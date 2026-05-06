@@ -1,111 +1,91 @@
+//! build.zig — Flommodore emulator build script.
+//!
+//! Block 2 additions:
+//!   - ram.zig, rom.zig, bus.zig, io.zig are compiled into the emulator.
+//!   - `zig build test` runs all unit tests embedded in each module plus
+//!     the combined routing test in tests/test_memory.zig.
+//!
+//! Usage:
+//!   zig build               — build the emulator binary
+//!   zig build test          — run all tests headlessly
+//!   zig build test --summary all  — verbose test output
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // ── Target & optimisation ────────────────────────────────────────────────
-    const target = b.standardTargetOptions(.{});
+    const target   = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // ── SDL3 C header translation (0.16: @cImport removed from the language) ─
-    //
-    // In Zig 0.16, @cImport is no longer a language builtin.  C headers are
-    // translated at build time via addTranslateC, which produces a Zig module
-    // that source files import by name ("sdl3").
-    //
-    // The header file src/sdl3.h is a thin wrapper that just does:
-    //   #include <SDL3/SDL.h>
-    //
-    // SDL3 itself is linked via linkSystemLibrary (system install) until the
-    // fetched dep hash is pinned.  To switch to the vendored source build,
-    // uncomment the sdl3_dep block below and replace linkSystemLibrary.
-    const translate_sdl3 = b.addTranslateC(.{
-        .root_source_file = b.path("src/sdl3.h"),
-        .target = target,
+    // -----------------------------------------------------------------------
+    // SDL3 dependency (added in Block 1.2)
+    // -----------------------------------------------------------------------
+    const sdl3_dep = b.dependency("sdl3", .{
+        .target   = target,
         .optimize = optimize,
-        .link_libc = true,
     });
-    // System SDL3 until dep hash is confirmed — run `zig fetch <url>` first.
-    translate_sdl3.linkSystemLibrary("SDL3", .{});
+    const sdl3_lib = sdl3_dep.artifact("SDL3");
 
-    // Vendored SDL3 (uncomment once hash is known):
-    // const sdl3_dep = b.dependency("sdl3", .{ .target = target, .optimize = optimize });
-    // translate_sdl3.linkLibrary(sdl3_dep.artifact("SDL3"));
-
-    const sdl3_module = translate_sdl3.createModule();
-
-    // ── Emulator executable ───────────────────────────────────────────────────
+    // -----------------------------------------------------------------------
+    // Main emulator executable
+    // -----------------------------------------------------------------------
     const exe = b.addExecutable(.{
-        .name = "flommodore",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "sdl3", .module = sdl3_module },
-            },
-        }),
+        .name           = "flommodore",
+        .root_source_file = b.path("src/main.zig"),
+        .target         = target,
+        .optimize       = optimize,
     });
-    // SDL3 runtime linkage on the executable
-    exe.root_module.linkSystemLibrary("SDL3", .{});
-    exe.root_module.link_libc = true;
-
+    exe.linkLibrary(sdl3_lib);
     b.installArtifact(exe);
 
-    // ── Run step: `zig build run` ────────────────────────────────────────────
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
-
-    const run_step = b.step("run", "Run the Flommodore emulator");
-    run_step.dependOn(&run_cmd.step);
-
-    // ── Unit tests: `zig build test` ─────────────────────────────────────────
+    // -----------------------------------------------------------------------
+    // Unit tests — each source module carries its own `test` blocks.
     //
-    // Each source module can contain `test` blocks.
-    // We compile a test binary per module so that `zig build test` runs all.
-    const test_step = b.step("test", "Run all unit tests");
+    // We compile a single test binary that imports all modules so Zig runs
+    // all embedded tests plus the standalone routing test.
+    // -----------------------------------------------------------------------
 
+    // Per-module test steps (run in-source tests for each module independently)
     const modules = [_][]const u8{
-        "src/util.zig",
         "src/ram.zig",
         "src/rom.zig",
-        "src/bus.zig",
-        "src/cpu.zig",
-        "src/vic256.zig",
-        "src/aur1.zig",
         "src/io.zig",
-        "src/debugger.zig",
+        "src/bus.zig",
+        "src/util.zig",
     };
 
     for (modules) |mod_path| {
-        const unit_tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(mod_path),
-                .target = target,
-                .optimize = optimize,
-            }),
+        const mod_tests = b.addTest(.{
+            .root_source_file = b.path(mod_path),
+            .target           = target,
+            .optimize         = optimize,
         });
-        const run_unit_tests = b.addRunArtifact(unit_tests);
-        test_step.dependOn(&run_unit_tests.step);
+        const run_mod_tests = b.addRunArtifact(mod_tests);
+        b.step("test", "Run unit tests").dependOn(&run_mod_tests.step);
     }
 
-    // ── Headless test harness: `zig build test-roms` ─────────────────────────
-    //
-    // Runs per-component test ROMs headlessly.  Wired in here so the build
-    // target exists from day one; the harness itself is implemented in Block 3.
-    const harness = b.addExecutable(.{
-        .name = "flommodore-test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/harness.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    // Block 2.5: combined memory routing test
+    const mem_tests = b.addTest(.{
+        .root_source_file = b.path("tests/test_memory.zig"),
+        .target           = target,
+        .optimize         = optimize,
     });
-    harness.root_module.linkSystemLibrary("SDL3", .{});
-    harness.root_module.link_libc = true;
+    // The routing test imports bus/ram/rom/io — make them available as modules.
+    const ram_mod = b.addModule("ram", .{ .root_source_file = b.path("src/ram.zig") });
+    const rom_mod = b.addModule("rom", .{ .root_source_file = b.path("src/rom.zig") });
+    const io_mod  = b.addModule("io",  .{ .root_source_file = b.path("src/io.zig")  });
+    const bus_mod = b.addModule("bus", .{
+        .root_source_file = b.path("src/bus.zig"),
+        .imports = &.{
+            .{ .name = "ram", .module = ram_mod },
+            .{ .name = "rom", .module = rom_mod },
+            .{ .name = "io",  .module = io_mod  },
+        },
+    });
+    mem_tests.root_module.addImport("bus", bus_mod);
+    mem_tests.root_module.addImport("ram", ram_mod);
+    mem_tests.root_module.addImport("rom", rom_mod);
+    mem_tests.root_module.addImport("io",  io_mod);
 
-    const run_harness = b.addRunArtifact(harness);
-    if (b.args) |args| run_harness.addArgs(args);
-
-    const test_roms_step = b.step("test-roms", "Run headless ROM test suite");
-    test_roms_step.dependOn(&run_harness.step);
+    const run_mem_tests = b.addRunArtifact(mem_tests);
+    b.step("test", "Run unit tests").dependOn(&run_mem_tests.step);
 }

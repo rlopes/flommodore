@@ -6,3 +6,5 @@ zig-pkg/
 /build/
 /build-*/
 /docgen_tmp/
+
+.DS_Store
