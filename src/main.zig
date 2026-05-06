@@ -2,29 +2,36 @@
 //!
 //! Block 1 version: opens an SDL3 window and closes cleanly.
 //! Stubs for the main emulation loop will be filled in by Block 5.
+//!
+//! Zig 0.16 notes:
+//!   • @cImport is removed — SDL3 is imported via the "sdl3" module produced
+//!     by addTranslateC in build.zig.
+//!   • std.io.getStdOut() is gone — use std.debug.print for simple output,
+//!     or the new std.Io interface for file I/O.
 
 const std = @import("std");
-const sdl = @cImport(@cInclude("SDL3/SDL.h"));
+// "sdl3" is the module produced by build.zig's addTranslateC step.
+const sdl = @import("sdl3");
 
-const util    = @import("util.zig");
-const bus     = @import("bus.zig");
-const cpu     = @import("cpu.zig");
-const vic256  = @import("vic256.zig");
-const aur1    = @import("aur1.zig");
-const io      = @import("io.zig");
+const util     = @import("util.zig");
+const bus      = @import("bus.zig");
+const cpu      = @import("cpu.zig");
+const vic256   = @import("vic256.zig");
+const aur1     = @import("aur1.zig");
+const io       = @import("io.zig");
 const debugger = @import("debugger.zig");
 
 const log = util.log;
 
 // ── Window defaults ──────────────────────────────────────────────────────────
-// The native Flommodore resolution is 320×180 (16:9, pixel-doubled).
-// The window is 4× that for a comfortable default on modern displays.
+// Native Flommodore resolution: 320×180 (16:9, pixel-doubled).
+// Window is 4× that for a comfortable default on modern displays.
 const WINDOW_TITLE  = "Flommodore Fantasy Computer";
-const WINDOW_WIDTH  = 320 * 4;   // 1280
-const WINDOW_HEIGHT = 180 * 4;   // 720
+const WINDOW_WIDTH  = 320 * 4; // 1280
+const WINDOW_HEIGHT = 180 * 4; // 720
 
 pub fn main() !void {
-    log.info("Flommodore emulator — Block 1 scaffold", .{});
+    log.info("Flommodore emulator — Block 1 scaffold (Zig 0.16)", .{});
 
     // ── SDL3 initialisation ──────────────────────────────────────────────────
     if (!sdl.SDL_Init(sdl.SDL_INIT_VIDEO | sdl.SDL_INIT_AUDIO)) {

@@ -21,12 +21,12 @@ const std = @import("std");
 ///   sign_extend(u32, 0b0111_0000, 8) == 0x0000_0070  (0x70 treated as +112)
 pub fn sign_extend(comptime T: type, value: T, from_bits: u5) T {
     comptime {
-        const info = @typeInfo(T);
-        if (info != .int) @compileError("sign_extend: T must be an integer type");
+        if (@typeInfo(T) != .int) @compileError("sign_extend: T must be an integer type");
     }
-    const shift: u5 = @as(u5, @intCast(@typeInfo(T).int.bits)) - from_bits;
-    // Arithmetic shift: cast to the signed peer, shift left then right.
-    const Signed = std.meta.Int(.signed, @typeInfo(T).int.bits);
+    const bits = @typeInfo(T).int.bits;
+    const Signed = @Int(.signed, bits);
+    const ShiftT = std.math.Log2Int(T);
+    const shift: ShiftT = @intCast(bits - from_bits);
     const as_signed: Signed = @bitCast(value);
     return @bitCast((as_signed << shift) >> shift);
 }
@@ -64,8 +64,14 @@ pub inline fn bit_toggle(comptime T: type, value: T, bit: u5) T {
 ///
 ///   bit_field(u32, 0b1101_0110, lo=2, width=3) → 0b101 (bits 4:2)
 pub inline fn bit_field(comptime T: type, value: T, lo: u5, width: u5) T {
-    const mask: T = (@as(T, 1) << width) - 1;
-    return (value >> lo) & mask;
+    if (width == 0) return 0;
+    const bits = @typeInfo(T).int.bits;
+    const ShiftT = std.math.Log2Int(T);
+    const mask: T = if (width == bits)
+        std.math.maxInt(T)
+    else
+        (@as(T, 1) << @as(ShiftT, @intCast(width))) - 1;
+    return (value >> @as(ShiftT, @intCast(lo))) & mask;
 }
 
 /// Mask a value to 20 bits (Gab-16 address bus width).
@@ -107,14 +113,14 @@ pub const log = std.log.scoped(.flommodore);
 /// Subsystem-scoped loggers — import these in each module:
 ///
 ///   const log = util.log_cpu;
-pub const log_cpu     = std.log.scoped(.cpu);
-pub const log_bus     = std.log.scoped(.bus);
-pub const log_vic     = std.log.scoped(.vic256);
-pub const log_aur     = std.log.scoped(.aur1);
-pub const log_io      = std.log.scoped(.io);
-pub const log_rom     = std.log.scoped(.rom);
-pub const log_ram     = std.log.scoped(.ram);
-pub const log_dbg     = std.log.scoped(.debugger);
+pub const log_cpu = std.log.scoped(.cpu);
+pub const log_bus = std.log.scoped(.bus);
+pub const log_vic = std.log.scoped(.vic256);
+pub const log_aur = std.log.scoped(.aur1);
+pub const log_io = std.log.scoped(.io);
+pub const log_rom = std.log.scoped(.rom);
+pub const log_ram = std.log.scoped(.ram);
+pub const log_dbg = std.log.scoped(.debugger);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Unit tests

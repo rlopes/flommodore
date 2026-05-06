@@ -12,6 +12,10 @@
 //!   flommodore-test tests/roms/*.rom    (runs all, reports summary)
 //!
 //! Implemented in Block 3 (after CPU and RAM exist).
+//!
+//! Zig 0.16 notes:
+//!   • std.io.getStdOut().writer() is gone; use std.debug.print for stderr,
+//!     or the new std.Io interface for stdout.
 
 const std = @import("std");
 
@@ -19,7 +23,6 @@ const std = @import("std");
 //                 and implement run_test() / main().
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("flommodore-test: harness stub (Block 1)\n", .{});
-    try stdout.print("  Implement in Block 3 once CPU and RAM are ready.\n", .{});
+    std.debug.print("flommodore-test: harness stub (Block 1)\n", .{});
+    std.debug.print("  Implement in Block 3 once CPU and RAM are ready.\n", .{});
 }

@@ -1,14 +1,15 @@
 .{
-    .name = "flommodore",
+    .name = .flommodore,
+    .fingerprint = 0x1e986f31c7839b39,
     .version = "0.1.0",
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
         // SDL3 — fetched directly from the official repository.
         // Pin to a known-good commit for reproducible builds.
         .sdl3 = .{
             .url = "https://github.com/libsdl-org/SDL/archive/refs/tags/release-3.2.4.tar.gz",
-            .hash = "1220c91c10b6f88cf30e7c51d6e7dd2a6a0d31e4f4e0e3c5a1d7e20e9c4b3f8d912",
+            .hash = "N-V-__8AAG3fggMFaUlZZUdjGi89a87SCVcWs1QEov-cDsm_",
         },
     },
 
