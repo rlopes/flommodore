@@ -64,6 +64,8 @@ pub fn write_u16(addr: u32, value: u16) void {
     }
 }
 
+pub fn init() void {}
+
 pub fn reset() void {
     syscfg = 0x0000;
 }

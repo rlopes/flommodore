@@ -14,11 +14,23 @@ const std = @import("std");
 
 pub const RAM_SIZE: u32 = 512 * 1024; // 0x80000
 
-var data: [RAM_SIZE]u8 = std.mem.zeroes([RAM_SIZE]u8);
+/// ROM shadow mirror ($FC000–$FFFFF).  When SYSCFG bit 0 is set the bus
+/// routes that CPU range here instead of the ROM buffer.
+pub const SHADOW_BASE: u32 = 0xFC000;
+pub const SHADOW_SIZE: u32 = 0x4000;
 
-/// Reset all RAM to zero.
+var data: [RAM_SIZE]u8 = std.mem.zeroes([RAM_SIZE]u8);
+var shadow: [SHADOW_SIZE]u8 = std.mem.zeroes([SHADOW_SIZE]u8);
+
+fn shadow_index(addr: u32) u32 {
+    std.debug.assert(addr >= SHADOW_BASE and addr < SHADOW_BASE + SHADOW_SIZE);
+    return addr - SHADOW_BASE;
+}
+
+/// Reset all RAM (and the ROM shadow mirror) to zero.
 pub fn reset() void {
     @memset(&data, 0);
+    @memset(&shadow, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -47,8 +59,31 @@ pub fn read_u16(addr: u32) u16 {
 
 pub fn write_u16(addr: u32, value: u16) void {
     std.debug.assert(addr + 1 < RAM_SIZE);
-    data[addr]     = @truncate(value);
+    data[addr] = @truncate(value);
     data[addr + 1] = @truncate(value >> 8);
+}
+
+// ---------------------------------------------------------------------------
+// ROM shadow mirror ($FC000–$FFFFF)
+// ---------------------------------------------------------------------------
+
+pub fn read_shadow_byte(addr: u32) u8 {
+    return shadow[shadow_index(addr)];
+}
+
+pub fn write_shadow_byte(addr: u32, value: u8) void {
+    shadow[shadow_index(addr)] = value;
+}
+
+pub fn read_shadow_u16(addr: u32) u16 {
+    const i = shadow_index(addr);
+    return @as(u16, shadow[i]) | (@as(u16, shadow[i + 1]) << 8);
+}
+
+pub fn write_shadow_u16(addr: u32, value: u16) void {
+    const i = shadow_index(addr);
+    shadow[i] = @truncate(value);
+    shadow[i + 1] = @truncate(value >> 8);
 }
 
 // ---------------------------------------------------------------------------

@@ -11,14 +11,21 @@
 
 const std = @import("std");
 // "sdl3" is the module produced by build.zig's addTranslateC step.
-const sdl = @import("sdl3");
+//const sdl = @import("sdl3");
+const sdl = @cImport({
+    @cDefine("SDL_DISABLE_OLD_NAMES", {});
+    @cInclude("SDL3/SDL.h");
+    @cInclude("SDL3/SDL_revision.h");
+    @cDefine("SDL_MAIN_HANDLED", {}); // We are providing our own entry point
+    @cInclude("SDL3/SDL_main.h");
+});
 
-const util     = @import("util.zig");
-const bus      = @import("bus.zig");
-const cpu      = @import("cpu.zig");
-const vic256   = @import("vic256.zig");
-const aur1     = @import("aur1.zig");
-const io       = @import("io.zig");
+const util = @import("util.zig");
+const bus = @import("bus.zig");
+const cpu = @import("cpu.zig");
+const vic256 = @import("vic256.zig");
+const aur1 = @import("aur1.zig");
+const io = @import("io.zig");
 const debugger = @import("debugger.zig");
 
 const log = util.log;
@@ -26,8 +33,8 @@ const log = util.log;
 // ── Window defaults ──────────────────────────────────────────────────────────
 // Native Flommodore resolution: 320×180 (16:9, pixel-doubled).
 // Window is 4× that for a comfortable default on modern displays.
-const WINDOW_TITLE  = "Flommodore Fantasy Computer";
-const WINDOW_WIDTH  = 320 * 4; // 1280
+const WINDOW_TITLE = "Flommodore Fantasy Computer";
+const WINDOW_WIDTH = 320 * 4; // 1280
 const WINDOW_HEIGHT = 180 * 4; // 720
 
 pub fn main() !void {
@@ -84,4 +91,9 @@ pub fn main() !void {
     }
 
     log.info("Clean exit.", .{});
+}
+
+test {
+    std.testing.refAllDecls(@This());
+    _ = @import("test_memory.zig");
 }

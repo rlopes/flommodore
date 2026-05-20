@@ -19,22 +19,22 @@
 //!
 //! Implemented in Block 2.3 (routing) and Block 2.4 (shadow logic).
 
-const std  = @import("std");
-const ram  = @import("ram.zig");
-const rom  = @import("rom.zig");
-const io   = @import("io.zig");
+const std = @import("std");
+const ram = @import("ram.zig");
+const rom = @import("rom.zig");
+const io = @import("io.zig");
 
 // ---------------------------------------------------------------------------
 // Address-space constants
 // ---------------------------------------------------------------------------
 
-const ADDR_MASK:     u32 = 0x000F_FFFF; // 20-bit mask
+const ADDR_MASK: u32 = 0x000F_FFFF; // 20-bit mask
 
-const RAM_END:       u32 = 0x7FFFF;
-const IO_START:      u32 = 0x80000;
-const IO_END:        u32 = 0x80FFF;
-const OPEN_BUS_END:  u32 = 0xFBFFF;
-const ROM_START:     u32 = 0xFC000;
+const RAM_END: u32 = 0x7FFFF;
+const IO_START: u32 = 0x80000;
+const IO_END: u32 = 0x80FFF;
+const OPEN_BUS_END: u32 = 0xFBFFF;
+const ROM_START: u32 = 0xFC000;
 // ROM_END == ADDR_MASK (0xFFFFF)
 
 // ---------------------------------------------------------------------------
@@ -54,12 +54,10 @@ const ROM_START:     u32 = 0xFC000;
 pub fn read_byte(addr: u32) u8 {
     const a = addr & ADDR_MASK;
     return switch (a) {
-        0x00000...RAM_END    => ram.read_byte(a),
-        IO_START...IO_END    => @truncate(io.read_u16(a)),
+        0x00000...RAM_END => ram.read_byte(a),
+        IO_START...IO_END => @truncate(io.read_u16(a)),
         IO_END + 1...OPEN_BUS_END => 0x00,
-        ROM_START...ADDR_MASK =>
-            if (io.rom_shadow_enabled()) ram.read_byte(a)
-            else                         rom.read_byte(a),
+        ROM_START...ADDR_MASK => if (io.rom_shadow_enabled()) ram.read_shadow_byte(a) else rom.read_byte(a),
         else => unreachable,
     };
 }
@@ -67,11 +65,11 @@ pub fn read_byte(addr: u32) u8 {
 pub fn write_byte(addr: u32, value: u8) void {
     const a = addr & ADDR_MASK;
     switch (a) {
-        0x00000...RAM_END    => ram.write_byte(a, value),
-        IO_START...IO_END    => io.write_u16(a, @as(u16, value)),
+        0x00000...RAM_END => ram.write_byte(a, value),
+        IO_START...IO_END => io.write_u16(a, @as(u16, value)),
         IO_END + 1...OPEN_BUS_END => {}, // open bus — ignore
         ROM_START...ADDR_MASK => {
-            if (io.rom_shadow_enabled()) ram.write_byte(a, value);
+            if (io.rom_shadow_enabled()) ram.write_shadow_byte(a, value);
             // else: write to real ROM is ignored
         },
         else => unreachable,
@@ -88,12 +86,10 @@ pub fn write_byte(addr: u32, value: u8) void {
 pub fn read_u16(addr: u32) u16 {
     const a = addr & ADDR_MASK;
     return switch (a) {
-        0x00000...RAM_END    => ram.read_u16(a),
-        IO_START...IO_END    => io.read_u16(a),
+        0x00000...RAM_END => ram.read_u16(a),
+        IO_START...IO_END => io.read_u16(a),
         IO_END + 1...OPEN_BUS_END => 0x0000,
-        ROM_START...ADDR_MASK =>
-            if (io.rom_shadow_enabled()) ram.read_u16(a)
-            else                         rom.read_u16(a),
+        ROM_START...ADDR_MASK => if (io.rom_shadow_enabled()) ram.read_shadow_u16(a) else rom.read_u16(a),
         else => unreachable,
     };
 }
@@ -101,16 +97,18 @@ pub fn read_u16(addr: u32) u16 {
 pub fn write_u16(addr: u32, value: u16) void {
     const a = addr & ADDR_MASK;
     switch (a) {
-        0x00000...RAM_END    => ram.write_u16(a, value),
-        IO_START...IO_END    => io.write_u16(a, value),
+        0x00000...RAM_END => ram.write_u16(a, value),
+        IO_START...IO_END => io.write_u16(a, value),
         IO_END + 1...OPEN_BUS_END => {}, // open bus — ignore
         ROM_START...ADDR_MASK => {
-            if (io.rom_shadow_enabled()) ram.write_u16(a, value);
+            if (io.rom_shadow_enabled()) ram.write_shadow_u16(a, value);
             // else: write to real ROM is ignored
         },
         else => unreachable,
     }
 }
+
+pub fn init() void {}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -162,13 +160,13 @@ test "bus: ROM region routes to RAM when shadow enabled" {
     ram.reset();
     rom.reset();
     // Write a value into the RAM at the ROM shadow address range.
-    ram.write_u16(0xFC000, 0xDEAD);
+    ram.write_shadow_u16(0xFC000, 0xDEAD);
     // Enable shadow and read via the bus.
     io.set_rom_shadow(true);
     try std.testing.expect(read_u16(0xFC000) == 0xDEAD);
-    // Write via bus should also go to RAM.
+    // Write via bus should also go to the shadow mirror.
     write_u16(0xFC000, 0x1234);
-    try std.testing.expect(ram.read_u16(0xFC000) == 0x1234);
+    try std.testing.expect(ram.read_shadow_u16(0xFC000) == 0x1234);
     // Disable shadow — bus should now return rom contents (zeroed).
     io.set_rom_shadow(false);
     try std.testing.expect(read_u16(0xFC000) == 0x0000);

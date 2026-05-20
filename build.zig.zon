@@ -5,11 +5,9 @@
     .minimum_zig_version = "0.16.0",
 
     .dependencies = .{
-        // SDL3 — fetched directly from the official repository.
-        // Pin to a known-good commit for reproducible builds.
-        .sdl3 = .{
-            .url = "https://github.com/libsdl-org/SDL/archive/refs/tags/release-3.2.4.tar.gz",
-            .hash = "N-V-__8AAG3fggMFaUlZZUdjGi89a87SCVcWs1QEov-cDsm_",
+        .sdl = .{
+            .url = "https://github.com/castholm/SDL/archive/refs/tags/v0.5.0+3.4.8.tar.gz",
+            .hash = "sdl-0.5.0+3.4.8-SDL--k4DpgH323IfF6cEaGzKUdtUQv1azbBmmcv0RMAu",
         },
     },
 

@@ -3,7 +3,7 @@
 //! Walks every address range defined in the spec and verifies that reads and
 //! writes route to the correct module.  Runs headlessly (no SDL3, no window).
 //!
-//! Run with:   zig build test
+//! Pulled into the test suite via `@import("test_memory.zig")` in main.zig.
 //!
 //! Pass criteria (spec §1.2):
 //!   $00000–$7FFFF  → RAM
@@ -15,7 +15,7 @@ const std = @import("std");
 const bus = @import("bus.zig");
 const ram = @import("ram.zig");
 const rom = @import("rom.zig");
-const io  = @import("io.zig");
+const io = @import("io.zig");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -106,10 +106,11 @@ test "routing: open bus high boundary ($FBFFF) reads 0x0000" {
 
 test "routing: open bus writes do not crash" {
     reset_all();
+    ram.write_u16(0x00000, 0xAAAA); // sentinel in RAM
     bus.write_u16(0x81000, 0xDEAD);
     bus.write_u16(0xFBFFE, 0xBEEF);
-    // Verify the bus didn't route these to RAM.
-    try std.testing.expect(ram.read_u16(0x81000) == 0x0000);
+    // Open-bus writes must not touch RAM.
+    try std.testing.expect(ram.read_u16(0x00000) == 0xAAAA);
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +144,7 @@ test "routing: ROM write is ignored when shadow disabled" {
 test "routing: shadow on — ROM range reads from RAM" {
     reset_all();
     // Write sentinel into RAM at the shadow address.
-    ram.write_u16(0xFC000, 0xDEAD);
+    ram.write_shadow_u16(0xFC000, 0xDEAD);
     // Also put something different in ROM.
     const img = [_]u8{ 0x11, 0x22 };
     try rom.load_bytes(&img);
@@ -158,7 +159,7 @@ test "routing: shadow on — bus writes to ROM range go to RAM" {
     reset_all();
     io.set_rom_shadow(true);
     bus.write_u16(0xFC010, 0x5678);
-    try std.testing.expect(ram.read_u16(0xFC010) == 0x5678);
+    try std.testing.expect(ram.read_shadow_u16(0xFC010) == 0x5678);
     io.set_rom_shadow(false);
 }
 
