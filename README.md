@@ -4,11 +4,11 @@ A fully specified fantasy computer — Gab-16 CPU (16-bit RISC, 20-bit address
 bus), VIC-256 video, AUR-1 sound, 512KB RAM — implemented as a reference
 emulator and toolchain in **Zig 0.16** with **SDL3**.
 
-Block 3 status: the Gab-16 CPU core is complete — all 49 instructions,
-the §1.6 flag table, supervisor/user modes, the 8-byte interrupt frame with
-nesting, and BRK trapping — verified by unit tests, a 100k-word decoder
-fuzz, and five generated test ROMs run headlessly. I/O and timers arrive
-in Block 4.
+Block 4 status: the I/O region is live — system config (SYSID/SYSPWR),
+both 16-bit timers with exact prescaler timing (÷1/÷8/÷64/÷256 at 14.4 MHz),
+the IRQ controller (raw IRQSTAT, mask, w1c ack) wired to the CPU line, and
+the keyboard/joystick register sets awaiting SDL in Block 8. Next: Block 5,
+the scanline-quantum main loop — Milestone 1.
 
 ## Build
 

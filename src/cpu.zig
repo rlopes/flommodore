@@ -559,10 +559,12 @@ pub fn init() void {}
 const testing = std.testing;
 const ram_mod = @import("ram");
 const rom_mod = @import("rom");
+const io_mod = @import("io");
 
 const Fixture = struct {
     ram: *ram_mod.Ram,
     rom: *rom_mod.Rom,
+    io: *io_mod.Io,
     bus: Bus,
     cpu: Gab16,
 
@@ -572,10 +574,13 @@ const Fixture = struct {
         const ram = try testing.allocator.create(ram_mod.Ram);
         errdefer testing.allocator.destroy(ram);
         const rom = try testing.allocator.create(rom_mod.Rom);
+        errdefer testing.allocator.destroy(rom);
+        const io = try testing.allocator.create(io_mod.Io);
         ram.init();
         rom.init();
-        var f = Fixture{ .ram = ram, .rom = rom, .bus = undefined, .cpu = undefined };
-        f.bus = Bus.init(ram, rom);
+        io.* = io_mod.Io.init();
+        var f = Fixture{ .ram = ram, .rom = rom, .io = io, .bus = undefined, .cpu = undefined };
+        f.bus = Bus.init(ram, rom, io);
         var image: [rom_mod.size]u8 = @splat(0);
         std.mem.writeInt(u32, image[rom_mod.vectors_offset..][0..4], 0x01000, .little);
         try rom.loadFromSlice(&image);
@@ -587,6 +592,7 @@ const Fixture = struct {
     fn teardown(f: *Fixture) void {
         testing.allocator.destroy(f.ram);
         testing.allocator.destroy(f.rom);
+        testing.allocator.destroy(f.io);
     }
 
     /// Plant a program at $01000 and reposition PC there.

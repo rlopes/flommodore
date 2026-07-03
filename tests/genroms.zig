@@ -463,6 +463,145 @@ fn buildIrq() RomImage {
     return image;
 }
 
+/// test_io_timer.rom (Block 4, task 4.10): reload, repeat/one-shot, all
+/// four divisors (timing measured against CYC), device IRQ gate, raw
+/// IRQSTAT vs IRQMASK, IRQACK w1c, timer independence, CNT read-only —
+/// and the ROM finishes via SYSPWR soft power-off instead of HLT (task 4.2).
+///
+/// Register conventions: R1 = timer A base ($80010; timer B at +8, keyboard
+/// at +$10, IRQ controller at +$30 via offsets), R8 = IRQ controller base
+/// (handler-owned), R11 = check number, R12 = scratch.
+fn buildIoTimer() RomImage {
+    var image = RomImage.init();
+    image.setVector(2, irq_handler_addr);
+
+    // IRQ handler: ack everything pending, count invocations in R2.
+    var h = image.codeAt(irq_handler_addr);
+    h.emit(encode.lw(9, 8, 0)); //   R9 = IRQSTAT   (R8 = $80040, set by main)
+    h.emit(encode.sw(8, 2, 9)); //   IRQACK <- R9 (w1c per source, §5.5)
+    h.emit(encode.addi(2, 2, 1));
+    h.emit(encode.rti());
+
+    var k = Kit.begin(&image);
+    // Supervisor setup.
+    k.emit(encode.li(15, 0x1100)); //  SP (D12)
+    k.emit(encode.li(3, 0x20F0));
+    k.emit(encode.mtsr(.ssp, 3));
+    k.loadAddr(3, 0xFFFC0);
+    k.emit(encode.mtsr(.ivt, 3));
+    k.loadAddr(1, 0x80010); //         timer A base
+    k.loadAddr(8, 0x80040); //         IRQ controller base
+
+    // Checks 1-4: one-shot expiry timing at every divisor, measured with
+    // CYC (D39/D41 make the machine fully cycle-deterministic). The poll
+    // loop is 4 instructions, so the measured latency window is
+    // [period, period + poll granularity + a few setup cycles].
+    const timing = [_]struct { div: i32, reload: i32, period: i32 }{
+        .{ .div = 0, .reload = 20, .period = 20 }, //   ÷1
+        .{ .div = 1, .reload = 5, .period = 40 }, //    ÷8
+        .{ .div = 2, .reload = 2, .period = 128 }, //   ÷64
+        .{ .div = 3, .reload = 2, .period = 512 }, //   ÷256
+    };
+    for (timing, 1..) |t, n| {
+        k.emit(encode.li(12, t.reload));
+        k.emit(encode.sw(1, 0, 12)); //             TxLOADLO <- reload
+        k.emit(encode.sw(1, 1, 0)); //              TxLOADHI <- 0 (via R0)
+        k.emit(encode.li(12, t.div));
+        k.emit(encode.sw(1, 5, 12)); //             TxDIV
+        k.emit(encode.mfsr(5, .cyc)); //            start stamp
+        k.emit(encode.li(12, 1));
+        k.emit(encode.sw(1, 4, 12)); //             TxCTRL: enable, one-shot
+        const poll_top = k.cur.addr;
+        k.emit(encode.lw(6, 1, 6)); //              poll TxSTAT
+        k.emit(encode.cmpi(6, 0));
+        k.branchTo(.beq, poll_top);
+        k.emit(encode.mfsr(6, .cyc)); //            end stamp
+        k.emit(encode.sub(7, 6, 5)); //             elapsed cycles (low 16 compared)
+        // Window: expiry can be visible to the poll no earlier than the
+        // period (enable-write cycle counts as tick #1) and the loop adds
+        // at most ~10 cycles of granularity + stamp overhead.
+        k.num(@intCast(n));
+        k.emit(encode.cmpi(7, t.period));
+        k.assertTaken(.bcs); //                     elapsed >= period
+        k.emit(encode.cmpi(7, t.period + 12));
+        k.assertTaken(.bcc); //                     elapsed < period + 12
+        // One-shot: TxCTRL bit 0 self-cleared; STAT w1c works.
+        k.emit(encode.lw(6, 1, 4));
+        k.emit(encode.andi(6, 6, 1));
+        k.checkEqImm(@intCast(10 + n), 6, 0);
+        k.emit(encode.li(12, 1));
+        k.emit(encode.sw(1, 6, 12));
+        k.emit(encode.lw(6, 1, 6));
+        k.checkEqImm(@intCast(20 + n), 6, 0);
+    }
+
+    // Check 5: device gate + raw IRQSTAT vs mask. Timer A repeat+IRQ with
+    // IRQMASK = 0: the bit sets raw, no CPU interrupt (I is 0 anyway).
+    k.emit(encode.li(12, 200));
+    k.emit(encode.sw(1, 0, 12)); //  reload 200
+    k.emit(encode.sw(1, 5, 0)); //   ÷1
+    k.emit(encode.li(12, 7));
+    k.emit(encode.sw(1, 4, 12)); //  enable | repeat | IRQ
+    const poll_stat = k.cur.addr;
+    k.emit(encode.lw(6, 1, 6)); //   wait for first expiry via TxSTAT
+    k.emit(encode.cmpi(6, 0));
+    k.branchTo(.beq, poll_stat);
+    k.emit(encode.lw(6, 8, 0)); //   IRQSTAT raw
+    k.emit(encode.andi(6, 6, 1));
+    k.checkEqImm(30, 6, 1); //       bit 0 pending though masked out
+    k.checkEqImm(31, 2, 0); //       and no handler ran
+    k.emit(encode.li(12, 1));
+    k.emit(encode.sw(8, 2, 12)); //  IRQACK bit 0
+    k.emit(encode.lw(6, 8, 0));
+    k.emit(encode.andi(6, 6, 1));
+    k.checkEqImm(32, 6, 0); //       w1c cleared it (next expiry is ~200 cycles off)
+
+    // Check 6: masked in + SEI -> handler runs 3 periods, acking each.
+    k.emit(encode.li(12, 1));
+    k.emit(encode.sw(8, 1, 12)); //  IRQMASK bit 0
+    k.emit(encode.sei());
+    const wait_irqs = k.cur.addr;
+    k.emit(encode.cmpi(2, 3));
+    k.branchTo(.bne, wait_irqs);
+    k.emit(encode.sw(1, 4, 0)); //   disable timer A
+    k.emit(encode.cli());
+    k.checkEqImm(33, 2, 3); //       exactly 3 (period 200 >> disable latency)
+
+    // Check 7: timer B independent, its own IRQ bit; CNT is read-only.
+    k.emit(encode.li(12, 30));
+    k.emit(encode.sw(1, 8, 12)); //  TBLOADLO (base+8)
+    k.emit(encode.sw(1, 13, 0)); //  TBDIV ÷1
+    k.emit(encode.li(12, 1));
+    k.emit(encode.sw(1, 12, 12)); // TBCTRL enable one-shot (no IRQ bit)
+    const poll_b = k.cur.addr;
+    k.emit(encode.lw(6, 1, 14)); //  TBSTAT
+    k.emit(encode.cmpi(6, 0));
+    k.branchTo(.beq, poll_b);
+    k.emit(encode.lw(6, 8, 0)); //   IRQSTAT: TB gate off -> bit 1 never set
+    k.emit(encode.andi(6, 6, 2));
+    k.checkEqImm(34, 6, 0);
+    k.emit(encode.li(12, 0x99));
+    k.emit(encode.sw(1, 10, 12)); // TBCNTLO write attempt
+    k.emit(encode.lw(6, 1, 10));
+    k.checkEqImm(35, 6, 0); //       read-only: count froze at 0
+
+    // Check 8: keyboard and joystick sane defaults (tasks 4.8/4.9).
+    k.emit(encode.lw(6, 1, 0x10)); //  KSTAT ($80020)
+    k.checkEqImm(36, 6, 0);
+    k.emit(encode.lw(6, 1, 0x20)); //  JOY1 ($80030)
+    k.checkEqImm(37, 6, 0);
+
+    // Finish: write PASS, then SYSPWR soft power-off (task 4.2) - the
+    // harness must exit cleanly WITHOUT a HLT.
+    k.emit(encode.li(11, 0x600D));
+    k.emit(encode.sw(0, result_addr, 11));
+    k.loadAddr(3, 0x80003); //         SYSPWR
+    k.emit(encode.li(12, 1));
+    k.emit(encode.sw(3, 0, 12));
+    k.emit(encode.jmpa(fail_addr)); // must never execute
+    return image;
+}
+
 const Builder = struct {
     name: []const u8,
     build: *const fn () RomImage,
@@ -475,6 +614,7 @@ const builders = [_]Builder{
     .{ .name = "test_cpu_branch.rom", .build = buildBranch },
     .{ .name = "test_cpu_stack.rom", .build = buildStack },
     .{ .name = "test_cpu_irq.rom", .build = buildIrq },
+    .{ .name = "test_io_timer.rom", .build = buildIoTimer },
 };
 
 pub fn main(init: std.process.Init) !void {

@@ -25,6 +25,7 @@ const ram_mod = @import("ram");
 const rom_mod = @import("rom");
 const bus_mod = @import("bus");
 const cpu_mod = @import("cpu");
+const io_mod = @import("io");
 
 const Options = struct {
     rom_path: []const u8,
@@ -94,9 +95,12 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.destroy(ram);
     const rom = try gpa.create(rom_mod.Rom);
     defer gpa.destroy(rom);
+    const io_dev = try gpa.create(io_mod.Io);
+    defer gpa.destroy(io_dev);
     ram.init();
     rom.init();
-    var bus = bus_mod.Bus.init(ram, rom);
+    io_dev.* = io_mod.Io.init();
+    var bus = bus_mod.Bus.init(ram, rom, io_dev);
 
     try rom.loadFromFile(io, std.Io.Dir.cwd(), opts.rom_path);
     util.logInfo("loaded ROM: {s}", .{opts.rom_path});
@@ -112,27 +116,33 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Bounded, deterministic run: one instruction (or idle/delivery step)
-    // per cycle (D17).
+    // per cycle (D17/D41). Ordering per cycle: sample the IRQ line, step
+    // the CPU, tick the devices — so a device event in cycle k is
+    // deliverable from cycle k+1 (io.zig header).
     var cycles: u64 = 0;
     var irq_idx: usize = 0;
-    while (cycles < opts.max_cycles and !cpu.halted) : (cycles += 1) {
+    var injected = false;
+    while (cycles < opts.max_cycles and !cpu.halted and !io_dev.power_off) : (cycles += 1) {
         if (irq_idx < opts.irq_count and cycles >= opts.irq_at[irq_idx]) {
-            cpu.irq_line = true; // asserted until delivered
+            injected = true; // --irq-at: asserted until delivered
         }
+        cpu.irq_line = io_dev.irqLine() or injected;
         const event = cpu.step(&bus);
-        if (event == .irq_entered) {
-            cpu.irq_line = false;
+        io_dev.tick();
+        if (event == .irq_entered and injected) {
+            injected = false;
             irq_idx += 1;
         }
     }
-    util.logInfo("ran {d} cycles; halted={}, PC=${X:0>5}", .{ cycles, cpu.halted, cpu.pc });
+    util.logInfo("ran {d} cycles; halted={}, power_off={}, PC=${X:0>5}", .{ cycles, cpu.halted, io_dev.power_off, cpu.pc });
     if (irq_idx < opts.irq_count) {
         util.logWarn("{d} of {d} --irq-at pulses were never delivered", .{ opts.irq_count - irq_idx, opts.irq_count });
     }
 
     if (opts.expect_pass) {
         const result = bus.read16(result_addr);
-        if (!cpu.halted) {
+        // A test ROM finishes by HLT or by SYSPWR soft power-off (§5.1).
+        if (!cpu.halted and !io_dev.power_off) {
             util.logErr("expected HLT within {d} cycles", .{opts.max_cycles});
             return error.TestRomTimedOut;
         }

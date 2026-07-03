@@ -33,9 +33,11 @@ const std = @import("std");
 const util = @import("util");
 const ram_mod = @import("ram");
 const rom_mod = @import("rom");
+const io_mod = @import("io");
 
 const Ram = ram_mod.Ram;
 const Rom = rom_mod.Rom;
+const Io = io_mod.Io;
 
 // Region boundaries (Phase 1 §1.2).
 pub const ram_end: u32 = 0x7FFFF; // 512KB RAM, inclusive
@@ -44,14 +46,8 @@ pub const io_end: u32 = 0x80FFF; // inclusive
 pub const rom_base: u32 = 0xFC000; // 16KB ROM
 pub const shadow_base: u32 = 0x3C000; // fixed shadow window (D9)
 
-/// `SYSCFG` — system configuration register, `$80000` (Phase 5 §5.1).
-/// Bit 0 = ROM shadow enable. Owned by the bus because shadow mapping is a
-/// bus behaviour (plan task 2.4); the rest of the I/O region is dispatched
-/// to the devices as they land (Blocks 6–8).
-pub const syscfg_addr: u32 = 0x80000;
-/// SYSCFG defined bits — only bit 0 exists; undefined bits read as zero
-/// (amendment §3.1).
-const syscfg_mask: u16 = 0x0001;
+/// Re-exported for tests and callers that address SYSCFG through the bus.
+pub const syscfg_addr: u32 = io_mod.syscfg_addr;
 
 pub const Region = enum { ram, io, open_bus, rom };
 
@@ -66,25 +62,29 @@ pub fn regionOf(addr: u32) Region {
 pub const Bus = struct {
     ram: *Ram,
     rom: *Rom,
-    syscfg: u16 = 0,
+    /// The I/O region (Block 4). Owns SYSCFG; the bus queries it for the
+    /// shadow mapping.
+    io: *Io,
 
-    pub fn init(ram: *Ram, rom: *Rom) Bus {
-        return .{ .ram = ram, .rom = rom };
+    pub fn init(ram: *Ram, rom: *Rom, io: *Io) Bus {
+        return .{ .ram = ram, .rom = rom, .io = io };
     }
 
     pub fn shadowEnabled(bus: *const Bus) bool {
-        return (bus.syscfg & 0x0001) != 0;
+        return bus.io.shadowEnabled();
     }
 
     // ------------------------------------------------------------------
     // Byte access — the routing primitive.
     // ------------------------------------------------------------------
 
-    pub fn read8(bus: *const Bus, addr_in: u32) u8 {
+    pub fn read8(bus: *Bus, addr_in: u32) u8 {
         const addr = util.maskAddr(addr_in);
         return switch (regionOf(addr)) {
             .ram => bus.ram.readByte(addr),
-            .io => @truncate(bus.ioRead16(addr)), // low byte of the register (§3.1)
+            // Low byte of the register (§3.1). Non-const: KDATA dequeues on
+            // any read width.
+            .io => @truncate(bus.io.read16(addr)),
             .open_bus => 0x00, // open-bus reads return $0000 (§1.7)
             .rom => if (bus.shadowEnabled())
                 bus.ram.readByte(shadow_base + (addr - rom_base)) // D9: $FC000+off → $3C000+off
@@ -98,9 +98,11 @@ pub const Bus = struct {
         switch (regionOf(addr)) {
             .ram => bus.ram.writeByte(addr, value),
             .io => {
-                // Byte writes touch the low byte of the register (§3.1).
-                const old = bus.ioRead16(addr);
-                bus.ioWrite16(addr, (old & 0xFF00) | value);
+                // Byte writes are a read-modify-write of the register's low
+                // byte (D47). The read half carries the register's own read
+                // side effects — documented for KDATA.
+                const old = bus.io.read16(addr);
+                bus.io.write16(addr, (old & 0xFF00) | value);
             },
             .open_bus => {}, // writes ignored (§1.7)
             .rom => if (bus.shadowEnabled()) {
@@ -114,11 +116,11 @@ pub const Bus = struct {
     // (§1.7), exact-register semantics wholly inside I/O (D14/§3.1).
     // ------------------------------------------------------------------
 
-    pub fn read16(bus: *const Bus, addr_in: u32) u16 {
+    pub fn read16(bus: *Bus, addr_in: u32) u16 {
         const a0 = util.maskAddr(addr_in);
         const a1 = util.maskAddr(addr_in +% 1); // wraps $FFFFF → $00000 (§1.7)
         if (regionOf(a0) == .io and regionOf(a1) == .io) {
-            return bus.ioRead16(a0); // 16-bit register at the exact address (D14)
+            return bus.io.read16(a0); // 16-bit register at the exact address (D14)
         }
         const lo: u16 = bus.read8(a0);
         const hi: u16 = bus.read8(a1);
@@ -129,32 +131,11 @@ pub const Bus = struct {
         const a0 = util.maskAddr(addr_in);
         const a1 = util.maskAddr(addr_in +% 1);
         if (regionOf(a0) == .io and regionOf(a1) == .io) {
-            bus.ioWrite16(a0, value); // exact register (D14)
+            bus.io.write16(a0, value); // exact register (D14)
             return;
         }
         bus.write8(a0, @truncate(value));
         bus.write8(a1, @truncate(value >> 8));
-    }
-
-    // ------------------------------------------------------------------
-    // I/O region internals. Block 2 implements only SYSCFG ($80000);
-    // every other I/O address reads $0000 and ignores writes until its
-    // device block lands (timers/keyboard/joystick Block 8, VIC Block 6,
-    // AUR-1 Block 7).
-    // ------------------------------------------------------------------
-
-    fn ioRead16(bus: *const Bus, addr: u32) u16 {
-        return switch (addr) {
-            syscfg_addr => bus.syscfg,
-            else => 0x0000, // unimplemented device registers (Blocks 6–8)
-        };
-    }
-
-    fn ioWrite16(bus: *Bus, addr: u32, value: u16) void {
-        switch (addr) {
-            syscfg_addr => bus.syscfg = value & syscfg_mask,
-            else => {}, // unimplemented device registers (Blocks 6–8)
-        }
     }
 };
 
@@ -168,20 +149,25 @@ const testing = std.testing;
 const Fixture = struct {
     ram: *Ram,
     rom: *Rom,
+    io: *Io,
     bus: Bus,
 
     fn setup() !Fixture {
         const ram = try testing.allocator.create(Ram);
         errdefer testing.allocator.destroy(ram);
         const rom = try testing.allocator.create(Rom);
+        errdefer testing.allocator.destroy(rom);
+        const io = try testing.allocator.create(Io);
         ram.init();
         rom.init();
-        return .{ .ram = ram, .rom = rom, .bus = Bus.init(ram, rom) };
+        io.* = Io.init();
+        return .{ .ram = ram, .rom = rom, .io = io, .bus = Bus.init(ram, rom, io) };
     }
 
     fn teardown(f: *Fixture) void {
         testing.allocator.destroy(f.ram);
         testing.allocator.destroy(f.rom);
+        testing.allocator.destroy(f.io);
     }
 };
 
@@ -248,9 +234,10 @@ test "bus: I/O exact-register model (D14) — SYSCFG" {
     // 16-bit access wholly inside I/O hits the exact register.
     f.bus.write16(syscfg_addr, 0x0001);
     try testing.expectEqual(@as(u16, 0x0001), f.bus.read16(syscfg_addr));
-    // Adjacent registers never combine: $80001 (SYSID slot, unimplemented
-    // until Block 8) is independent and reads $0000.
-    try testing.expectEqual(@as(u16, 0x0000), f.bus.read16(0x80001));
+    // Adjacent registers never combine: $80001 is SYSID ($F1, Block 4) —
+    // a 16-bit read at $80000 returns SYSCFG alone, and $80001 is its own
+    // independent register.
+    try testing.expectEqual(@as(u16, 0x00F1), f.bus.read16(0x80001));
     // Byte access touches the register's low byte.
     try testing.expectEqual(@as(u8, 0x01), f.bus.read8(syscfg_addr));
     f.bus.write8(syscfg_addr, 0x00);

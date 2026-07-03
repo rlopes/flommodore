@@ -15,7 +15,7 @@ const rom = @import("rom");
 const cpu = @import("cpu");
 const vic256 = @import("vic256.zig");
 const aur1 = @import("aur1.zig");
-const io = @import("io.zig");
+const io = @import("io");
 const debugger = @import("debugger.zig");
 const encode = @import("encode");
 
@@ -30,7 +30,7 @@ comptime {
     _ = &cpu.Gab16.reset;
     _ = &vic256.init;
     _ = &aur1.init;
-    _ = &io.init;
+    _ = &io.Io.init;
     _ = &debugger.init;
 }
 

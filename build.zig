@@ -41,6 +41,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const io_mod = b.createModule(.{
+        .root_source_file = b.path("src/io.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+        },
+    });
     const bus_mod = b.createModule(.{
         .root_source_file = b.path("src/bus.zig"),
         .target = target,
@@ -49,6 +57,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "util", .module = util_mod },
             .{ .name = "ram", .module = ram_mod },
             .{ .name = "rom", .module = rom_mod },
+            .{ .name = "io", .module = io_mod },
         },
     });
     const encode_mod = b.createModule(.{
@@ -67,9 +76,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "util", .module = util_mod },
             .{ .name = "bus", .module = bus_mod },
             .{ .name = "encode", .module = encode_mod },
-            // ram/rom are used by cpu.zig's test fixtures only.
+            // ram/rom/io are used by cpu.zig's test fixtures only.
             .{ .name = "ram", .module = ram_mod },
             .{ .name = "rom", .module = rom_mod },
+            .{ .name = "io", .module = io_mod },
         },
     });
 
@@ -113,6 +123,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "bus", .module = bus_mod },
             .{ .name = "encode", .module = encode_mod },
             .{ .name = "cpu", .module = cpu_mod },
+            .{ .name = "io", .module = io_mod },
         },
     });
     exe_module.linkLibrary(sdl_lib); // 0.16: linking is a Module property
@@ -142,6 +153,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "rom", .module = rom_mod },
             .{ .name = "bus", .module = bus_mod },
             .{ .name = "cpu", .module = cpu_mod },
+            .{ .name = "io", .module = io_mod },
         },
     });
     const harness_exe = b.addExecutable(.{
@@ -206,6 +218,7 @@ pub fn build(b: *std.Build) void {
         util_mod,
         ram_mod,
         rom_mod,
+        io_mod,
         bus_mod,
         encode_mod,
         cpu_mod,
