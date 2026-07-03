@@ -4,27 +4,13 @@
 //! LOCKED v1.1 amendment §1.1–§1.7 (which supersedes Phase 2 where they
 //! disagree). One instruction per cycle, uniform (D17).
 //!
-//! Implementation decisions where the spec is silent (each marked
-//! `DECISION:` at its use site; candidates for a v1.2 amendment):
-//!   1. Trap/interrupt resume PC — the pushed PC is the address of the
-//!      *following* instruction (PC has already advanced past fetch), so RTI
-//!      resumes after the trapping instruction. Consistent with interrupts
-//!      pushing the resume point.
-//!   2. SHL/SHR operate on the full 20-bit register value (required by the
-//!      documented pointer technique "SHR by 16 and CMP again", §1.1);
-//!      ASR operates on the 16-bit signed domain ("sign from bit 15",
-//!      Phase 2 §2.4) and zero-extends its 16-bit result. Shift carry-out is
-//!      taken from the 16-bit view, since FLAGS always derive from the low
-//!      16 bits (§1.6).
-//!   3. DIV/MOD are unsigned, on the full 20-bit register values.
-//!   4. MFSR of CYC goes through the standard register write path and is
-//!      therefore masked to 20 bits — the amendment's normative `set_reg`
-//!      masks *every* register write (§1.1). CYC itself is 32-bit and wraps
-//!      (defined behaviour, G20).
-//!   5. MFSR of a reserved sreg (6–15) reads 0; MTSR to one is ignored
-//!      (mirrors the CYC-write-ignored rule, §1.4).
-//!   6. Delivering an interrupt or trap consumes one cycle; a halted CPU
-//!      consumes one cycle per idle step (timers keep ticking, Block 4).
+//! Points where the v1.1 spec was silent are now LOCKED by the v1.2
+//! amendment (docs/flommodore-spec-amendment-v1_2.md), cited as D36-D47 at
+//! their use sites: trap resume PC (D36), shift domains (D37), unsigned
+//! DIV/MOD (D38), 20-bit CYC (D39), reserved sregs (D40), cycle accounting
+//! (D41), MTSR violation semantics (D42), ignored encoding fields (D43),
+//! supervisor-only RTI (D44), user-mode SEI/CLI ignored (D45), user-mode
+//! entry (D46).
 
 const std = @import("std");
 const util = @import("util");
@@ -77,8 +63,10 @@ pub const Gab16 = struct {
     usp: u32,
     ssp: u32,
     sys: u16,
-    /// 32-bit cycle counter; wraps every ~298 s at 14.4 MHz — defined
-    /// behaviour (G20). One increment per step (D17).
+    /// Cycle counter — architecturally 20 bits (D39): MFSR passes it
+    /// through the masked register write, so software sees a counter that
+    /// wraps every 2^20 cycles (~72.8 ms). Kept wider here for the
+    /// debugger. Increments once per step of every kind (D17/D41).
     cyc: u32,
     halted: bool,
     /// Level-sensitive IRQ line, driven by the IRQ controller (Block 4) or
@@ -132,7 +120,7 @@ pub const Gab16 = struct {
         if (cpu.irq_line and (cpu.flags & flag_i) != 0) {
             cpu.halted = false;
             cpu.enterVector(bus, vec_irq);
-            return .irq_entered; // DECISION 6: delivery consumes the cycle
+            return .irq_entered; // delivery consumes the cycle (D41)
         }
         if (cpu.halted) return .halted_idle;
 
@@ -144,7 +132,7 @@ pub const Gab16 = struct {
         const d = decode(word) catch {
             // Illegal instruction (unassigned opcode, or nonzero reserved
             // FUNC/FLAGS fields, D32/D35) → BRK vector.
-            cpu.enterVector(bus, vec_brk); // DECISION 1: pushed PC = next
+            cpu.enterVector(bus, vec_brk); // pushed PC = next instruction (D36)
             return .trapped;
         };
         return cpu.execute(bus, d);
@@ -285,10 +273,24 @@ pub const Gab16 = struct {
 
             // ---- System (task 3.12) ----
             .nop => {},
-            .hlt => cpu.halted = true,
-            .rti => cpu.execRti(bus),
-            .sei => cpu.flags |= flag_i,
-            .cli => cpu.flags &= ~flag_i,
+            .hlt => cpu.halted = true, // unprivileged (D45)
+            .rti => {
+                // RTI is supervisor-only (D44): user code controls its own
+                // stack, so a user-mode RTI would be a privilege escalation.
+                if ((cpu.flags & flag_s) == 0) {
+                    cpu.enterVector(bus, vec_brk);
+                    return .trapped;
+                }
+                cpu.execRti(bus);
+            },
+            // SEI/CLI are silently ignored in user mode (D45), consistent
+            // with user-mode FLAGS writes ignoring the I bit (§1.4).
+            .sei => if ((cpu.flags & flag_s) != 0) {
+                cpu.flags |= flag_i;
+            },
+            .cli => if ((cpu.flags & flag_s) != 0) {
+                cpu.flags &= ~flag_i;
+            },
             .mfsr => cpu.setReg(d.rd, cpu.readSreg(d.ra)), // n in the RA field (§1.4)
             .mtsr => {
                 // n in the RD field (§1.4). Privilege violations trap to BRK.
@@ -323,10 +325,9 @@ pub const Gab16 = struct {
             2 => cpu.usp,
             3 => cpu.ssp,
             4 => cpu.sys,
-            // DECISION 4: goes through the masked register write like every
-            // other MFSR; CYC itself is the full 32-bit wrapping counter.
+            // Architecturally 20-bit (D39): masked by the register write.
             5 => cpu.cyc,
-            else => 0, // DECISION 5: reserved sregs read 0
+            else => 0, // reserved sregs read 0 (D40)
         };
     }
 
@@ -357,7 +358,7 @@ pub const Gab16 = struct {
                 cpu.sys = @truncate(val);
             },
             5 => {}, // CYC writes are ignored (§1.4)
-            else => {}, // DECISION 5: reserved sreg writes are ignored
+            else => {}, // reserved sreg writes are ignored (D40)
         }
         return true;
     }
@@ -413,8 +414,8 @@ pub const Gab16 = struct {
         cpu.setV(false);
     }
 
-    /// DECISION 2: SHL on the full 20-bit value; carry = last bit shifted
-    /// out of the 16-bit field (bit 16−n of the original), 0 if shift = 0.
+    /// SHL on the full 20-bit value (D37); carry = last bit shifted out of
+    /// the 16-bit field (bit 16−n of the original), 0 if shift = 0.
     fn aluShl(cpu: *Gab16, rd: u4, a: u32, n: u4) void {
         const result = (a << n) & util.addr_mask;
         cpu.setReg(rd, result);
@@ -424,9 +425,9 @@ pub const Gab16 = struct {
         cpu.setV(false);
     }
 
-    /// DECISION 2: SHR on the full 20-bit value (enables the "SHR by 16"
-    /// pointer-high-bits technique, §1.1); carry = last bit shifted out
-    /// (bit n−1 of the original), 0 if shift = 0.
+    /// SHR on the full 20-bit value (D37) — pointer bits 19:16 participate;
+    /// carry = last bit shifted out (bit n−1 of the original), 0 if
+    /// shift = 0.
     fn aluShr(cpu: *Gab16, rd: u4, a: u32, n: u4) void {
         const result = a >> n;
         cpu.setReg(rd, result);
@@ -435,8 +436,8 @@ pub const Gab16 = struct {
         cpu.setV(false);
     }
 
-    /// DECISION 2: ASR on the 16-bit signed domain ("sign from bit 15"),
-    /// result zero-extended into the register; carry as SHR.
+    /// ASR on the 16-bit signed domain ("sign from bit 15", D37), result
+    /// zero-extended into the register; carry as SHR.
     fn aluAsr(cpu: *Gab16, rd: u4, a: u32, n: u4) void {
         const a16: u16 = @truncate(a);
         const r16: u16 = @bitCast(@as(i16, @bitCast(a16)) >> n);
@@ -455,8 +456,8 @@ pub const Gab16 = struct {
         cpu.setV(false);
     }
 
-    /// DECISION 3: unsigned, full 20-bit operands. Divide by zero:
-    /// RD ← $FFFF, V ← 1, no trap — for both DIV and MOD (§1.6).
+    /// Unsigned, full 20-bit operands (D38). Divide by zero: RD ← $FFFF,
+    /// V ← 1, no trap — for both DIV and MOD (§1.6).
     fn aluDivMod(cpu: *Gab16, rd: u4, a: u32, b: u32, comptime kind: enum { quotient, remainder }) void {
         if (b == 0) {
             cpu.setReg(rd, 0xFFFF);
@@ -851,7 +852,7 @@ test "3.6/3.7 ALU: results and the §1.6 flag table" {
     f.run(9);
     try testing.expectEqual(@as(u32, 0x30000), cpu.getReg(3));
     try testing.expectEqual(@as(u32, 0xF), cpu.getReg(6));
-    try testing.expectEqual(@as(u32, 0xFFFE), cpu.getReg(8)); // bits 19:16 zeroed (DECISION 2)
+    try testing.expectEqual(@as(u32, 0xFFFE), cpu.getReg(8)); // bits 19:16 zeroed (D37)
     // Zero shift: C=0.
     f.load(&.{ encode.li(1, 0x8000), encode.shl(2, 1, 0) });
     f.run(2);
@@ -986,7 +987,7 @@ test "3.12 system: HLT halts and idles; SEI/CLI; MFSR/MTSR + privilege" {
     const pc_at_halt = cpu.pc;
     try testing.expectEqual(Event.halted_idle, f.cpu.step(&f.bus));
     try testing.expectEqual(pc_at_halt, cpu.pc); // idle cycles don't fetch
-    try testing.expectEqual(@as(u32, 4), cpu.cyc); // but do count (DECISION 6)
+    try testing.expectEqual(@as(u32, 4), cpu.cyc); // but do count (D41)
 
     // Supervisor MTSR/MFSR round-trips.
     var f2 = try Fixture.setup();
@@ -1139,6 +1140,68 @@ test "3.16 mode transitions: MTSR privilege traps; user FLAGS write ignores I/S"
     f4.load(&.{ encode.li(1, 0), encode.mtsr(.flags, 1) });
     f4.run(2);
     try testing.expect(f4.cpu.flags & flag_s == 0);
+}
+
+test "D44: RTI is supervisor-only — user-mode RTI traps, no escalation" {
+    var f = try Fixture.setup();
+    defer f.teardown();
+    const cpu = &f.cpu;
+    write32(&f.bus, 0x0000C, 0x02000); // BRK vector (IVT = 0)
+    write32(&f.bus, 0x02000, encode.hlt());
+    cpu.ssp = 0x020F0;
+    cpu.flags = 0; // user mode
+    // The attack: craft a frame with S=1 and RTI into supervisor mode.
+    f.load(&.{
+        encode.li(1, 0x30), // FLAGS image: S=1, I=1
+        encode.push(1),
+        encode.rti(),
+    });
+    // (frame layout irrelevant — the RTI must trap before touching it)
+    f.run(2);
+    try testing.expectEqual(Event.trapped, f.cpu.step(&f.bus));
+    try testing.expectEqual(@as(u32, 0x02000), cpu.pc); // in the BRK handler
+    // Supervisor mode was entered by the *trap*, with a proper frame on the
+    // supervisor stack — not by the forged RTI.
+    try testing.expectEqual(@as(u32, 0x020F0 - 8), cpu.getReg(Gab16.sp));
+    const pushed_flags = read32(&f.bus, cpu.getReg(Gab16.sp));
+    try testing.expectEqual(@as(u32, 0), pushed_flags & flag_s); // pre-trap S=0 preserved
+}
+
+test "D45: SEI/CLI are ignored in user mode; supervisor unaffected" {
+    var f = try Fixture.setup();
+    defer f.teardown();
+    const cpu = &f.cpu;
+    // User mode with I=1: CLI must not clear it, SEI must be a no-op too.
+    cpu.flags = flag_i;
+    f.load(&.{ encode.cli(), encode.sei(), encode.nop() });
+    f.run(2);
+    try testing.expectEqual(flag_i, cpu.flags); // untouched, no trap
+    // User mode with I=0: SEI must not enable interrupts.
+    cpu.flags = 0;
+    f.load(&.{encode.sei()});
+    f.run(1);
+    try testing.expectEqual(@as(u16, 0), cpu.flags);
+    // Supervisor semantics unchanged.
+    cpu.flags = flag_s;
+    f.load(&.{ encode.sei(), encode.cli() });
+    f.run(1);
+    try testing.expect(cpu.flags & flag_i != 0);
+    f.run(1);
+    try testing.expect(cpu.flags & flag_i == 0);
+}
+
+test "D46: supervisor MTSR FLAGS clearing S performs no stack switch" {
+    var f = try Fixture.setup();
+    defer f.teardown();
+    const cpu = &f.cpu;
+    cpu.ssp = 0x020F0;
+    cpu.usp = 0x00500;
+    f.load(&.{ encode.li(1, 0), encode.mtsr(.flags, 1) });
+    f.run(2);
+    try testing.expect(cpu.flags & flag_s == 0); // dropped to user…
+    try testing.expectEqual(@as(u32, 0x01100), cpu.getReg(Gab16.sp)); // …but SP untouched
+    try testing.expectEqual(@as(u32, 0x00500), cpu.usp); // USP untouched
+    try testing.expectEqual(@as(u32, 0x020F0), cpu.ssp); // SSP untouched
 }
 
 test "3.17 decoder fuzz: random instruction words never panic" {

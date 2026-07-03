@@ -358,9 +358,10 @@ fn buildStack() RomImage {
     return image;
 }
 
-/// test_cpu_irq.rom (tasks 3.12-3.16): BRK trap, IRQ with nesting, the
-/// supervisor->user transition via RTI, a user-mode privilege trap, and the
-/// user-mode stack switch. Run with:
+/// test_cpu_irq.rom (tasks 3.12-3.16 + amendment v1.2): BRK trap, IRQ with
+/// nesting, the D46 supervisor->user RTI-frame transition, user-mode
+/// privilege traps (MTSR and RTI, D42/D44), ignored user-mode CLI (D45),
+/// and the user-mode stack switch. Run with:
 ///   --irq-at 30 --irq-at 60 --irq-at 200
 /// (assert-until-delivered semantics make the exact cycles forgiving).
 fn buildIrq() RomImage {
@@ -449,6 +450,15 @@ fn buildIrq() RomImage {
     // 8: SSP survived the user-mode IRQ round-trip (MFSR is never privileged).
     u.emit(encode.mfsr(5, .ssp));
     u.checkEqImm(9, 5, 0x20F0);
+    // 9: CLI is silently ignored in user mode (D45): I stays 1.
+    u.emit(encode.cli());
+    u.emit(encode.mfsr(5, .flags));
+    u.emit(encode.andi(6, 5, 0x10));
+    u.checkEqImm(10, 6, 0x10);
+    // 10: RTI is supervisor-only (D44): a user-mode RTI traps to BRK
+    // (R10 -> 3) and resumes after the RTI word (D36).
+    u.emit(encode.rti());
+    u.checkEqImm(11, 10, 3);
     u.pass();
     return image;
 }

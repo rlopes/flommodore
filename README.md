@@ -34,4 +34,8 @@ zig build -Dtarget=x86_64-macos      # macOS host only (needs the Apple SDK)
 ## Spec
 
 Implementation follows the v1.1 spec amendment (LOCKED), which supersedes the
-v1.0 phase documents wherever they disagree.
+v1.0 phase documents wherever they disagree, plus the v1.2 amendment
+(`docs/flommodore-spec-amendment-v1_2.md`) covering the points the Block 2–3
+implementation surfaced: trap resume PC, shift domains, unsigned DIV/MOD,
+20-bit CYC, the completed privilege matrix (supervisor-only RTI, user-ignored
+SEI/CLI), user-mode entry, and I/O byte-write/straddle composition (D36–D47).
