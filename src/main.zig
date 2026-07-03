@@ -1,99 +1,77 @@
-//! main.zig — Flommodore emulator entry point.
+//! Flommodore — `main.zig` (Block 1).
 //!
-//! Block 1 version: opens an SDL3 window and closes cleanly.
-//! Stubs for the main emulation loop will be filled in by Block 5.
-//!
-//! Zig 0.16 notes:
-//!   • @cImport is removed — SDL3 is imported via the "sdl3" module produced
-//!     by addTranslateC in build.zig.
-//!   • std.io.getStdOut() is gone — use std.debug.print for simple output,
-//!     or the new std.Io interface for file I/O.
+//! Entry point. For Block 1 this opens an SDL3 window titled "Flommodore",
+//! polls events, and exits cleanly on window close or ESC (task 1.2).
+//! The emulator main loop (scanline-quantum scheduling, 240,000 cycles/frame)
+//! arrives in Block 5.
 
 const std = @import("std");
-// "sdl3" is the module produced by build.zig's addTranslateC step.
-//const sdl = @import("sdl3");
-const sdl = @cImport({
-    @cDefine("SDL_DISABLE_OLD_NAMES", {});
-    @cInclude("SDL3/SDL.h");
-    @cInclude("SDL3/SDL_revision.h");
-    @cDefine("SDL_MAIN_HANDLED", {}); // We are providing our own entry point
-    @cInclude("SDL3/SDL_main.h");
-});
+const sdl = @import("sdl3");
 
 const util = @import("util.zig");
 const bus = @import("bus.zig");
+const ram = @import("ram.zig");
+const rom = @import("rom.zig");
 const cpu = @import("cpu.zig");
 const vic256 = @import("vic256.zig");
 const aur1 = @import("aur1.zig");
 const io = @import("io.zig");
 const debugger = @import("debugger.zig");
+const encode = @import("encode.zig");
 
-const log = util.log;
+// Force semantic analysis of every stub so dead modules can't rot between
+// blocks (Zig 0.16 analyses lazily; an unreferenced file is never checked).
+comptime {
+    _ = &bus.init;
+    _ = &ram.init;
+    _ = &rom.init;
+    _ = &cpu.init;
+    _ = &vic256.init;
+    _ = &aur1.init;
+    _ = &io.init;
+    _ = &debugger.init;
+    _ = &encode.init;
+    _ = &util.maskAddr;
+}
 
-// ── Window defaults ──────────────────────────────────────────────────────────
-// Native Flommodore resolution: 320×180 (16:9, pixel-doubled).
-// Window is 4× that for a comfortable default on modern displays.
-const WINDOW_TITLE = "Flommodore Fantasy Computer";
-const WINDOW_WIDTH = 320 * 4; // 1280
-const WINDOW_HEIGHT = 180 * 4; // 720
+/// Initial window size. Placeholder until the VIC-256 render pipeline
+/// (Block 6) fixes the framebuffer dimensions per display mode.
+const initial_window_width = 960;
+const initial_window_height = 540;
 
 pub fn main() !void {
-    log.info("Flommodore emulator — Block 1 scaffold (Zig 0.16)", .{});
-
-    // ── SDL3 initialisation ──────────────────────────────────────────────────
-    if (!sdl.SDL_Init(sdl.SDL_INIT_VIDEO | sdl.SDL_INIT_AUDIO)) {
-        log.err("SDL_Init failed: {s}", .{sdl.SDL_GetError()});
+    if (!sdl.SDL_Init(sdl.SDL_INIT_VIDEO)) {
+        util.logErr("SDL_Init failed: {s}", .{sdl.SDL_GetError()});
         return error.SdlInitFailed;
     }
     defer sdl.SDL_Quit();
 
     const window = sdl.SDL_CreateWindow(
-        WINDOW_TITLE,
-        WINDOW_WIDTH,
-        WINDOW_HEIGHT,
-        sdl.SDL_WINDOW_RESIZABLE,
+        "Flommodore",
+        initial_window_width,
+        initial_window_height,
+        0,
     ) orelse {
-        log.err("SDL_CreateWindow failed: {s}", .{sdl.SDL_GetError()});
-        return error.SdlWindowFailed;
+        util.logErr("SDL_CreateWindow failed: {s}", .{sdl.SDL_GetError()});
+        return error.SdlCreateWindowFailed;
     };
     defer sdl.SDL_DestroyWindow(window);
 
-    log.info("Window opened ({d}×{d}) — Block 1 OK", .{ WINDOW_WIDTH, WINDOW_HEIGHT });
+    util.logInfo("Flommodore Block 1 scaffold — window open; close or press ESC to quit", .{});
 
-    // ── Stub initialisation of all subsystems ────────────────────────────────
-    // These are no-ops in Block 1.  Each module's real init() is implemented
-    // in the corresponding block.
-    bus.init();
-    cpu.init();
-    vic256.init();
-    aur1.init();
-    io.init();
-    debugger.init();
-
-    // ── Minimal event loop — exit on quit ────────────────────────────────────
-    // The real emulation loop (timing, CPU ticks, frame render) is Block 5.
-    var event: sdl.SDL_Event = undefined;
     var running = true;
     while (running) {
+        var event: sdl.SDL_Event = undefined;
         while (sdl.SDL_PollEvent(&event)) {
             switch (event.type) {
                 sdl.SDL_EVENT_QUIT => running = false,
                 sdl.SDL_EVENT_KEY_DOWN => {
-                    if (event.key.scancode == sdl.SDL_SCANCODE_ESCAPE) {
-                        running = false;
-                    }
+                    if (event.key.key == sdl.SDLK_ESCAPE) running = false;
                 },
                 else => {},
             }
         }
-        // Nothing to render yet — sleep to avoid burning CPU.
-        sdl.SDL_Delay(16);
+        // Nothing to render yet; don't spin a core while idle.
+        sdl.SDL_Delay(10);
     }
-
-    log.info("Clean exit.", .{});
-}
-
-test {
-    std.testing.refAllDecls(@This());
-    _ = @import("test_memory.zig");
 }
