@@ -8,30 +8,30 @@
 const std = @import("std");
 const sdl = @import("sdl3");
 
-const util = @import("util.zig");
-const bus = @import("bus.zig");
-const ram = @import("ram.zig");
-const rom = @import("rom.zig");
+const util = @import("util");
+const bus = @import("bus");
+const ram = @import("ram");
+const rom = @import("rom");
 const cpu = @import("cpu.zig");
 const vic256 = @import("vic256.zig");
 const aur1 = @import("aur1.zig");
 const io = @import("io.zig");
 const debugger = @import("debugger.zig");
-const encode = @import("encode.zig");
+const encode = @import("encode");
 
 // Force semantic analysis of every stub so dead modules can't rot between
 // blocks (Zig 0.16 analyses lazily; an unreferenced file is never checked).
 comptime {
-    _ = &bus.init;
-    _ = &ram.init;
-    _ = &rom.init;
+    _ = &bus.Bus.init;
+    _ = &ram.Ram.init;
+    _ = &rom.Rom.init;
+    _ = &encode.nop;
+    _ = &util.maskAddr;
     _ = &cpu.init;
     _ = &vic256.init;
     _ = &aur1.init;
     _ = &io.init;
     _ = &debugger.init;
-    _ = &encode.init;
-    _ = &util.maskAddr;
 }
 
 /// Initial window size. Placeholder until the VIC-256 render pipeline

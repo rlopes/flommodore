@@ -1,22 +1,64 @@
-//! Flommodore — build script (Block 1).
+//! Flommodore — build script (Blocks 1–2).
 //!
 //! Zig 0.16 build graph:
 //!   zig build            → the `flommodore` emulator binary (SDL3 statically linked)
 //!   zig build run        → build + launch the emulator window
 //!   zig build test       → all unit-test artifacts (one `test` step, many run artifacts)
-//!   zig build genroms    → test-ROM generator (placeholder until Block 2)
+//!   zig build genroms    → emit generated test ROMs into tests/roms/
+//!   zig build harness -- --rom <path>  → headless runner (no SDL)
 //!
-//! API shapes below (`addExecutable` taking `.root_module`, `b.createModule`,
-//! `b.addTranslateC` + `createModule()` for C headers, `addTest` taking
-//! `.root_module`) were verified against the installed Zig 0.16.0 std.Build
-//! source and the official 0.16.0 release notes ("@cImport Moving to Build
-//! System" section), 2026-07-02.
+//! Core machine components (util, ram, rom, bus, encode) are named modules
+//! so `tests/` code and — later — the toolchain binaries can import them
+//! without file-path imports across directory roots. Each type then has
+//! exactly one canonical instance in the build graph.
+//!
+//! API shapes were verified against the installed Zig 0.16.0 std.Build
+//! source and the official 0.16.0 release notes, 2026-07-02.
 
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // ------------------------------------------------------------------
+    // Core machine modules (Block 2). Dependency edges are explicit:
+    //   util ← {ram? no, rom? no, bus, encode}
+    //   bus  ← util, ram, rom
+    // ------------------------------------------------------------------
+    const util_mod = b.createModule(.{
+        .root_source_file = b.path("src/util.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ram_mod = b.createModule(.{
+        .root_source_file = b.path("src/ram.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const rom_mod = b.createModule(.{
+        .root_source_file = b.path("src/rom.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bus_mod = b.createModule(.{
+        .root_source_file = b.path("src/bus.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "ram", .module = ram_mod },
+            .{ .name = "rom", .module = rom_mod },
+        },
+    });
+    const encode_mod = b.createModule(.{
+        .root_source_file = b.path("src/encode.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+        },
+    });
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -52,14 +94,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "sdl3", .module = sdl3_module },
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "ram", .module = ram_mod },
+            .{ .name = "rom", .module = rom_mod },
+            .{ .name = "bus", .module = bus_mod },
+            .{ .name = "encode", .module = encode_mod },
         },
     });
+    exe_module.linkLibrary(sdl_lib); // 0.16: linking is a Module property
 
     const exe = b.addExecutable(.{
         .name = "flommodore",
         .root_module = exe_module,
     });
-    exe_module.linkLibrary(sdl_lib); // 0.16: linking is a Module property, not a Compile-step method
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -69,45 +116,88 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // ------------------------------------------------------------------
-    // Tests. The `test` step is created exactly ONCE; each per-module test
-    // binary gets its own run artifact which the single step depends on.
-    // (Registering the same step name twice is a build error — the pre-v1.1
-    // scaffold's loop bug, audit P6.)
+    // Headless harness (task 2.8) — never links or imports SDL.
     // ------------------------------------------------------------------
-    const test_step = b.step("test", "Run all unit tests");
-
-    // Test roots grow over the blocks; Block 1 ships util (real tests) and
-    // encode (stub — compiles and runs zero tests, proving the multi-artifact
-    // step shape works).
-    const test_roots = [_][]const u8{
-        "src/util.zig",
-        "src/encode.zig",
-    };
-    for (test_roots) |root| {
-        const t = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(root),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        test_step.dependOn(&b.addRunArtifact(t).step);
-    }
+    const harness_module = b.createModule(.{
+        .root_source_file = b.path("tests/harness.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "ram", .module = ram_mod },
+            .{ .name = "rom", .module = rom_mod },
+            .{ .name = "bus", .module = bus_mod },
+        },
+    });
+    const harness_exe = b.addExecutable(.{
+        .name = "harness",
+        .root_module = harness_module,
+    });
+    b.installArtifact(harness_exe);
+    const harness_run = b.addRunArtifact(harness_exe);
+    if (b.args) |args| harness_run.addArgs(args);
+    const harness_step = b.step("harness", "Run the headless test harness (-- --rom <path>)");
+    harness_step.dependOn(&harness_run.step);
 
     // ------------------------------------------------------------------
-    // genroms — placeholder step so the build-graph shape is final now.
-    // Block 2 replaces the stub body with real test-ROM builders emitting
-    // into tests/roms/.
+    // genroms (task 2.7): emit generated test ROMs into tests/roms/.
+    // Runs on the host (it only writes files) and receives the output
+    // directory as argv[1] so cwd never matters.
     // ------------------------------------------------------------------
+    const host_util = b.createModule(.{
+        .root_source_file = b.path("src/util.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const host_rom = b.createModule(.{
+        .root_source_file = b.path("src/rom.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const host_encode = b.createModule(.{
+        .root_source_file = b.path("src/encode.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{.{ .name = "util", .module = host_util }},
+    });
+    const genroms_module = b.createModule(.{
+        .root_source_file = b.path("tests/genroms.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{
+            .{ .name = "util", .module = host_util },
+            .{ .name = "rom", .module = host_rom },
+            .{ .name = "encode", .module = host_encode },
+        },
+    });
     const genroms_exe = b.addExecutable(.{
         .name = "genroms",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/genroms.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
+        .root_module = genroms_module,
     });
     const genroms_run = b.addRunArtifact(genroms_exe);
-    const genroms_step = b.step("genroms", "Generate test ROMs (not implemented until Block 2)");
+    genroms_run.addArg(b.pathFromRoot("tests/roms"));
+    // Always regenerate: output freshness is the builders' concern, and the
+    // images are tiny.
+    genroms_run.has_side_effects = true;
+    const genroms_step = b.step("genroms", "Generate test ROMs into tests/roms/");
     genroms_step.dependOn(&genroms_run.step);
+
+    // ------------------------------------------------------------------
+    // Tests. The `test` step is created exactly ONCE; each per-module test
+    // binary gets its own run artifact which the single step depends on.
+    // ------------------------------------------------------------------
+    const test_step = b.step("test", "Run all unit tests");
+    const test_modules = [_]*std.Build.Module{
+        util_mod,
+        ram_mod,
+        rom_mod,
+        bus_mod,
+        encode_mod,
+        genroms_module,
+        harness_module,
+    };
+    for (test_modules) |mod| {
+        const t = b.addTest(.{ .root_module = mod });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 }
