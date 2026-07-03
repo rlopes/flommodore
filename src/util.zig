@@ -28,6 +28,28 @@ comptime {
     std.debug.assert(cycles_per_frame == 240_000);
 }
 
+/// Per-display-mode scanline timing (Phase 3 §3.11; plan Block 5). The main
+/// loop runs `cycles_per_line` CPU cycles per scanline quantum, and
+/// `total_lines` quanta per frame. Every mode multiplies out to exactly
+/// 240,000 cycles/frame (audit E21/G16).
+pub const ModeTiming = struct {
+    cycles_per_line: u32,
+    total_lines: u32,
+};
+
+pub const mode_timing = [4]ModeTiming{
+    .{ .cycles_per_line = 1200, .total_lines = 200 }, // Mode 0
+    .{ .cycles_per_line = 600, .total_lines = 400 }, //  Mode 1
+    .{ .cycles_per_line = 400, .total_lines = 600 }, //  Mode 2
+    .{ .cycles_per_line = 320, .total_lines = 750 }, //  Mode 3
+};
+
+comptime {
+    for (mode_timing) |m| {
+        std.debug.assert(m.cycles_per_line * m.total_lines == cycles_per_frame);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Addresses (spec amendment §1.7: bus wraps at $FFFFF).
 // ---------------------------------------------------------------------------

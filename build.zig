@@ -60,6 +60,19 @@ pub fn build(b: *std.Build) void {
             .{ .name = "io", .module = io_mod },
         },
     });
+    const flapp_mod = b.createModule(.{
+        .root_source_file = b.path("src/flapp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "bus", .module = bus_mod },
+            // ram/rom/io are used by flapp.zig's test fixture only.
+            .{ .name = "ram", .module = ram_mod },
+            .{ .name = "rom", .module = rom_mod },
+            .{ .name = "io", .module = io_mod },
+        },
+    });
     const encode_mod = b.createModule(.{
         .root_source_file = b.path("src/encode.zig"),
         .target = target,
@@ -124,6 +137,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "encode", .module = encode_mod },
             .{ .name = "cpu", .module = cpu_mod },
             .{ .name = "io", .module = io_mod },
+            .{ .name = "flapp", .module = flapp_mod },
         },
     });
     exe_module.linkLibrary(sdl_lib); // 0.16: linking is a Module property
@@ -154,6 +168,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "bus", .module = bus_mod },
             .{ .name = "cpu", .module = cpu_mod },
             .{ .name = "io", .module = io_mod },
+            .{ .name = "flapp", .module = flapp_mod },
         },
     });
     const harness_exe = b.addExecutable(.{
@@ -187,6 +202,40 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
         .imports = &.{.{ .name = "util", .module = host_util }},
     });
+    const host_ram = b.createModule(.{
+        .root_source_file = b.path("src/ram.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const host_io = b.createModule(.{
+        .root_source_file = b.path("src/io.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{.{ .name = "util", .module = host_util }},
+    });
+    const host_bus = b.createModule(.{
+        .root_source_file = b.path("src/bus.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{
+            .{ .name = "util", .module = host_util },
+            .{ .name = "ram", .module = host_ram },
+            .{ .name = "rom", .module = host_rom },
+            .{ .name = "io", .module = host_io },
+        },
+    });
+    const host_flapp = b.createModule(.{
+        .root_source_file = b.path("src/flapp.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{
+            .{ .name = "util", .module = host_util },
+            .{ .name = "bus", .module = host_bus },
+            .{ .name = "ram", .module = host_ram },
+            .{ .name = "rom", .module = host_rom },
+            .{ .name = "io", .module = host_io },
+        },
+    });
     const genroms_module = b.createModule(.{
         .root_source_file = b.path("tests/genroms.zig"),
         .target = b.graph.host,
@@ -195,6 +244,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "util", .module = host_util },
             .{ .name = "rom", .module = host_rom },
             .{ .name = "encode", .module = host_encode },
+            .{ .name = "flapp", .module = host_flapp },
         },
     });
     const genroms_exe = b.addExecutable(.{
@@ -220,6 +270,7 @@ pub fn build(b: *std.Build) void {
         rom_mod,
         io_mod,
         bus_mod,
+        flapp_mod,
         encode_mod,
         cpu_mod,
         genroms_module,

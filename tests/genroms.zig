@@ -12,6 +12,7 @@ const std = @import("std");
 const encode = @import("encode");
 const rom = @import("rom");
 const util = @import("util");
+const flapp = @import("flapp");
 
 /// A 16KB ROM image under construction, addressed in machine addresses
 /// (`$FC000–$FFFFF`) so builders read like memory maps, not file offsets.
@@ -602,6 +603,34 @@ fn buildIoTimer() RomImage {
     return image;
 }
 
+/// test_prog.flapp (Block 5, task 5.5): a standalone program image built
+/// with encode.zig — loads at the canonical $04100 (D10), writes the PASS
+/// marker, and exits via SYSPWR. Exercises the full .flapp path: header
+/// parse, verbatim load, entry at load+12.
+fn buildTestFlapp() [flapp.header_size + 8 * 4]u8 {
+    var file: [flapp.header_size + 8 * 4]u8 = @splat(0);
+    flapp.writeHeader(file[0..flapp.header_size], .{
+        .version = 1,
+        .entry_offset = flapp.header_size,
+        .min_ram_kb = 1,
+        .load_addr = 0x04100,
+    });
+    const code = [8]u32{
+        encode.li(11, 0x600D),
+        encode.sw(0, result_addr, 11), //  [$00080] <- $600D
+        encode.li(3, 0x0003), //           LOAD_ADDR R3, $80003 (SYSPWR)
+        encode.lui(3, 0x8),
+        encode.li(12, 1),
+        encode.sw(3, 0, 12), //            soft power-off (§5.1)
+        encode.jmpa(0x0410C), //           must never execute
+        encode.nop(),
+    };
+    for (code, 0..) |word, i| {
+        std.mem.writeInt(u32, file[flapp.header_size + 4 * i ..][0..4], word, .little);
+    }
+    return file;
+}
+
 const Builder = struct {
     name: []const u8,
     build: *const fn () RomImage,
@@ -643,6 +672,12 @@ pub fn main(init: std.process.Init) !void {
         try file.writeStreamingAll(io, &image.bytes);
         std.log.info("wrote {s}/{s} ({d} bytes)", .{ out_dir_path, b.name, image.bytes.len });
     }
+
+    const flapp_image = buildTestFlapp();
+    var f = try out_dir.createFile(io, "test_prog.flapp", .{});
+    defer f.close(io);
+    try f.writeStreamingAll(io, &flapp_image);
+    std.log.info("wrote {s}/test_prog.flapp ({d} bytes)", .{ out_dir_path, flapp_image.len });
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +686,15 @@ pub fn main(init: std.process.Init) !void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "genroms: test_prog.flapp parses and enters at load+12" {
+    const file = buildTestFlapp();
+    const h = try flapp.parseHeader(&file);
+    try testing.expectEqual(@as(u32, 0x04100), h.load_addr);
+    try testing.expectEqual(@as(u16, flapp.header_size), h.entry_offset);
+    const first = std.mem.readInt(u32, file[flapp.header_size..][0..4], .little);
+    try testing.expectEqual(encode.li(11, 0x600D), first);
+}
 
 test "genroms: nop_loop image has vectors and code where the spec says" {
     const image = buildNopLoop();

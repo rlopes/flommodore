@@ -8,7 +8,7 @@
 //!     BIOS LFSR arrives in Block 12; nothing random exists yet);
 //!   - `--max-cycles N` bounds the run so looping ROMs terminate.
 //!
-//! Usage: `harness --rom <path> [--max-cycles N] [--quiet]`
+//! Usage: `harness (--rom <path> | --flapp <path>) [--max-cycles N] [--quiet]`
 //!
 //! Block 3: steps the Gab-16 CPU for real. Extras:
 //!   - `--irq-at N` (repeatable, ascending): assert the CPU IRQ line once
@@ -26,9 +26,11 @@ const rom_mod = @import("rom");
 const bus_mod = @import("bus");
 const cpu_mod = @import("cpu");
 const io_mod = @import("io");
+const flapp_mod = @import("flapp");
 
 const Options = struct {
-    rom_path: []const u8,
+    rom_path: ?[]const u8 = null,
+    flapp_path: ?[]const u8 = null,
     max_cycles: u64 = util.cycles_per_frame, // one frame by default
     quiet: bool = false,
     expect_pass: bool = false,
@@ -44,15 +46,18 @@ const failnum_addr: u32 = 0x00084;
 const result_pass: u16 = 0x600D;
 
 fn parseArgs(args: []const []const u8) !Options {
-    var rom_path: ?[]const u8 = null;
-    var opts: Options = .{ .rom_path = undefined };
+    var opts: Options = .{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--rom")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
-            rom_path = args[i];
+            opts.rom_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--flapp")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            opts.flapp_path = args[i];
         } else if (std.mem.eql(u8, arg, "--max-cycles")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -74,7 +79,8 @@ fn parseArgs(args: []const []const u8) !Options {
             return error.UnknownArgument;
         }
     }
-    opts.rom_path = rom_path orelse return error.MissingRom;
+    if (opts.rom_path == null and opts.flapp_path == null) return error.MissingRom;
+    if (opts.rom_path != null and opts.flapp_path != null) return error.RomAndFlapp;
     return opts;
 }
 
@@ -85,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     const opts = parseArgs(args) catch {
-        std.log.err("usage: harness --rom <path> [--max-cycles N] [--irq-at N]... [--expect-pass] [--quiet]", .{});
+        std.log.err("usage: harness (--rom <path> | --flapp <path>) [--max-cycles N] [--irq-at N]... [--expect-pass] [--quiet]", .{});
         return error.BadUsage;
     };
     if (opts.quiet) util.setLevel(.silent);
@@ -102,17 +108,30 @@ pub fn main(init: std.process.Init) !void {
     io_dev.* = io_mod.Io.init();
     var bus = bus_mod.Bus.init(ram, rom, io_dev);
 
-    try rom.loadFromFile(io, std.Io.Dir.cwd(), opts.rom_path);
-    util.logInfo("loaded ROM: {s}", .{opts.rom_path});
-
     var cpu: cpu_mod.Gab16 = undefined;
-    cpu.reset(&bus);
-    util.logInfo("RESET → ${X:0>5}", .{cpu.pc});
-    if (cpu.pc == 0) {
-        // An all-zero vector means an unpopulated image; it would trap to
-        // BRK through a zero IVT immediately (D35). Treat as a bad image.
-        util.logErr("RESET vector is $00000 — not a runnable image", .{});
-        return error.EmptyResetVector;
+    if (opts.rom_path) |path| {
+        try rom.loadFromFile(io, std.Io.Dir.cwd(), path);
+        util.logInfo("loaded ROM: {s}", .{path});
+        cpu.reset(&bus);
+        util.logInfo("RESET → ${X:0>5}", .{cpu.pc});
+        if (cpu.pc == 0) {
+            // An all-zero vector means an unpopulated image; it would trap
+            // to BRK through a zero IVT immediately (D35).
+            util.logErr("RESET vector is $00000 — not a runnable image", .{});
+            return error.EmptyResetVector;
+        }
+    } else {
+        // Standalone .flapp (task 5.5): same pre-BIOS environment the
+        // emulator CLI provides (D12 boot values) — one loader, one truth.
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, opts.flapp_path.?, arena, .limited(1 << 20));
+        cpu.reset(&bus);
+        const entry = try flapp_mod.load(&bus, bytes);
+        cpu.setReg(cpu_mod.Gab16.sp, 0x01100);
+        cpu.ssp = 0x020F0;
+        cpu.usp = 0x01100;
+        cpu.ivt = 0xFFFC0;
+        cpu.pc = entry;
+        util.logInfo("loaded .flapp: {s} → entry ${X:0>5}", .{ opts.flapp_path.?, entry });
     }
 
     // Bounded, deterministic run: one instruction (or idle/delivery step)
@@ -162,7 +181,7 @@ const testing = std.testing;
 
 test "harness: argument parsing" {
     const o1 = try parseArgs(&.{ "harness", "--rom", "x.rom" });
-    try testing.expectEqualStrings("x.rom", o1.rom_path);
+    try testing.expectEqualStrings("x.rom", o1.rom_path.?);
     try testing.expectEqual(@as(u64, util.cycles_per_frame), o1.max_cycles);
     try testing.expect(!o1.quiet);
 
@@ -176,6 +195,10 @@ test "harness: argument parsing" {
     try testing.expectEqual(@as(u64, 60), o3.irq_at[1]);
     try testing.expect(o3.expect_pass);
     try testing.expectError(error.IrqsNotAscending, parseArgs(&.{ "harness", "--rom", "x", "--irq-at", "60", "--irq-at", "30" }));
+
+    const o4 = try parseArgs(&.{ "harness", "--flapp", "p.flapp" });
+    try testing.expectEqualStrings("p.flapp", o4.flapp_path.?);
+    try testing.expectError(error.RomAndFlapp, parseArgs(&.{ "harness", "--rom", "x", "--flapp", "y" }));
 
     try testing.expectError(error.MissingRom, parseArgs(&.{"harness"}));
     try testing.expectError(error.MissingValue, parseArgs(&.{ "harness", "--rom" }));
