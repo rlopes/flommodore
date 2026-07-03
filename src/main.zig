@@ -12,7 +12,7 @@ const util = @import("util");
 const bus = @import("bus");
 const ram = @import("ram");
 const rom = @import("rom");
-const cpu = @import("cpu.zig");
+const cpu = @import("cpu");
 const vic256 = @import("vic256.zig");
 const aur1 = @import("aur1.zig");
 const io = @import("io.zig");
@@ -27,7 +27,7 @@ comptime {
     _ = &rom.Rom.init;
     _ = &encode.nop;
     _ = &util.maskAddr;
-    _ = &cpu.init;
+    _ = &cpu.Gab16.reset;
     _ = &vic256.init;
     _ = &aur1.init;
     _ = &io.init;

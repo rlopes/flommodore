@@ -59,6 +59,19 @@ pub fn build(b: *std.Build) void {
             .{ .name = "util", .module = util_mod },
         },
     });
+    const cpu_mod = b.createModule(.{
+        .root_source_file = b.path("src/cpu.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "bus", .module = bus_mod },
+            .{ .name = "encode", .module = encode_mod },
+            // ram/rom are used by cpu.zig's test fixtures only.
+            .{ .name = "ram", .module = ram_mod },
+            .{ .name = "rom", .module = rom_mod },
+        },
+    });
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -99,6 +112,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "rom", .module = rom_mod },
             .{ .name = "bus", .module = bus_mod },
             .{ .name = "encode", .module = encode_mod },
+            .{ .name = "cpu", .module = cpu_mod },
         },
     });
     exe_module.linkLibrary(sdl_lib); // 0.16: linking is a Module property
@@ -127,6 +141,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ram", .module = ram_mod },
             .{ .name = "rom", .module = rom_mod },
             .{ .name = "bus", .module = bus_mod },
+            .{ .name = "cpu", .module = cpu_mod },
         },
     });
     const harness_exe = b.addExecutable(.{
@@ -193,6 +208,7 @@ pub fn build(b: *std.Build) void {
         rom_mod,
         bus_mod,
         encode_mod,
+        cpu_mod,
         genroms_module,
         harness_module,
     };
