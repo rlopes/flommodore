@@ -4,6 +4,16 @@ A fully specified fantasy computer — Gab-16 CPU (16-bit RISC, 20-bit address
 bus), VIC-256 video, AUR-1 sound, 512KB RAM — implemented as a reference
 emulator and toolchain in **Zig 0.16** with **SDL3**.
 
+**Milestone 2 — First Pixels — reached** (Block 6): the VIC-256 renders.
+All four display modes (bitmap 8/4/1bpp, tile with fine scroll, bitmap+tile
+overlay, ROM-font text), 64 sprites with flips/sizes/priority/collision and
+the authentic 8-per-scanline limit, double buffering via VSWAP, and — the
+architecture proof — raster IRQs evaluated per scanline quantum: a copper
+chain splitting the background colour mid-frame renders pixel-exactly and is
+pinned by golden SHA-256 frame hashes (`tests/goldens.txt`, verified in CI
+via `harness --frames N --golden HEX`; `--dump-ppm` regenerates the frames
+for eyeballing).
+
 **Milestone 1 — First Execution — reached** (Blocks 1–5): the machine runs.
 The scanline-quantum main loop executes exactly 240,000 cycles/frame at a
 measured 60.000 fps over 60 s, the CPU boots from the ROM RESET vector,
@@ -15,7 +25,7 @@ zig build -Doptimize=ReleaseFast     # Debug is cycle-exact but below real time
 ./zig-out/bin/flommodore tests/roms/test_prog.flapp
 ```
 
-Next: Block 6 — the VIC-256 renderer. First pixels.
+Next: Block 7 — the AUR-1 sound chip.
 
 ## Build
 

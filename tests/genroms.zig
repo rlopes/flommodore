@@ -28,6 +28,11 @@ pub const RomImage = struct {
         return addr - 0xFC000;
     }
 
+    /// Write one raw byte at a machine address inside the ROM (font data).
+    pub fn writeByte(image: *RomImage, addr: u32, byte: u8) void {
+        image.bytes[offsetOf(addr)] = byte;
+    }
+
     /// Write one 32-bit little-endian word (instruction or DD-style data)
     /// at a machine address inside the ROM.
     pub fn writeWord32(image: *RomImage, addr: u32, word: u32) void {
@@ -89,10 +94,14 @@ fn buildNopLoop() RomImage {
 const result_addr: i32 = 0x00080;
 const failnum_addr: i32 = 0x00084;
 const entry_addr: u32 = 0xFC200;
-const user_code_addr: u32 = 0xFC500; // irq ROM: user-mode code
-const irq_handler_addr: u32 = 0xFC600;
-const brk_handler_addr: u32 = 0xFC680;
-const fail_addr: u32 = 0xFC800;
+const user_code_addr: u32 = 0xFC500; // irq ROM: user-mode code (its main stays short)
+// Handlers and the FAIL stub live in high ROM so main code has room to
+// grow: entry region = $FC200–$FCFFF (896 instructions). The Block 6
+// sprite ROM overran the original $FC600 layout — a silent-corruption
+// class of bug the generator can't detect, hence the guard in emitAll.
+const fail_addr: u32 = 0xFD000;
+const irq_handler_addr: u32 = 0xFD100;
+const brk_handler_addr: u32 = 0xFD180;
 
 /// Small assembly kit over the cursor. Register conventions inside test
 /// ROMs: R11 = current check number, R12 = scratch.
@@ -111,6 +120,10 @@ const Kit = struct {
     }
 
     fn emit(kit: *Kit, word: u32) void {
+        // Main code must never grow into the FAIL stub / handler region —
+        // that failure mode is silent image corruption (found the hard way
+        // by the Block 6 sprite ROM).
+        std.debug.assert(kit.cur.addr < fail_addr);
         kit.cur.emit(word);
     }
 
@@ -631,6 +644,353 @@ fn buildTestFlapp() [flapp.header_size + 8 * 4]u8 {
     return file;
 }
 
+// ---------------------------------------------------------------------------
+// Block 6 VIC-256 test ROMs (task 6.21). Verified by golden RGB24 hash via
+// `harness --frames N --golden HEX`; each also self-checks device state and
+// writes the $600D marker (--expect-pass works too).
+// ---------------------------------------------------------------------------
+
+const vic_base: u32 = 0x80200;
+
+/// Emit a VIC register write: SB [R1 + reg-offset], value — R1 must hold
+/// $80200. Uses R12 as scratch.
+fn vicWrite(k: *Kit, reg_offset: i32, value: i32) void {
+    k.emit(encode.li(12, value));
+    k.emit(encode.sb(1, reg_offset, 12));
+}
+
+/// Emit the standard identity palette loop: entry i = (i, i, i) at $02100.
+/// Clobbers R3, R4. ~1.8k cycles.
+fn emitIdentityPalette(k: *Kit) void {
+    k.loadAddr(3, 0x02100);
+    k.emit(encode.li(4, 0));
+    const top = k.cur.addr;
+    k.emit(encode.sb(3, 0, 4));
+    k.emit(encode.sb(3, 1, 4));
+    k.emit(encode.sb(3, 2, 4));
+    k.emit(encode.addi(3, 3, 3));
+    k.emit(encode.addi(4, 4, 1));
+    k.emit(encode.cmpi(4, 256));
+    k.branchTo(.bne, top);
+}
+
+/// Common VIC setup: 320×180 @ 8bpp, palette at $02100, SAT $02400,
+/// tile map $02600, VBUF $44000, VBUF2 $54000. Leaves R1 = $80200.
+fn emitVicBases(k: *Kit) void {
+    k.loadAddr(1, vic_base);
+    vicWrite(k, 0x01, 3); //          VPALETTE = 8bpp
+    vicWrite(k, 0x02, 0); //          VRESX = 320
+    vicWrite(k, 0x03, 0); //          VRESY = 180
+    vicWrite(k, 0x06, 0x00); //       VBUF = $44000/16 = $4400
+    vicWrite(k, 0x07, 0x44);
+    vicWrite(k, 0x08, 0x00); //       VBUF2 = $54000/16 = $5400
+    vicWrite(k, 0x09, 0x54);
+    vicWrite(k, 0x0B, 0x10); //       VPALBASE = $02100/16 = $0210
+    vicWrite(k, 0x0C, 0x02);
+    vicWrite(k, 0x0D, 0x40); //       VSATBASE = $02400/16 = $0240
+    vicWrite(k, 0x0E, 0x02);
+    vicWrite(k, 0x0F, 0x60); //       VTMAPBASE = $02600/16 = $0260
+    vicWrite(k, 0x10, 0x02);
+}
+
+/// test_vic_bitmap.rom: 8bpp bitmap gradient in both buffers (buffer 2
+/// inverted), then a VSWAP — the golden frame shows the *inverted* gradient,
+/// proving tasks 6.7 (bitmap), 6.6 (palette), and 6.19 (double buffer).
+fn buildVicBitmap() RomImage {
+    var image = RomImage.init();
+    var k = Kit.begin(&image);
+    k.emit(encode.li(15, 0x1100));
+    emitIdentityPalette(&k);
+    emitVicBases(&k);
+    // Fill both framebuffers: fb[y*320+x] = (x+y) & $FF; fb2 = ~fb.
+    k.loadAddr(3, 0x44000);
+    k.emit(encode.li(6, 0)); //         y
+    const y_top = k.cur.addr;
+    k.emit(encode.li(7, 0)); //         x
+    const x_top = k.cur.addr;
+    k.emit(encode.add(8, 6, 7)); //     value = x + y (low byte stored)
+    k.emit(encode.sb(3, 0, 8));
+    k.emit(encode.not(9, 8)); //        inverted for buffer 2
+    k.emit(encode.sb(3, 65536, 9)); //  $54000 = $44000 + $10000
+    k.emit(encode.addi(3, 3, 1));
+    k.emit(encode.addi(7, 7, 1));
+    k.emit(encode.cmpi(7, 320));
+    k.branchTo(.bne, x_top);
+    k.emit(encode.addi(6, 6, 1));
+    k.emit(encode.cmpi(6, 180));
+    k.branchTo(.bne, y_top);
+    vicWrite(&k, 0x00, 0); //           VMODE = bitmap
+    vicWrite(&k, 0x0A, 1); //           VSWAP: front becomes the inverted buffer
+    k.emit(encode.li(11, 0x600D));
+    k.emit(encode.sw(0, result_addr, 11));
+    k.emit(encode.hlt()); //            VIC keeps rendering while halted
+    return image;
+}
+
+/// Minimal 8×8 font glyphs for the text ROM.
+const Glyph = struct { ch: u8, rows: [8]u8 };
+const font_glyphs = [_]Glyph{
+    .{ .ch = 'F', .rows = .{ 0xFC, 0x80, 0x80, 0xF8, 0x80, 0x80, 0x80, 0x00 } },
+    .{ .ch = 'L', .rows = .{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0xFC, 0x00 } },
+    .{ .ch = 'O', .rows = .{ 0x78, 0x84, 0x84, 0x84, 0x84, 0x84, 0x78, 0x00 } },
+    .{ .ch = 'M', .rows = .{ 0x84, 0xCC, 0xB4, 0x84, 0x84, 0x84, 0x84, 0x00 } },
+    .{ .ch = 'D', .rows = .{ 0xF8, 0x84, 0x84, 0x84, 0x84, 0x84, 0xF8, 0x00 } },
+    .{ .ch = 'R', .rows = .{ 0xF8, 0x84, 0x84, 0xF8, 0x90, 0x88, 0x84, 0x00 } },
+    .{ .ch = 'E', .rows = .{ 0xFC, 0x80, 0x80, 0xF8, 0x80, 0x80, 0xFC, 0x00 } },
+    .{ .ch = '!', .rows = .{ 0x30, 0x30, 0x30, 0x30, 0x30, 0x00, 0x30, 0x00 } },
+};
+
+/// test_vic_text.rom: 640×360 text mode (80×45 cells), embedded ROM font at
+/// $FE000 (Phase 6 §6.1), "FLOMMODORE!" in two attribute styles (task 6.20:
+/// 2-byte cells, bit 7 = leftmost, fg = attr[3:0], bg = attr[7:4]).
+fn buildVicText() RomImage {
+    var image = RomImage.init();
+    for (font_glyphs) |g| {
+        for (g.rows, 0..) |row_byte, r| {
+            image.writeByte(0xFE000 + 8 * @as(u32, g.ch) + @as(u32, @intCast(r)), row_byte);
+        }
+    }
+    var k = Kit.begin(&image);
+    k.emit(encode.li(15, 0x1100));
+    emitIdentityPalette(&k);
+    // Brighten entry 1 (fg) and colour entry 2 (inverse bg) for contrast.
+    k.loadAddr(3, 0x02100);
+    k.emit(encode.li(4, 255));
+    k.emit(encode.sb(3, 3, 4)); //      palette[1] = (255, 255, 255)
+    k.emit(encode.sb(3, 4, 4));
+    k.emit(encode.sb(3, 5, 4));
+    k.emit(encode.li(4, 96));
+    k.emit(encode.sb(3, 6, 4)); //      palette[2] = (96, 0, 0)
+    k.emit(encode.li(4, 0));
+    k.emit(encode.sb(3, 7, 4));
+    k.emit(encode.sb(3, 8, 4));
+    emitVicBases(&k);
+    vicWrite(&k, 0x02, 1); //           VRESX = 640
+    vicWrite(&k, 0x03, 1); //           VRESY = 360
+    vicWrite(&k, 0x00, 3); //           VMODE = text
+    // "FLOMMODORE!" at cell row 2 col 4 (white on black) and row 4 col 4
+    // (black on dark red — inverse video).
+    const TextRow = struct { row: u32, attr: i32 };
+    const text_rows = [_]TextRow{
+        .{ .row = 2, .attr = 0x01 },
+        .{ .row = 4, .attr = 0x20 },
+    };
+    const msg = "FLOMMODORE!";
+    for (text_rows) |tr| {
+        k.loadAddr(3, 0x02600 + 2 * (tr.row * 80 + 4));
+        for (msg) |ch| {
+            k.emit(encode.li(4, ch));
+            k.emit(encode.sb(3, 0, 4));
+            k.emit(encode.li(4, tr.attr));
+            k.emit(encode.sb(3, 1, 4));
+            k.emit(encode.addi(3, 3, 2));
+        }
+    }
+    k.emit(encode.li(11, 0x600D));
+    k.emit(encode.sw(0, result_addr, 11));
+    k.emit(encode.hlt());
+    return image;
+}
+
+/// Override one palette entry at $02100 (after emitIdentityPalette).
+/// Clobbers R3, R4.
+fn emitPaletteEntry(k: *Kit, index: u32, r: i32, g: i32, b: i32) void {
+    k.loadAddr(3, 0x02100 + 3 * index);
+    k.emit(encode.li(4, r));
+    k.emit(encode.sb(3, 0, 4));
+    k.emit(encode.li(4, g));
+    k.emit(encode.sb(3, 1, 4));
+    k.emit(encode.li(4, b));
+    k.emit(encode.sb(3, 2, 4));
+}
+
+/// test_vic_sprite.rom: mode 1 (tile) at 320×180 @ 8bpp with a tile band,
+/// fine scroll, sprites (front / behind / flip-X / 16×16 / palette offset),
+/// the 8-per-scanline limit, a collision self-check, and a raster copper
+/// chain splitting VBGCOL at line 90 — the task 6.18 acceptance.
+fn buildVicSprite() RomImage {
+    var image = RomImage.init();
+    image.setVector(2, irq_handler_addr);
+
+    // Raster handler: ack IRQ bit 5; toggle between (VBGCOL 60, VSCAN 0)
+    // and (VBGCOL 20, VSCAN 90) — the classic two-point copper chain.
+    // R7 = phase, R8 = IRQ controller base, R1 = VIC base (main-owned).
+    var h = image.codeAt(irq_handler_addr);
+    h.emit(encode.li(12, 0x20)); //     IRQACK <- raster bit
+    h.emit(encode.sw(8, 2, 12));
+    h.emit(encode.xori(7, 7, 1));
+    h.emit(encode.cmpi(7, 1));
+    const phase1_at = h.addr;
+    h.emit(0); //                       BNE phase0 (patched below)
+    h.emit(encode.li(12, 60)); //       phase 1 (fired at 90): bottom colour,
+    h.emit(encode.sb(1, 0x04, 12)); //  retrigger at line 0
+    h.emit(encode.li(12, 0));
+    h.emit(encode.sb(1, 0x14, 12));
+    h.emit(encode.rti());
+    const phase0_at = h.addr;
+    h.emit(encode.li(12, 20)); //       phase 0 (fired at 0): top colour,
+    h.emit(encode.sb(1, 0x04, 12)); //  retrigger at line 90
+    h.emit(encode.li(12, 90));
+    h.emit(encode.sb(1, 0x14, 12));
+    h.emit(encode.rti());
+    {
+        const off: i64 = @as(i64, phase0_at) - (@as(i64, phase1_at) + 4);
+        image.writeWord32(phase1_at, encode.formatJ(.bne, @as(u32, @bitCast(@as(i32, @intCast(off)))) & 0x3FF_FFFF));
+    }
+
+    var k = Kit.begin(&image);
+    k.emit(encode.li(15, 0x1100));
+    k.emit(encode.li(3, 0x20F0));
+    k.emit(encode.mtsr(.ssp, 3));
+    k.loadAddr(3, 0xFFFC0);
+    k.emit(encode.mtsr(.ivt, 3));
+    emitIdentityPalette(&k);
+    // Vivid entries so the golden frame is visually legible:
+    emitPaletteEntry(&k, 20, 0, 0, 130); //    top background: deep blue
+    emitPaletteEntry(&k, 60, 0, 110, 110); //  bottom background: teal
+    emitPaletteEntry(&k, 5, 0, 200, 0); //     tile band: green
+    emitPaletteEntry(&k, 7, 255, 80, 0); //    8×8 sprites: orange
+    emitPaletteEntry(&k, 17, 255, 220, 0); //  sprite 3 (7 + offset 10): yellow
+    emitPaletteEntry(&k, 9, 255, 0, 255); //   16×16 sprite: magenta
+    emitVicBases(&k);
+
+    // Tile 1 graphic: solid colour 5 (64 bytes at $40040).
+    k.loadAddr(3, 0x40040);
+    k.emit(encode.li(4, 0));
+    const t1_top = k.cur.addr;
+    k.emit(encode.li(12, 5));
+    k.emit(encode.sb(3, 0, 12));
+    k.emit(encode.addi(3, 3, 1));
+    k.emit(encode.addi(4, 4, 1));
+    k.emit(encode.cmpi(4, 64));
+    k.branchTo(.bne, t1_top);
+    // Sprite graphic tile 2 ($40080): left 4 columns colour 7, rest 0
+    // (transparent) — makes flip-X visibly different.
+    k.loadAddr(3, 0x40080);
+    k.emit(encode.li(4, 0)); //         row counter
+    const s2_row = k.cur.addr;
+    k.emit(encode.li(12, 7));
+    k.emit(encode.sb(3, 0, 12));
+    k.emit(encode.sb(3, 1, 12));
+    k.emit(encode.sb(3, 2, 12));
+    k.emit(encode.sb(3, 3, 12));
+    k.emit(encode.addi(3, 3, 8));
+    k.emit(encode.addi(4, 4, 1));
+    k.emit(encode.cmpi(4, 8));
+    k.branchTo(.bne, s2_row);
+    // 16×16 sprite graphic index 1 ($40100): solid colour 9 (256 bytes).
+    k.loadAddr(3, 0x40100);
+    k.emit(encode.li(4, 0));
+    const s16_top = k.cur.addr;
+    k.emit(encode.li(12, 9));
+    k.emit(encode.sb(3, 0, 12));
+    k.emit(encode.addi(3, 3, 1));
+    k.emit(encode.addi(4, 4, 1));
+    k.emit(encode.cmpi(4, 256));
+    k.branchTo(.bne, s16_top);
+    // Tile map: row 10 (y 80–87) columns 0–39 = tile 1 → a horizontal band.
+    k.loadAddr(3, 0x02600 + 40 * 10);
+    k.emit(encode.li(4, 0));
+    const map_top = k.cur.addr;
+    k.emit(encode.li(12, 1));
+    k.emit(encode.sb(3, 0, 12));
+    k.emit(encode.addi(3, 3, 1));
+    k.emit(encode.addi(4, 4, 1));
+    k.emit(encode.cmpi(4, 40));
+    k.branchTo(.bne, map_top);
+
+    // SAT: sprite 0 front (30,50); 1 behind the band (60,82) — its middle
+    // rows hide under the tiles; 2 flip-X (100,50); 3 overlaps 0 →
+    // collision, palette offset +10; 10–19 all on line 140 → only the
+    // first 8 hardware units render (task 6.15).
+    const SatSpec = struct { n: u32, x: i32, y: i32, tile: i32, flags: i32, pal: i32 };
+    var sats: [14]SatSpec = undefined;
+    sats[0] = .{ .n = 0, .x = 30, .y = 50, .tile = 2, .flags = 0x80, .pal = 0 };
+    sats[1] = .{ .n = 1, .x = 60, .y = 82, .tile = 2, .flags = 0x84, .pal = 0 };
+    sats[2] = .{ .n = 2, .x = 100, .y = 50, .tile = 2, .flags = 0xC0, .pal = 0 };
+    // x=32: opaque columns 32–35 overlap sprite 0's opaque 30–33 → collision.
+    sats[3] = .{ .n = 3, .x = 32, .y = 50, .tile = 2, .flags = 0x80, .pal = 10 };
+    for (0..10) |i| {
+        sats[4 + i] = .{
+            .n = @intCast(10 + i),
+            .x = @intCast(10 + 12 * i),
+            .y = 140,
+            .tile = 2,
+            .flags = 0x80,
+            .pal = 0,
+        };
+    }
+    for (sats) |sp| {
+        k.loadAddr(3, 0x02400 + 8 * sp.n);
+        k.emit(encode.li(4, sp.x & 0xFF));
+        k.emit(encode.sb(3, 0, 4));
+        k.emit(encode.li(4, (sp.x >> 8) & 0xFF));
+        k.emit(encode.sb(3, 1, 4));
+        k.emit(encode.li(4, sp.y & 0xFF));
+        k.emit(encode.sb(3, 2, 4));
+        k.emit(encode.li(4, (sp.y >> 8) & 0xFF));
+        k.emit(encode.sb(3, 3, 4));
+        k.emit(encode.li(4, sp.tile));
+        k.emit(encode.sb(3, 4, 4));
+        k.emit(encode.li(4, sp.flags));
+        k.emit(encode.sb(3, 5, 4));
+        k.emit(encode.li(4, sp.pal));
+        k.emit(encode.sb(3, 6, 4));
+    }
+    // One 16×16 sprite (index 20, group 2) at (200, 60).
+    k.loadAddr(3, 0x02400 + 8 * 20);
+    k.emit(encode.li(4, 200));
+    k.emit(encode.sb(3, 0, 4));
+    k.emit(encode.li(4, 60));
+    k.emit(encode.sb(3, 2, 4));
+    k.emit(encode.li(4, 1));
+    k.emit(encode.sb(3, 4, 4));
+    k.emit(encode.li(4, 0x88)); //      enable | size 16×16
+    k.emit(encode.sb(3, 5, 4));
+
+    // Live VIC config: tile mode, fine scroll x=3, sprite groups 0–2,
+    // raster chain armed — phase 0 → first fire at line 90.
+    vicWrite(&k, 0x00, 1); //           VMODE = tile
+    vicWrite(&k, 0x11, 3); //           VSCROLLX
+    vicWrite(&k, 0x13, 0x07); //        VSPRENA groups 0–2
+    vicWrite(&k, 0x04, 20); //          VBGCOL (top colour)
+    vicWrite(&k, 0x14, 90); //          VSCANLO = 90
+    vicWrite(&k, 0x15, 0); //           VSCANHI = 0
+    vicWrite(&k, 0x16, 0x02); //        VIRQEN: raster enable
+    k.loadAddr(8, 0x80040); //          IRQ controller (handler-owned R8)
+    k.emit(encode.li(12, 0x20));
+    k.emit(encode.sw(8, 1, 12)); //     IRQMASK = raster bit
+    k.emit(encode.sei());
+
+    // Wait two VBLANK edges (VSTAT bit 0: 0→1 twice) so at least one full
+    // frame has rendered, then self-check the collision flag (task 6.16).
+    for (0..2) |_| {
+        const wait_clear = k.cur.addr;
+        k.emit(encode.lw(5, 1, 0x17));
+        k.emit(encode.andi(5, 5, 1));
+        k.emit(encode.cmpi(5, 0));
+        k.branchTo(.bne, wait_clear);
+        const wait_set = k.cur.addr;
+        k.emit(encode.lw(5, 1, 0x17));
+        k.emit(encode.andi(5, 5, 1));
+        k.emit(encode.cmpi(5, 0));
+        k.branchTo(.beq, wait_set);
+    }
+    k.num(1);
+    k.emit(encode.lw(5, 1, 0x17)); //   VSTAT
+    k.emit(encode.andi(5, 5, 0x04));
+    k.emit(encode.cmpi(5, 0x04));
+    k.assertTaken(.beq); //             sprites 0/3 must have collided
+    k.emit(encode.li(11, 0x600D));
+    k.emit(encode.sw(0, result_addr, 11));
+    // Halt loop: raster IRQs wake HLT twice per frame; the handler RTIs to
+    // the JMPA, which re-halts. The copper chain runs forever.
+    const halt_top = k.cur.addr;
+    k.emit(encode.hlt());
+    k.emit(encode.jmpa(halt_top));
+    return image;
+}
+
 const Builder = struct {
     name: []const u8,
     build: *const fn () RomImage,
@@ -644,6 +1004,9 @@ const builders = [_]Builder{
     .{ .name = "test_cpu_stack.rom", .build = buildStack },
     .{ .name = "test_cpu_irq.rom", .build = buildIrq },
     .{ .name = "test_io_timer.rom", .build = buildIoTimer },
+    .{ .name = "test_vic_bitmap.rom", .build = buildVicBitmap },
+    .{ .name = "test_vic_text.rom", .build = buildVicText },
+    .{ .name = "test_vic_sprite.rom", .build = buildVicSprite },
 };
 
 pub fn main(init: std.process.Init) !void {

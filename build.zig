@@ -41,12 +41,23 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const vic_mod = b.createModule(.{
+        .root_source_file = b.path("src/vic256.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "ram", .module = ram_mod },
+            .{ .name = "rom", .module = rom_mod },
+        },
+    });
     const io_mod = b.createModule(.{
         .root_source_file = b.path("src/io.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "util", .module = util_mod },
+            .{ .name = "vic256", .module = vic_mod },
         },
     });
     const bus_mod = b.createModule(.{
@@ -81,6 +92,19 @@ pub fn build(b: *std.Build) void {
             .{ .name = "util", .module = util_mod },
         },
     });
+    const machine_mod = b.createModule(.{
+        .root_source_file = b.path("src/machine.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "ram", .module = ram_mod },
+            .{ .name = "rom", .module = rom_mod },
+            .{ .name = "io", .module = io_mod },
+            .{ .name = "bus", .module = bus_mod },
+            .{ .name = "vic256", .module = vic_mod },
+        },
+    });
     const cpu_mod = b.createModule(.{
         .root_source_file = b.path("src/cpu.zig"),
         .target = target,
@@ -95,6 +119,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "io", .module = io_mod },
         },
     });
+    machine_mod.addImport("cpu", cpu_mod);
+    machine_mod.addImport("encode", encode_mod); // machine.zig tests only
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -138,6 +164,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "cpu", .module = cpu_mod },
             .{ .name = "io", .module = io_mod },
             .{ .name = "flapp", .module = flapp_mod },
+            .{ .name = "machine", .module = machine_mod },
+            .{ .name = "vic256", .module = vic_mod },
         },
     });
     exe_module.linkLibrary(sdl_lib); // 0.16: linking is a Module property
@@ -169,6 +197,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "cpu", .module = cpu_mod },
             .{ .name = "io", .module = io_mod },
             .{ .name = "flapp", .module = flapp_mod },
+            .{ .name = "machine", .module = machine_mod },
+            .{ .name = "vic256", .module = vic_mod },
         },
     });
     const harness_exe = b.addExecutable(.{
@@ -271,6 +301,8 @@ pub fn build(b: *std.Build) void {
         io_mod,
         bus_mod,
         flapp_mod,
+        vic_mod,
+        machine_mod,
         encode_mod,
         cpu_mod,
         genroms_module,

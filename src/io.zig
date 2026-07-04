@@ -34,6 +34,7 @@
 
 const std = @import("std");
 const util = @import("util");
+const vic_mod = @import("vic256");
 
 // ---------------------------------------------------------------------------
 // Register addresses (Phase 5 §5.1–§5.5; audit Appendix D).
@@ -227,6 +228,10 @@ pub const Io = struct {
     jctrl: u16 = 0, // bit 0 = IRQ on state change
     irqstat: u8 = 0, // raw pending, mask-independent (§5.5)
     irqmask: u8 = 0,
+    /// VIC-256 register dispatch ($80200–$802FF), wired by machine.zig
+    /// (Block 6). Null until then — reads return $0000, writes are ignored,
+    /// matching the Block 4 behaviour.
+    vic: ?*vic_mod.Vic = null,
 
     pub fn init() Io {
         return .{};
@@ -244,8 +249,9 @@ pub const Io = struct {
     }
 
     /// A device raises its IRQSTAT bit (device-level enables are applied by
-    /// the caller — they gate the *setting*, §5.5).
-    fn raise(io: *Io, source: u8) void {
+    /// the caller — they gate the *setting*, §5.5). Pub: the VIC and AUR-1
+    /// raise through machine.zig.
+    pub fn raise(io: *Io, source: u8) void {
         io.irqstat |= source & irq_defined_mask;
     }
 
@@ -286,6 +292,9 @@ pub const Io = struct {
         std.debug.assert(addr >= io_base and addr <= 0x80FFF);
         if (addr >= timer_a_base and addr < timer_a_base + 8) return io.timer_a.read(addr - timer_a_base);
         if (addr >= timer_b_base and addr < timer_b_base + 8) return io.timer_b.read(addr - timer_b_base);
+        if (addr >= vic_mod.base_addr and addr <= vic_mod.end_addr) {
+            return if (io.vic) |v| v.read(addr) else 0x0000;
+        }
         return switch (addr) {
             syscfg_addr => io.syscfg,
             sysid_addr => machine_id, // read-only (§5.1)
@@ -309,6 +318,10 @@ pub const Io = struct {
         std.debug.assert(addr >= io_base and addr <= 0x80FFF);
         if (addr >= timer_a_base and addr < timer_a_base + 8) return io.timer_a.write(addr - timer_a_base, value);
         if (addr >= timer_b_base and addr < timer_b_base + 8) return io.timer_b.write(addr - timer_b_base, value);
+        if (addr >= vic_mod.base_addr and addr <= vic_mod.end_addr) {
+            if (io.vic) |v| v.write(addr, value);
+            return;
+        }
         switch (addr) {
             syscfg_addr => io.syscfg = value & 0x0001, // bit 0 only (D47.5)
             sysid_addr, sysver_addr => {}, // read-only

@@ -1,0 +1,6 @@
+# Golden RGB24 frame hashes (SHA-256) for the VIC-256 test ROMs (task 6.21).
+# Regenerate with: harness --rom <rom> --frames <N> --dump-ppm out.ppm
+# (eyeball the PPM before pinning a new hash).
+test_vic_bitmap.rom  --frames 5  b541d4a451908f73c2ee1763b79e1540323a6da72e9f14025d32bd113f243b3d
+test_vic_text.rom    --frames 3  2f42902136a5dfa1b3089f9f4ea327abf9550b43f8d2ed208b8b4fd0a2e32c74
+test_vic_sprite.rom  --frames 6  af43734a3ad3e311a4d20610f5cc77d3acf46229e704bc91d9c27b25560bf779

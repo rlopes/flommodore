@@ -21,94 +21,30 @@ const std = @import("std");
 const sdl = @import("sdl3");
 
 const util = @import("util");
-const ram_mod = @import("ram");
 const rom_mod = @import("rom");
-const io_mod = @import("io");
-const bus_mod = @import("bus");
 const cpu_mod = @import("cpu");
-const encode = @import("encode");
 const flapp = @import("flapp");
+const machine_mod = @import("machine");
+const Machine = machine_mod.Machine;
 
-const vic256 = @import("vic256.zig"); // Block 6
 const aur1 = @import("aur1.zig"); // Block 7
 const debugger = @import("debugger.zig"); // Block 9
 
 // Force semantic analysis of not-yet-implemented stubs (Zig analyses
 // lazily; an unreferenced file is never checked).
 comptime {
-    _ = &vic256.init;
     _ = &aur1.init;
     _ = &debugger.init;
 }
 
-/// Initial window size. Placeholder until the VIC-256 render pipeline
-/// (Block 6) fixes the framebuffer dimensions per display mode.
+/// Window size: 3× the fallback mode; SDL logical presentation letterboxes
+/// whatever resolution the VIC is actually running (Block 6).
 const initial_window_width = 960;
 const initial_window_height = 540;
 
 const frame_ns: u64 = 1_000_000_000 / util.frame_rate_hz; // 16,666,666 ns
 /// Sleep coarse until this close to the deadline, then spin (task 5.4).
 const spin_margin_ns: u64 = 1_500_000;
-
-// ---------------------------------------------------------------------------
-// Machine composition.
-// ---------------------------------------------------------------------------
-
-const Machine = struct {
-    ram: *ram_mod.Ram,
-    rom: *rom_mod.Rom,
-    io: *io_mod.Io,
-    bus: bus_mod.Bus,
-    cpu: cpu_mod.Gab16,
-
-    fn create(gpa: std.mem.Allocator) !*Machine {
-        const m = try gpa.create(Machine);
-        errdefer gpa.destroy(m);
-        m.ram = try gpa.create(ram_mod.Ram);
-        errdefer gpa.destroy(m.ram);
-        m.rom = try gpa.create(rom_mod.Rom);
-        errdefer gpa.destroy(m.rom);
-        m.io = try gpa.create(io_mod.Io);
-        m.ram.init();
-        m.rom.init();
-        m.io.* = io_mod.Io.init();
-        m.bus = bus_mod.Bus.init(m.ram, m.rom, m.io);
-        return m;
-    }
-
-    fn destroy(m: *Machine, gpa: std.mem.Allocator) void {
-        gpa.destroy(m.io);
-        gpa.destroy(m.rom);
-        gpa.destroy(m.ram);
-        gpa.destroy(m);
-    }
-
-    /// One master cycle: sample the IRQ line, step the CPU, tick devices —
-    /// the pinned per-cycle ordering (io.zig header).
-    inline fn cycle(m: *Machine) void {
-        m.cpu.irq_line = m.io.irqLine();
-        _ = m.cpu.step(&m.bus);
-        m.io.tick();
-    }
-
-    /// One frame: TOTAL_LINES scanline quanta of CYCLES_PER_LINE cycles
-    /// (task 5.1). Mode 0 timing until the VIC provides the live mode
-    /// (Block 6); every mode is exactly 240,000 cycles (util.mode_timing).
-    fn runFrame(m: *Machine) void {
-        const timing = util.mode_timing[0];
-        var line: u32 = 0;
-        while (line < timing.total_lines) : (line += 1) {
-            var c: u32 = 0;
-            while (c < timing.cycles_per_line) : (c += 1) {
-                m.cycle();
-            }
-            // ── scanline hook: vic.endLine(line) renders the line and may
-            //    raise the raster IRQ (Block 6, plan 6.18).
-        }
-        // ── frame hooks: VBLANK IRQ + present (Block 6), audio push of 735
-        //    samples (Block 7).
-    }
-};
 
 // ---------------------------------------------------------------------------
 // CLI.
@@ -195,12 +131,21 @@ pub fn main(init: std.process.Init) !void {
         "Flommodore",
         initial_window_width,
         initial_window_height,
-        0,
+        sdl.SDL_WINDOW_RESIZABLE,
     ) orelse {
         util.logErr("SDL_CreateWindow failed: {s}", .{sdl.SDL_GetError()});
         return error.SdlCreateWindowFailed;
     };
     defer sdl.SDL_DestroyWindow(window);
+    const renderer = sdl.SDL_CreateRenderer(window, null) orelse {
+        util.logErr("SDL_CreateRenderer failed: {s}", .{sdl.SDL_GetError()});
+        return error.SdlCreateRendererFailed;
+    };
+    defer sdl.SDL_DestroyRenderer(renderer);
+    var texture: ?*sdl.SDL_Texture = null;
+    var tex_w: u32 = 0;
+    var tex_h: u32 = 0;
+    defer if (texture) |t| sdl.SDL_DestroyTexture(t);
 
     util.logInfo("Flommodore running — 14.4 MHz, 240,000 cycles/frame, 60 Hz", .{});
 
@@ -213,6 +158,36 @@ pub fn main(init: std.process.Init) !void {
     while (running) {
         machine.runFrame();
         frames += 1;
+
+        // Present (Block 6): copy the VIC's RGB24 buffer into a streaming
+        // texture sized to this frame's resolution; letterbox to the window.
+        const vw = machine.vic.visibleWidth();
+        const vh = machine.vic.visibleHeight();
+        if (texture == null or vw != tex_w or vh != tex_h) {
+            if (texture) |t| sdl.SDL_DestroyTexture(t);
+            texture = sdl.SDL_CreateTexture(
+                renderer,
+                sdl.SDL_PIXELFORMAT_RGB24,
+                sdl.SDL_TEXTUREACCESS_STREAMING,
+                @intCast(vw),
+                @intCast(vh),
+            );
+            tex_w = vw;
+            tex_h = vh;
+            _ = sdl.SDL_SetTextureScaleMode(texture, sdl.SDL_SCALEMODE_NEAREST);
+            _ = sdl.SDL_SetRenderLogicalPresentation(
+                renderer,
+                @intCast(vw),
+                @intCast(vh),
+                sdl.SDL_LOGICAL_PRESENTATION_LETTERBOX,
+            );
+        }
+        if (texture) |t| {
+            _ = sdl.SDL_UpdateTexture(t, null, &machine.vic.rgb, @intCast(vw * 3));
+            _ = sdl.SDL_RenderClear(renderer);
+            _ = sdl.SDL_RenderTexture(renderer, t, null, null);
+            _ = sdl.SDL_RenderPresent(renderer);
+        }
 
         // Frame-end actions (task 5.3): events first, so quit is prompt.
         var event: sdl.SDL_Event = undefined;

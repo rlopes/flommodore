@@ -27,6 +27,7 @@ const bus_mod = @import("bus");
 const cpu_mod = @import("cpu");
 const io_mod = @import("io");
 const flapp_mod = @import("flapp");
+const machine_mod = @import("machine");
 
 const Options = struct {
     rom_path: ?[]const u8 = null,
@@ -36,6 +37,13 @@ const Options = struct {
     expect_pass: bool = false,
     irq_at: [max_irqs]u64 = undefined,
     irq_count: usize = 0,
+    /// Frame mode (Block 6): run N full scanline-quantum frames through the
+    /// shared machine loop instead of raw cycles.
+    frames: u64 = 0,
+    /// SHA-256 (hex) the last frame's visible RGB24 buffer must match.
+    golden: ?[]const u8 = null,
+    /// Write the last frame as a PPM (golden regeneration / eyeballing).
+    dump_ppm: ?[]const u8 = null,
 
     const max_irqs = 16;
 };
@@ -66,6 +74,18 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.quiet = true;
         } else if (std.mem.eql(u8, arg, "--expect-pass")) {
             opts.expect_pass = true;
+        } else if (std.mem.eql(u8, arg, "--frames")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            opts.frames = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--golden")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            opts.golden = args[i];
+        } else if (std.mem.eql(u8, arg, "--dump-ppm")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            opts.dump_ppm = args[i];
         } else if (std.mem.eql(u8, arg, "--irq-at")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -91,28 +111,26 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     const opts = parseArgs(args) catch {
-        std.log.err("usage: harness (--rom <path> | --flapp <path>) [--max-cycles N] [--irq-at N]... [--expect-pass] [--quiet]", .{});
+        std.log.err("usage: harness (--rom <path> | --flapp <path>) [--max-cycles N | --frames N] [--golden HEX] [--dump-ppm f.ppm] [--irq-at N]... [--expect-pass] [--quiet]", .{});
         return error.BadUsage;
     };
     if (opts.quiet) util.setLevel(.silent);
 
-    // Build the machine.
-    const ram = try gpa.create(ram_mod.Ram);
-    defer gpa.destroy(ram);
-    const rom = try gpa.create(rom_mod.Rom);
-    defer gpa.destroy(rom);
-    const io_dev = try gpa.create(io_mod.Io);
-    defer gpa.destroy(io_dev);
-    ram.init();
-    rom.init();
-    io_dev.* = io_mod.Io.init();
-    var bus = bus_mod.Bus.init(ram, rom, io_dev);
+    // Build the machine — the shared composition (identical raster timing
+    // to the emulator; Block 6 golden tests depend on this).
+    const m = try machine_mod.Machine.create(gpa);
+    defer m.destroy(gpa);
+    const ram = m.ram;
+    const rom = m.rom;
+    const io_dev = m.io;
+    const bus = &m.bus;
+    _ = ram;
 
-    var cpu: cpu_mod.Gab16 = undefined;
+    const cpu = &m.cpu;
     if (opts.rom_path) |path| {
         try rom.loadFromFile(io, std.Io.Dir.cwd(), path);
         util.logInfo("loaded ROM: {s}", .{path});
-        cpu.reset(&bus);
+        cpu.reset(bus);
         util.logInfo("RESET → ${X:0>5}", .{cpu.pc});
         if (cpu.pc == 0) {
             // An all-zero vector means an unpopulated image; it would trap
@@ -124,8 +142,8 @@ pub fn main(init: std.process.Init) !void {
         // Standalone .flapp (task 5.5): same pre-BIOS environment the
         // emulator CLI provides (D12 boot values) — one loader, one truth.
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, opts.flapp_path.?, arena, .limited(1 << 20));
-        cpu.reset(&bus);
-        const entry = try flapp_mod.load(&bus, bytes);
+        cpu.reset(bus);
+        const entry = try flapp_mod.load(bus, bytes);
         cpu.setReg(cpu_mod.Gab16.sp, 0x01100);
         cpu.ssp = 0x020F0;
         cpu.usp = 0x01100;
@@ -134,34 +152,62 @@ pub fn main(init: std.process.Init) !void {
         util.logInfo("loaded .flapp: {s} → entry ${X:0>5}", .{ opts.flapp_path.?, entry });
     }
 
-    // Bounded, deterministic run: one instruction (or idle/delivery step)
-    // per cycle (D17/D41). Ordering per cycle: sample the IRQ line, step
-    // the CPU, tick the devices — so a device event in cycle k is
-    // deliverable from cycle k+1 (io.zig header).
     var cycles: u64 = 0;
-    var irq_idx: usize = 0;
-    var injected = false;
-    while (cycles < opts.max_cycles and !cpu.halted and !io_dev.power_off) : (cycles += 1) {
-        if (irq_idx < opts.irq_count and cycles >= opts.irq_at[irq_idx]) {
-            injected = true; // --irq-at: asserted until delivered
+    if (opts.frames > 0) {
+        // Frame mode (Block 6): whole scanline-quantum frames via the
+        // shared loop. Deterministic: no wall clock, no SDL.
+        var frame: u64 = 0;
+        while (frame < opts.frames and !io_dev.power_off) : (frame += 1) {
+            m.runFrame();
         }
-        cpu.irq_line = io_dev.irqLine() or injected;
-        const event = cpu.step(&bus);
-        io_dev.tick();
-        if (event == .irq_entered and injected) {
-            injected = false;
-            irq_idx += 1;
+        cycles = @as(u64, frame) * util.cycles_per_frame;
+        util.logInfo("ran {d} frames ({d} cycles); {d}×{d} output", .{
+            frame, cycles, m.vic.visibleWidth(), m.vic.visibleHeight(),
+        });
+        const hash = m.vic.frameHash();
+        var hex: [64]u8 = undefined;
+        for (hash, 0..) |byte, bi| {
+            _ = std.fmt.bufPrint(hex[bi * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable;
+        }
+        util.logInfo("frame hash: {s}", .{&hex});
+        if (opts.dump_ppm) |path| {
+            try dumpPpm(io, m, path);
+        }
+        if (opts.golden) |want| {
+            if (!std.ascii.eqlIgnoreCase(want, &hex)) {
+                util.logErr("golden mismatch: want {s}", .{want});
+                return error.GoldenMismatch;
+            }
+            util.logInfo("golden matched", .{});
+        }
+    } else {
+        // Cycle mode (Blocks 2–5): one instruction (or idle/delivery step)
+        // per cycle (D17/D41). Ordering per cycle: sample the IRQ line,
+        // step the CPU, tick the devices.
+        var irq_idx: usize = 0;
+        var injected = false;
+        while (cycles < opts.max_cycles and !cpu.halted and !io_dev.power_off) : (cycles += 1) {
+            if (irq_idx < opts.irq_count and cycles >= opts.irq_at[irq_idx]) {
+                injected = true; // --irq-at: asserted until delivered
+            }
+            cpu.irq_line = io_dev.irqLine() or injected;
+            const event = cpu.step(bus);
+            io_dev.tick();
+            if (event == .irq_entered and injected) {
+                injected = false;
+                irq_idx += 1;
+            }
+        }
+        if (irq_idx < opts.irq_count) {
+            util.logWarn("{d} of {d} --irq-at pulses were never delivered", .{ opts.irq_count - irq_idx, opts.irq_count });
         }
     }
     util.logInfo("ran {d} cycles; halted={}, power_off={}, PC=${X:0>5}", .{ cycles, cpu.halted, io_dev.power_off, cpu.pc });
-    if (irq_idx < opts.irq_count) {
-        util.logWarn("{d} of {d} --irq-at pulses were never delivered", .{ opts.irq_count - irq_idx, opts.irq_count });
-    }
-
     if (opts.expect_pass) {
         const result = bus.read16(result_addr);
         // A test ROM finishes by HLT or by SYSPWR soft power-off (§5.1).
-        if (!cpu.halted and !io_dev.power_off) {
+        // In frame mode a halted CPU is normal — the VIC keeps rendering.
+        if (!cpu.halted and !io_dev.power_off and opts.frames == 0) {
             util.logErr("expected HLT within {d} cycles", .{opts.max_cycles});
             return error.TestRomTimedOut;
         }
@@ -171,6 +217,18 @@ pub fn main(init: std.process.Init) !void {
         }
         util.logInfo("test ROM passed", .{});
     }
+}
+
+fn dumpPpm(io: std.Io, m: *machine_mod.Machine, path: []const u8) !void {
+    const w = m.vic.visibleWidth();
+    const hgt = m.vic.visibleHeight();
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var header_buf: [64]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buf, "P6\n{d} {d}\n255\n", .{ w, hgt });
+    try file.writeStreamingAll(io, header);
+    try file.writeStreamingAll(io, m.vic.rgb[0 .. w * hgt * 3]);
+    util.logInfo("wrote {s}", .{path});
 }
 
 // ---------------------------------------------------------------------------
