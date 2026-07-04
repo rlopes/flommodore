@@ -35,6 +35,7 @@
 const std = @import("std");
 const util = @import("util");
 const vic_mod = @import("vic256");
+const aur_mod = @import("aur1");
 
 // ---------------------------------------------------------------------------
 // Register addresses (Phase 5 §5.1–§5.5; audit Appendix D).
@@ -232,6 +233,9 @@ pub const Io = struct {
     /// (Block 6). Null until then — reads return $0000, writes are ignored,
     /// matching the Block 4 behaviour.
     vic: ?*vic_mod.Vic = null,
+    /// AUR-1 register dispatch ($80100–$801FF), wired by machine.zig
+    /// (Block 7). Same null semantics.
+    aur: ?*aur_mod.Aur = null,
 
     pub fn init() Io {
         return .{};
@@ -295,6 +299,9 @@ pub const Io = struct {
         if (addr >= vic_mod.base_addr and addr <= vic_mod.end_addr) {
             return if (io.vic) |v| v.read(addr) else 0x0000;
         }
+        if (addr >= aur_mod.base_addr and addr <= aur_mod.end_addr) {
+            return if (io.aur) |dev| dev.read(addr) else 0x0000;
+        }
         return switch (addr) {
             syscfg_addr => io.syscfg,
             sysid_addr => machine_id, // read-only (§5.1)
@@ -320,6 +327,10 @@ pub const Io = struct {
         if (addr >= timer_b_base and addr < timer_b_base + 8) return io.timer_b.write(addr - timer_b_base, value);
         if (addr >= vic_mod.base_addr and addr <= vic_mod.end_addr) {
             if (io.vic) |v| v.write(addr, value);
+            return;
+        }
+        if (addr >= aur_mod.base_addr and addr <= aur_mod.end_addr) {
+            if (io.aur) |dev| dev.write(addr, value);
             return;
         }
         switch (addr) {

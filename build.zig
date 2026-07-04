@@ -51,6 +51,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "rom", .module = rom_mod },
         },
     });
+    const aur_mod = b.createModule(.{
+        .root_source_file = b.path("src/aur1.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "ram", .module = ram_mod },
+        },
+    });
     const io_mod = b.createModule(.{
         .root_source_file = b.path("src/io.zig"),
         .target = target,
@@ -58,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "util", .module = util_mod },
             .{ .name = "vic256", .module = vic_mod },
+            .{ .name = "aur1", .module = aur_mod },
         },
     });
     const bus_mod = b.createModule(.{
@@ -103,6 +113,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "io", .module = io_mod },
             .{ .name = "bus", .module = bus_mod },
             .{ .name = "vic256", .module = vic_mod },
+            .{ .name = "aur1", .module = aur_mod },
         },
     });
     const cpu_mod = b.createModule(.{
@@ -237,11 +248,34 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .Debug,
     });
+    const host_vic = b.createModule(.{
+        .root_source_file = b.path("src/vic256.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{
+            .{ .name = "util", .module = host_util },
+            .{ .name = "ram", .module = host_ram },
+            .{ .name = "rom", .module = host_rom },
+        },
+    });
+    const host_aur = b.createModule(.{
+        .root_source_file = b.path("src/aur1.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{
+            .{ .name = "util", .module = host_util },
+            .{ .name = "ram", .module = host_ram },
+        },
+    });
     const host_io = b.createModule(.{
         .root_source_file = b.path("src/io.zig"),
         .target = b.graph.host,
         .optimize = .Debug,
-        .imports = &.{.{ .name = "util", .module = host_util }},
+        .imports = &.{
+            .{ .name = "util", .module = host_util },
+            .{ .name = "vic256", .module = host_vic },
+            .{ .name = "aur1", .module = host_aur },
+        },
     });
     const host_bus = b.createModule(.{
         .root_source_file = b.path("src/bus.zig"),
@@ -298,6 +332,7 @@ pub fn build(b: *std.Build) void {
         util_mod,
         ram_mod,
         rom_mod,
+        aur_mod,
         io_mod,
         bus_mod,
         flapp_mod,

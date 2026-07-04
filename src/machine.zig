@@ -19,12 +19,14 @@ const io_mod = @import("io");
 const bus_mod = @import("bus");
 const cpu_mod = @import("cpu");
 const vic_mod = @import("vic256");
+const aur_mod = @import("aur1");
 
 pub const Machine = struct {
     ram: *ram_mod.Ram,
     rom: *rom_mod.Rom,
     io: *io_mod.Io,
     vic: *vic_mod.Vic,
+    aur: *aur_mod.Aur,
     bus: bus_mod.Bus,
     cpu: cpu_mod.Gab16,
 
@@ -38,16 +40,21 @@ pub const Machine = struct {
         m.io = try gpa.create(io_mod.Io);
         errdefer gpa.destroy(m.io);
         m.vic = try gpa.create(vic_mod.Vic);
+        errdefer gpa.destroy(m.vic);
+        m.aur = try gpa.create(aur_mod.Aur);
         m.ram.init();
         m.rom.init();
         m.io.* = io_mod.Io.init();
         m.vic.init();
+        m.aur.* = aur_mod.Aur.init();
         m.io.vic = m.vic; // $80200–$802FF dispatch (Block 6)
+        m.io.aur = m.aur; // $80100–$801FF dispatch (Block 7)
         m.bus = bus_mod.Bus.init(m.ram, m.rom, m.io);
         return m;
     }
 
     pub fn destroy(m: *Machine, gpa: std.mem.Allocator) void {
+        gpa.destroy(m.aur);
         gpa.destroy(m.vic);
         gpa.destroy(m.io);
         gpa.destroy(m.rom);
@@ -55,11 +62,13 @@ pub const Machine = struct {
         gpa.destroy(m);
     }
 
-    /// One master cycle.
+    /// One master cycle. The AUR ticks with cycle granularity so the
+    /// §4.9 software-PCM technique (timer IRQ writing VVOL) works.
     pub inline fn cycle(m: *Machine) void {
         m.cpu.irq_line = m.io.irqLine();
         _ = m.cpu.step(&m.bus);
         m.io.tick();
+        if (m.aur.tick(m.ram)) m.io.raise(io_mod.irq_audio);
     }
 
     /// One full frame — exactly 240,000 cycles in every mode (D17/D41,
@@ -78,7 +87,9 @@ pub const Machine = struct {
             }
             m.vic.renderLine(line, m.ram, m.rom);
         }
-        // ── frame hook: audio push of 735 samples (Block 7).
+        // Frame complete: aur.samples[0..aur.sample_count] holds this
+        // frame's stereo output (exactly 735 pairs at ASRATE 0). The owner
+        // presents/hashes it and calls aur.clearSamples().
     }
 };
 

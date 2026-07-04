@@ -27,13 +27,11 @@ const flapp = @import("flapp");
 const machine_mod = @import("machine");
 const Machine = machine_mod.Machine;
 
-const aur1 = @import("aur1.zig"); // Block 7
 const debugger = @import("debugger.zig"); // Block 9
 
-// Force semantic analysis of not-yet-implemented stubs (Zig analyses
+// Force semantic analysis of the not-yet-implemented stub (Zig analyses
 // lazily; an unreferenced file is never checked).
 comptime {
-    _ = &aur1.init;
     _ = &debugger.init;
 }
 
@@ -43,6 +41,13 @@ const initial_window_width = 960;
 const initial_window_height = 540;
 
 const frame_ns: u64 = 1_000_000_000 / util.frame_rate_hz; // 16,666,666 ns
+/// Audio queue management (task 7.21): one frame of stereo S16 at 44.1 kHz
+/// is 735 × 4 = 2940 bytes. Prime 2 frames of silence for a latency
+/// cushion; drop a frame's audio if the queue exceeds 8 frames (~133 ms) —
+/// production and consumption match on average because the pacer holds
+/// 60 Hz, so the queue only drifts on host clock mismatch.
+const audio_frame_bytes: usize = 735 * 2 * 2;
+const audio_high_water: c_int = @intCast(8 * audio_frame_bytes);
 /// Sleep coarse until this close to the deadline, then spin (task 5.4).
 const spin_margin_ns: u64 = 1_500_000;
 
@@ -147,6 +152,33 @@ pub fn main(init: std.process.Init) !void {
     var tex_h: u32 = 0;
     defer if (texture) |t| sdl.SDL_DestroyTexture(t);
 
+    // Audio stream (tasks 7.2/7.21). Failure is non-fatal: the machine
+    // runs silent (headless CI, missing audio hardware).
+    const audio_spec = sdl.SDL_AudioSpec{
+        .format = sdl.SDL_AUDIO_S16,
+        .channels = 2,
+        .freq = 44_100,
+    };
+    var audio: ?*sdl.SDL_AudioStream = null;
+    if (sdl.SDL_Init(sdl.SDL_INIT_AUDIO)) {
+        audio = sdl.SDL_OpenAudioDeviceStream(sdl.SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &audio_spec, null, null);
+        if (audio) |stream| {
+            const silence = [_]i16{0} ** (2 * audio_frame_bytes / 2);
+            _ = sdl.SDL_PutAudioStreamData(stream, &silence, @intCast(silence.len * 2));
+            _ = sdl.SDL_ResumeAudioStreamDevice(stream);
+            util.logInfo("audio: stereo S16 44.1 kHz", .{});
+        } else {
+            util.logWarn("audio unavailable: {s}", .{sdl.SDL_GetError()});
+        }
+    } else {
+        util.logWarn("SDL audio init failed: {s} — running silent", .{sdl.SDL_GetError()});
+    }
+    defer if (audio) |stream| sdl.SDL_DestroyAudioStream(stream);
+
+    var queue_min: c_int = std.math.maxInt(c_int);
+    var queue_max: c_int = 0;
+    var audio_drops: u64 = 0;
+
     util.logInfo("Flommodore running — 14.4 MHz, 240,000 cycles/frame, 60 Hz", .{});
 
     // ------------------------------------------------------------------
@@ -188,6 +220,24 @@ pub fn main(init: std.process.Init) !void {
             _ = sdl.SDL_RenderTexture(renderer, t, null, null);
             _ = sdl.SDL_RenderPresent(renderer);
         }
+
+        // Audio push (task 7.21): this frame's samples, unless the queue
+        // is already deep (drop instead of growing latency without bound).
+        if (audio) |stream| {
+            const queued = sdl.SDL_GetAudioStreamQueued(stream);
+            queue_min = @min(queue_min, queued);
+            queue_max = @max(queue_max, queued);
+            if (queued <= audio_high_water) {
+                _ = sdl.SDL_PutAudioStreamData(
+                    stream,
+                    &machine.aur.samples,
+                    @intCast(machine.aur.sample_count * 2),
+                );
+            } else {
+                audio_drops += 1;
+            }
+        }
+        machine.aur.clearSamples();
 
         // Frame-end actions (task 5.3): events first, so quit is prompt.
         var event: sdl.SDL_Event = undefined;
@@ -235,5 +285,11 @@ pub fn main(init: std.process.Init) !void {
             fps,
             machine.cpu.cyc,
         });
+    }
+    if (audio != null and queue_max > 0) {
+        // Task 7.21 acceptance evidence: the queue must stay inside a
+        // bounded window over long runs — no underrun collapse to 0 while
+        // producing, no unbounded latency growth.
+        util.logInfo("audio queue depth: min {d} B, max {d} B, {d} frame drops", .{ queue_min, queue_max, audio_drops });
     }
 }

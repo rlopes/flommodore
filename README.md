@@ -4,6 +4,18 @@ A fully specified fantasy computer — Gab-16 CPU (16-bit RISC, 20-bit address
 bus), VIC-256 video, AUR-1 sound, 512KB RAM — implemented as a reference
 emulator and toolchain in **Zig 0.16** with **SDL3**.
 
+**Block 7 — First Sound — complete**: the AUR-1 synthesises. Four voices
+with seven waveforms (comptime sine, square, triangle, saw, pulse-width,
+Galois-LFSR noise, RAM wavetables), linear SID-table ADSR with envelope-
+completion IRQs, ring mod, hard sync, OPL-style FM pairs with feedback, and
+a shared Chamberlin SVF filter — all-integer and bit-deterministic, so the
+golden audio hashes in `tests/goldens.txt` hold across hosts (verified in
+CI via `harness --audio-golden`; `--dump-wav` regenerates listenable/
+plottable output). The chip ticks per master cycle (software PCM per Phase
+4 §4.9 works), yields exactly 735 stereo samples per frame, and streams to
+SDL3 with queue-depth management: 60 s at 60.000 fps, queue bounded, zero
+drops. Milestone 3 (Interactive Machine) lands with Block 8's input.
+
 **Milestone 2 — First Pixels — reached** (Block 6): the VIC-256 renders.
 All four display modes (bitmap 8/4/1bpp, tile with fine scroll, bitmap+tile
 overlay, ROM-font text), 64 sprites with flips/sizes/priority/collision and
@@ -25,7 +37,7 @@ zig build -Doptimize=ReleaseFast     # Debug is cycle-exact but below real time
 ./zig-out/bin/flommodore tests/roms/test_prog.flapp
 ```
 
-Next: Block 7 — the AUR-1 sound chip.
+Next: Block 8 — SDL3 input (keyboard + joystick) → ★ Milestone 3.
 
 ## Build
 

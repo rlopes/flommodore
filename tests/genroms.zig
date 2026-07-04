@@ -110,12 +110,23 @@ const Kit = struct {
 
     fn begin(image: *RomImage) Kit {
         image.setVector(0, entry_addr); // RESET
-        // The shared FAIL stub: record R11, mark $0BAD, halt.
+        // Default trap vector → FAIL: a stray trap becomes a visible
+        // $0BAD instead of a silent PC=0 trap storm that carpet-bombs RAM
+        // with stack frames (found the hard way by the Block 7 audio ROM).
+        // Only when unset — trap-testing builders (buildIrq) install their
+        // own vector 3 before begin().
+        const v3 = std.mem.readInt(u32, image.bytes[RomImage.offsetOf(0xFFFC0 + 12)..][0..4], .little);
+        if (v3 == 0) image.setVector(3, fail_addr);
+        // The shared FAIL stub: record R11, mark $0BAD, halt. The halt is
+        // a LOOP: a late device IRQ wakes HLT, and falling through into
+        // zeroed ROM after RTI is exactly the storm above.
         var f = image.codeAt(fail_addr);
         f.emit(encode.sw(0, failnum_addr, 11));
         f.emit(encode.li(11, 0x0BAD));
         f.emit(encode.sw(0, result_addr, 11));
+        const fail_hlt = f.addr;
         f.emit(encode.hlt());
+        f.emit(encode.jmpa(fail_hlt));
         return .{ .cur = image.codeAt(entry_addr) };
     }
 
@@ -164,11 +175,13 @@ const Kit = struct {
         kit.emit(encode.lui(rd, @intCast(addr >> 16)));
     }
 
-    /// Success: write $600D and halt.
+    /// Success: write $600D and halt (in a loop — device IRQs wake HLT).
     fn pass(kit: *Kit) void {
         kit.emit(encode.li(11, 0x600D));
         kit.emit(encode.sw(0, result_addr, 11));
+        const hlt_at = kit.cur.addr;
         kit.emit(encode.hlt());
+        kit.emit(encode.jmpa(hlt_at));
     }
 };
 
@@ -991,6 +1004,165 @@ fn buildVicSprite() RomImage {
     return image;
 }
 
+// ---------------------------------------------------------------------------
+// Block 7 AUR-1 test ROMs (task 7.22). Verified by golden audio hash via
+// `harness --frames N --audio-golden HEX` (bit-deterministic: integer
+// synthesis + seeded LFSR); both also self-check and write $600D.
+// ---------------------------------------------------------------------------
+
+const aur_base: u32 = 0x80100;
+
+/// Emit an AUR register write: SB [R1 + offset], value — R1 holds $80100.
+fn aurWrite(k: *Kit, offset: i32, value: i32) void {
+    k.emit(encode.li(12, value));
+    k.emit(encode.sb(1, offset, 12));
+}
+
+/// test_aur_basic.rom: voice 0 square A440 with a full ADSR cycle — gate
+/// on, sustain, gate off, then a self-check that release completion set
+/// ASTAT bit 0 AND delivered the audio IRQ (AIRQEN + IRQMASK bit 6);
+/// voice 1 noise (seeded LFSR) keeps sounding into the golden frames.
+fn buildAurBasic() RomImage {
+    var image = RomImage.init();
+    image.setVector(2, irq_handler_addr);
+    // Audio IRQ handler: ack bit 6, count in R2.
+    var h = image.codeAt(irq_handler_addr);
+    h.emit(encode.li(12, 0x40));
+    h.emit(encode.sw(8, 2, 12)); //     IRQACK
+    h.emit(encode.addi(2, 2, 1));
+    h.emit(encode.rti());
+
+    var k = Kit.begin(&image);
+    k.emit(encode.li(15, 0x1100));
+    k.emit(encode.li(3, 0x20F0));
+    k.emit(encode.mtsr(.ssp, 3));
+    k.loadAddr(3, 0xFFFC0);
+    k.emit(encode.mtsr(.ivt, 3));
+    k.loadAddr(1, aur_base);
+    k.loadAddr(8, 0x80040); //          IRQ controller base (handler R8)
+    // Master section wide open.
+    aurWrite(&k, 0x40, 255); //         AMVOL
+    aurWrite(&k, 0x41, 15); //          AMVOLL
+    aurWrite(&k, 0x42, 15); //          AMVOLR
+    aurWrite(&k, 0x43, 0x03); //        AMVOICE: voices 0+1
+    aurWrite(&k, 0x4A, 0x01); //        AIRQEN: IRQ on envelope completion
+    // Voice 0: square A440 ($028E), A=2ms, D=114ms, S=12, R=6ms.
+    aurWrite(&k, 0x00, 0x8E);
+    aurWrite(&k, 0x01, 0x02);
+    aurWrite(&k, 0x02, 1); //           VWAVE square
+    aurWrite(&k, 0x04, 0x04); //        A idx 0 | D idx 4
+    aurWrite(&k, 0x05, 0xC0); //        S 12 | R idx 0
+    aurWrite(&k, 0x07, 255); //         VVOL
+    aurWrite(&k, 0x0D, 15); //          VVOLR
+    aurWrite(&k, 0x0E, 15); //          VVOLL
+    // Voice 1: noise, quieter, panned left-heavy.
+    aurWrite(&k, 0x10, 0x00);
+    aurWrite(&k, 0x11, 0x20); //        fast phase → lively LFSR clocking
+    aurWrite(&k, 0x12, 5); //           noise
+    aurWrite(&k, 0x14, 0x00);
+    aurWrite(&k, 0x15, 0xF0); //        S 15, R idx 0
+    aurWrite(&k, 0x17, 140);
+    aurWrite(&k, 0x1D, 4); //           VVOLR
+    aurWrite(&k, 0x1E, 15); //          VVOLL
+    // IRQ mask in the audio bit; enable interrupts; gates on.
+    k.emit(encode.li(12, 0x40));
+    k.emit(encode.sw(8, 1, 12)); //     IRQMASK
+    k.emit(encode.sei());
+    aurWrite(&k, 0x03, 0x80); //        voice 0 gate on
+    aurWrite(&k, 0x13, 0x80); //        voice 1 gate on
+    // Hold the note ≈ 120k cycles (60,000 × 2-cycle iterations — the ALU
+    // and flags are 16-bit, so a single-register countdown must stay
+    // ≤ 65535; the original 150,000 wrapped to 18,928 and the checks ran
+    // before the envelope IRQ could ever fire).
+    k.emit(encode.li(5, 60_000));
+    const hold_top = k.cur.addr;
+    k.emit(encode.subi(5, 5, 1));
+    k.branchTo(.bne, hold_top);
+    aurWrite(&k, 0x03, 0x00); //        gate off → release (6 ms full-scale)
+    // Wait ≈ 120k cycles: release ≈ 250 samples ≈ 82k cycles + delivery.
+    k.emit(encode.li(5, 60_000));
+    const wait_top = k.cur.addr;
+    k.emit(encode.subi(5, 5, 1));
+    k.branchTo(.bne, wait_top);
+    // Self-checks: handler ran exactly once; ASTAT bit 0 latched; w1c works.
+    k.checkEqImm(1, 2, 1);
+    k.num(2);
+    k.emit(encode.lw(5, 1, 0x4B)); //   ASTAT
+    k.emit(encode.andi(5, 5, 1));
+    k.emit(encode.cmpi(5, 1));
+    k.assertTaken(.beq);
+    aurWrite(&k, 0x4B, 0x01); //        w1c
+    k.num(3);
+    k.emit(encode.lw(5, 1, 0x4B));
+    k.emit(encode.cmpi(5, 0));
+    k.assertTaken(.beq);
+    k.pass(); //                        voice 1 sustains into the goldens
+    return image;
+}
+
+/// test_aur_fm.rom: FM pair 0→1 (sine modulator, depth $4000, feedback 3)
+/// through the low-pass filter; voices 2+3 demo hard sync + ring mod.
+fn buildAurFm() RomImage {
+    var image = RomImage.init();
+    var k = Kit.begin(&image);
+    k.emit(encode.li(15, 0x1100));
+    k.loadAddr(1, aur_base);
+    aurWrite(&k, 0x40, 255); //         AMVOL
+    aurWrite(&k, 0x41, 15);
+    aurWrite(&k, 0x42, 15);
+    aurWrite(&k, 0x43, 0x0F); //        all voices (modulator auto-excluded)
+    // Modulator voice 0: sine + FM enable, sustain full.
+    aurWrite(&k, 0x00, 0x40);
+    aurWrite(&k, 0x01, 0x01); //        $0140
+    aurWrite(&k, 0x02, 0x08); //        sine | FM (AUR-b)
+    aurWrite(&k, 0x04, 0x00);
+    aurWrite(&k, 0x05, 0xF0);
+    aurWrite(&k, 0x07, 255);
+    aurWrite(&k, 0x08, 0x00); //        depth $4000
+    aurWrite(&k, 0x09, 0x40);
+    aurWrite(&k, 0x0A, 3); //           feedback
+    // Carrier voice 1: sine A440-ish, routed into the LP filter.
+    aurWrite(&k, 0x10, 0x8E);
+    aurWrite(&k, 0x11, 0x02);
+    aurWrite(&k, 0x12, 0); //           sine
+    aurWrite(&k, 0x14, 0x00);
+    aurWrite(&k, 0x15, 0xF0);
+    aurWrite(&k, 0x17, 255);
+    aurWrite(&k, 0x1D, 15);
+    aurWrite(&k, 0x1E, 15);
+    // Filter: route voice 1, LP, mid cutoff, some resonance.
+    aurWrite(&k, 0x44, 0x02); //        AMFILT
+    aurWrite(&k, 0x45, 0x00); //        AFCUTLO
+    aurWrite(&k, 0x46, 0x80); //        AFCUTHI → cutoff $800
+    aurWrite(&k, 0x47, 8); //           AFRESON
+    aurWrite(&k, 0x48, 0); //           AFMODE LP
+    // Voice 2: sawtooth master for sync/ring.
+    aurWrite(&k, 0x20, 0x00);
+    aurWrite(&k, 0x21, 0x01);
+    aurWrite(&k, 0x22, 3);
+    aurWrite(&k, 0x24, 0x00);
+    aurWrite(&k, 0x25, 0xF0);
+    aurWrite(&k, 0x27, 160);
+    aurWrite(&k, 0x2D, 15);
+    aurWrite(&k, 0x2E, 4); //           panned right-heavy
+    // Voice 3: square, ring (×voice 2) + hard sync (from voice 2).
+    aurWrite(&k, 0x30, 0x00);
+    aurWrite(&k, 0x31, 0x07);
+    aurWrite(&k, 0x32, 1);
+    aurWrite(&k, 0x34, 0x00);
+    aurWrite(&k, 0x35, 0xF0);
+    aurWrite(&k, 0x37, 160);
+    aurWrite(&k, 0x3D, 4);
+    aurWrite(&k, 0x3E, 15);
+    // Gates on: 0, 1, 2, then 3 with ring|sync.
+    aurWrite(&k, 0x03, 0x80);
+    aurWrite(&k, 0x13, 0x80);
+    aurWrite(&k, 0x23, 0x80);
+    aurWrite(&k, 0x33, 0x80 | 0x40 | 0x20);
+    k.pass();
+    return image;
+}
+
 const Builder = struct {
     name: []const u8,
     build: *const fn () RomImage,
@@ -1007,6 +1179,8 @@ const builders = [_]Builder{
     .{ .name = "test_vic_bitmap.rom", .build = buildVicBitmap },
     .{ .name = "test_vic_text.rom", .build = buildVicText },
     .{ .name = "test_vic_sprite.rom", .build = buildVicSprite },
+    .{ .name = "test_aur_basic.rom", .build = buildAurBasic },
+    .{ .name = "test_aur_fm.rom", .build = buildAurFm },
 };
 
 pub fn main(init: std.process.Init) !void {

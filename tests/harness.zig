@@ -44,6 +44,10 @@ const Options = struct {
     golden: ?[]const u8 = null,
     /// Write the last frame as a PPM (golden regeneration / eyeballing).
     dump_ppm: ?[]const u8 = null,
+    /// SHA-256 (hex) over ALL audio samples produced during --frames.
+    audio_golden: ?[]const u8 = null,
+    /// Write the accumulated audio as a 44.1 kHz stereo S16 WAV.
+    dump_wav: ?[]const u8 = null,
 
     const max_irqs = 16;
 };
@@ -86,6 +90,14 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingValue;
             opts.dump_ppm = args[i];
+        } else if (std.mem.eql(u8, arg, "--audio-golden")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            opts.audio_golden = args[i];
+        } else if (std.mem.eql(u8, arg, "--dump-wav")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            opts.dump_wav = args[i];
         } else if (std.mem.eql(u8, arg, "--irq-at")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -157,8 +169,18 @@ pub fn main(init: std.process.Init) !void {
         // Frame mode (Block 6): whole scanline-quantum frames via the
         // shared loop. Deterministic: no wall clock, no SDL.
         var frame: u64 = 0;
+        var audio_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var wav_samples: std.ArrayList(i16) = .empty;
         while (frame < opts.frames and !io_dev.power_off) : (frame += 1) {
             m.runFrame();
+            // Audio: hash every frame's samples (task 7.22) and optionally
+            // accumulate for the WAV dump; then drain.
+            const produced = m.aur.samples[0..m.aur.sample_count];
+            audio_hash.update(std.mem.sliceAsBytes(produced));
+            if (opts.dump_wav != null) {
+                try wav_samples.appendSlice(arena, produced);
+            }
+            m.aur.clearSamples();
         }
         cycles = @as(u64, frame) * util.cycles_per_frame;
         util.logInfo("ran {d} frames ({d} cycles); {d}×{d} output", .{
@@ -180,6 +202,23 @@ pub fn main(init: std.process.Init) !void {
             }
             util.logInfo("golden matched", .{});
         }
+        var audio_digest: [32]u8 = undefined;
+        audio_hash.final(&audio_digest);
+        var audio_hex: [64]u8 = undefined;
+        for (audio_digest, 0..) |byte, bi| {
+            _ = std.fmt.bufPrint(audio_hex[bi * 2 ..][0..2], "{x:0>2}", .{byte}) catch unreachable;
+        }
+        util.logInfo("audio hash: {s}", .{&audio_hex});
+        if (opts.dump_wav) |path| {
+            try dumpWav(io, path, wav_samples.items);
+        }
+        if (opts.audio_golden) |want| {
+            if (!std.ascii.eqlIgnoreCase(want, &audio_hex)) {
+                util.logErr("audio golden mismatch: want {s}", .{want});
+                return error.AudioGoldenMismatch;
+            }
+            util.logInfo("audio golden matched", .{});
+        }
     } else {
         // Cycle mode (Blocks 2–5): one instruction (or idle/delivery step)
         // per cycle (D17/D41). Ordering per cycle: sample the IRQ line,
@@ -193,6 +232,7 @@ pub fn main(init: std.process.Init) !void {
             cpu.irq_line = io_dev.irqLine() or injected;
             const event = cpu.step(bus);
             io_dev.tick();
+            if (m.aur.tick(m.ram)) io_dev.raise(io_mod.irq_audio); // parity with machine.cycle
             if (event == .irq_entered and injected) {
                 injected = false;
                 irq_idx += 1;
@@ -217,6 +257,30 @@ pub fn main(init: std.process.Init) !void {
         }
         util.logInfo("test ROM passed", .{});
     }
+}
+
+/// Minimal RIFF/WAVE writer: stereo S16 at 44.1 kHz.
+fn dumpWav(io: std.Io, path: []const u8, samples: []const i16) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    const data_bytes: u32 = @intCast(samples.len * 2);
+    var header: [44]u8 = undefined;
+    @memcpy(header[0..4], "RIFF");
+    std.mem.writeInt(u32, header[4..8], 36 + data_bytes, .little);
+    @memcpy(header[8..12], "WAVE");
+    @memcpy(header[12..16], "fmt ");
+    std.mem.writeInt(u32, header[16..20], 16, .little); //   PCM chunk size
+    std.mem.writeInt(u16, header[20..22], 1, .little); //    PCM
+    std.mem.writeInt(u16, header[22..24], 2, .little); //    stereo
+    std.mem.writeInt(u32, header[24..28], 44_100, .little);
+    std.mem.writeInt(u32, header[28..32], 44_100 * 4, .little); // byte rate
+    std.mem.writeInt(u16, header[32..34], 4, .little); //    block align
+    std.mem.writeInt(u16, header[34..36], 16, .little); //   bits/sample
+    @memcpy(header[36..40], "data");
+    std.mem.writeInt(u32, header[40..44], data_bytes, .little);
+    try file.writeStreamingAll(io, &header);
+    try file.writeStreamingAll(io, std.mem.sliceAsBytes(samples));
+    util.logInfo("wrote {s} ({d} samples)", .{ path, samples.len / 2 });
 }
 
 fn dumpPpm(io: std.Io, m: *machine_mod.Machine, path: []const u8) !void {
