@@ -4,6 +4,22 @@ A fully specified fantasy computer — Gab-16 CPU (16-bit RISC, 20-bit address
 bus), VIC-256 video, AUR-1 sound, 512KB RAM — implemented as a reference
 emulator and toolchain in **Zig 0.16** with **SDL3**.
 
+**★ Milestone 3 — Interactive Machine — reached** (Block 8): the machine
+listens. SDL3 keyboard events forward to the §5.3 scancode queue nearly
+verbatim — SDL3 scancodes *are* USB HID usage-page 0x07 values — through a
+filter that drops host-synthesised auto-repeats, consumer-page codes above
+`$E7`, and the host-reserved keys (Escape quits, F12 is held for the Block 9
+debugger). `KMOD` and the `KSTAT` caps/num bits mirror live host state; the
+`KCTRL`-gated keyboard IRQ and the `JCTRL` any-transition joystick IRQ both
+fire through the real controller. Gamepads hot-plug onto the two §5.4 ports
+(d-pad + left stick with press/release hysteresis → directions, south/east
+face buttons → fire 1/2), and WASD+Space always merges into joystick 1, so a
+keyboard player needs no pad. The whole mapping layer (`src/input.zig`) is
+SDL-free and unit-tested headlessly; the bus-level contract is pinned by
+`test_io_kbd.rom`, driven by the harness's deterministic host-event
+injection (`--key-at CYCLE:HHHH`, `--joy-at CYCLE:PORT:HH` — the exact
+schedule is documented on the ROM's builder in `tests/genroms.zig`).
+
 **Block 7 — First Sound — complete**: the AUR-1 synthesises. Four voices
 with seven waveforms (comptime sine, square, triangle, saw, pulse-width,
 Galois-LFSR noise, RAM wavetables), linear SID-table ADSR with envelope-
@@ -14,7 +30,7 @@ CI via `harness --audio-golden`; `--dump-wav` regenerates listenable/
 plottable output). The chip ticks per master cycle (software PCM per Phase
 4 §4.9 works), yields exactly 735 stereo samples per frame, and streams to
 SDL3 with queue-depth management: 60 s at 60.000 fps, queue bounded, zero
-drops. Milestone 3 (Interactive Machine) lands with Block 8's input.
+drops.
 
 **Milestone 2 — First Pixels — reached** (Block 6): the VIC-256 renders.
 All four display modes (bitmap 8/4/1bpp, tile with fine scroll, bitmap+tile
@@ -37,7 +53,7 @@ zig build -Doptimize=ReleaseFast     # Debug is cycle-exact but below real time
 ./zig-out/bin/flommodore tests/roms/test_prog.flapp
 ```
 
-Next: Block 8 — SDL3 input (keyboard + joystick) → ★ Milestone 3.
+Next: Block 9 — debugger (console first) and Block 10 — assembler → ★ Milestone 4.
 
 ## Build
 

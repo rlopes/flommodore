@@ -629,6 +629,161 @@ fn buildIoTimer() RomImage {
     return image;
 }
 
+/// Sign-extend a 16-bit value for the encoder's i32 immediates (needed for
+/// key-up event words like $800B, whose low-16 pattern is negative).
+fn s16(v: u16) i32 {
+    return @as(i16, @bitCast(v));
+}
+
+/// test_io_kbd.rom (Block 8, task 8.9): the guest-visible keyboard and
+/// joystick contract over the real bus — FIFO order, the bit-15 key-up
+/// flag, empty-queue reads, KCTRL IRQ enable + flush, raw IRQSTAT vs
+/// IRQMASK for the keyboard bit, JOY state reads, and the JCTRL
+/// transition IRQ (task 8.7). Host events are injected by the harness;
+/// the ROM is only meaningful with exactly this schedule:
+///
+///   harness --rom test_io_kbd.rom --expect-pass \
+///     --key-at 1000:000B --key-at 1200:800B \
+///     --key-at 1400:000C --key-at 1600:800C \
+///     --key-at 5000:0004 \
+///     --key-at 6000:0010 --key-at 6100:0011 \
+///     --joy-at 8000:1:09 --joy-at 9000:2:40 --joy-at 12000:1:00
+///
+/// (HID: 'h'=$0B, 'i'=$0C, 'a'=$04; $8000 = key up. Phase boundaries are
+/// guarded by CYC waits, so poll-loop granularity can never race the
+/// schedule.) Register conventions: R1 = $80020 (keyboard base; joysticks
+/// at +$10), R8 = $80040 (IRQ controller), R2 = handler invocation count,
+/// R3 = last KDATA the handler dequeued, R11 = check number, R12 = scratch.
+fn buildIoKbd() RomImage {
+    var image = RomImage.init();
+    image.setVector(2, irq_handler_addr);
+
+    // IRQ handler: ack everything pending; if the keyboard bit was among
+    // them, dequeue one scancode into R3; count invocations in R2.
+    var h = image.codeAt(irq_handler_addr);
+    h.emit(encode.lw(9, 8, 0)); //     R9 = IRQSTAT
+    h.emit(encode.sw(8, 2, 9)); //     IRQACK <- R9 (w1c per source, §5.5)
+    h.emit(encode.andi(6, 9, 4)); //   keyboard source (bit 2)?
+    h.emit(encode.cmpi(6, 0));
+    h.emit(encode.formatJ(.beq, 4)); //  no: skip the KDATA read
+    h.emit(encode.lw(3, 1, 1)); //     R3 = KDATA (dequeues, §5.3)
+    h.emit(encode.addi(2, 2, 1));
+    h.emit(encode.rti());
+
+    var k = Kit.begin(&image);
+    // Supervisor setup (D12 boot values, IVT -> ROM system vectors).
+    k.emit(encode.li(15, 0x1100));
+    k.emit(encode.li(3, 0x20F0));
+    k.emit(encode.mtsr(.ssp, 3));
+    k.loadAddr(3, 0xFFFC0);
+    k.emit(encode.mtsr(.ivt, 3));
+    k.loadAddr(1, 0x80020); //         keyboard base
+    k.loadAddr(8, 0x80040); //         IRQ controller base
+
+    // 1: empty defaults — no event available, KDATA reads $0000 (runs
+    // long before the first injection at cycle 1000).
+    k.emit(encode.lw(6, 1, 0)); //     KSTAT
+    k.checkEqImm(1, 6, 0);
+    k.emit(encode.lw(6, 1, 1)); //     KDATA on empty queue
+    k.checkEqImm(2, 6, 0);
+
+    // 2-5: polled drain of four events — FIFO order and the bit-15 key-up
+    // flag survive the queue ('h' down/up, 'i' down/up).
+    const expected = [_]u16{ 0x000B, 0x800B, 0x000C, 0x800C };
+    for (expected, 3..) |word, n| {
+        const poll = k.cur.addr;
+        k.emit(encode.lw(6, 1, 0)); // KSTAT: wait for event-available
+        k.emit(encode.andi(6, 6, 1));
+        k.emit(encode.cmpi(6, 0));
+        k.branchTo(.beq, poll);
+        k.emit(encode.lw(6, 1, 1)); // KDATA
+        k.checkEqImm(@intCast(n), 6, s16(word));
+    }
+    // 7: drained — flag clear, one more read gives $0000.
+    k.emit(encode.lw(6, 1, 0));
+    k.checkEqImm(7, 6, 0);
+    k.emit(encode.lw(6, 1, 1));
+    k.checkEqImm(8, 6, 0);
+
+    // 9: the keyboard IRQ path (task 8.5): KCTRL bit 0 + IRQMASK bit 2 +
+    // SEI; the 'a' at cycle 5000 must invoke the handler exactly once and
+    // hand it the scancode.
+    k.emit(encode.li(12, 1));
+    k.emit(encode.sw(1, 3, 12)); //    KCTRL <- IRQ enable
+    k.emit(encode.li(12, 4));
+    k.emit(encode.sw(8, 1, 12)); //    IRQMASK <- keyboard bit
+    k.emit(encode.sei());
+    const wait_key_irq = k.cur.addr;
+    k.emit(encode.cmpi(2, 1));
+    k.branchTo(.bne, wait_key_irq);
+    k.emit(encode.cli());
+    k.checkEqImm(9, 3, 0x0004); //     handler saw the 'a' make code
+    k.checkEqImm(10, 2, 1); //         exactly one invocation
+
+    // 11-14: device gate vs mask, then flush. IRQMASK <- 0 (KCTRL still
+    // enables the device): the two events at 6000/6100 set IRQSTAT raw but
+    // no handler runs. Wait past the burst first — polling KSTAT would
+    // race the second event, and a flush between the two would leave a
+    // stray entry behind.
+    k.emit(encode.sw(8, 1, 0)); //     IRQMASK <- 0
+    const wait_burst = k.cur.addr;
+    k.emit(encode.mfsr(6, .cyc));
+    k.emit(encode.cmpi(6, 6200));
+    k.branchTo(.bcc, wait_burst);
+    k.emit(encode.lw(6, 1, 0)); //     KSTAT: events queued
+    k.emit(encode.andi(6, 6, 1));
+    k.checkEqImm(11, 6, 1);
+    k.emit(encode.lw(6, 8, 0)); //     IRQSTAT raw: bit 2 pending though masked
+    k.emit(encode.andi(6, 6, 4));
+    k.checkEqImm(12, 6, 4);
+    k.checkEqImm(13, 2, 1); //         and no handler ran
+    k.emit(encode.li(12, 4));
+    k.emit(encode.sw(8, 2, 12)); //    IRQACK the keyboard bit
+    k.emit(encode.li(12, 3));
+    k.emit(encode.sw(1, 3, 12)); //    KCTRL <- IRQ enable | flush (write-1)
+    k.emit(encode.lw(6, 1, 0)); //     queue emptied by the flush
+    k.checkEqImm(14, 6, 0);
+
+    // 15-17: joystick transition IRQ (task 8.7): JCTRL bit 0 + IRQMASK
+    // bit 3. Port 1 -> $09 (up+right) at 8000, port 2 -> $40 (fire 1) at
+    // 9000 — each transition is one handler invocation.
+    k.emit(encode.li(12, 1));
+    k.emit(encode.sw(1, 0x12, 12)); // JCTRL <- IRQ on state change
+    k.emit(encode.li(12, 8));
+    k.emit(encode.sw(8, 1, 12)); //    IRQMASK <- joystick bit
+    k.emit(encode.sei());
+    const wait_joy1 = k.cur.addr;
+    k.emit(encode.cmpi(2, 2));
+    k.branchTo(.bne, wait_joy1);
+    k.emit(encode.lw(6, 1, 0x10)); //  JOY1
+    k.checkEqImm(15, 6, 0x09);
+    const wait_joy2 = k.cur.addr;
+    k.emit(encode.cmpi(2, 3));
+    k.branchTo(.bne, wait_joy2);
+    k.emit(encode.cli());
+    k.emit(encode.lw(6, 1, 0x11)); //  JOY2 independent
+    k.checkEqImm(16, 6, 0x40);
+    k.emit(encode.lw(6, 1, 0x10)); //  JOY1 held meanwhile
+    k.checkEqImm(17, 6, 0x09);
+
+    // 18-19: JCTRL off — the release at 12000 changes visible state but
+    // must NOT raise IRQSTAT bit 3.
+    k.emit(encode.sw(1, 0x12, 0)); //  JCTRL <- 0
+    k.emit(encode.sw(8, 1, 0)); //     IRQMASK <- 0
+    const wait_release = k.cur.addr;
+    k.emit(encode.mfsr(6, .cyc));
+    k.emit(encode.cmpi(6, 12100));
+    k.branchTo(.bcc, wait_release);
+    k.emit(encode.lw(6, 1, 0x10)); //  JOY1 released
+    k.checkEqImm(18, 6, 0);
+    k.emit(encode.lw(6, 8, 0)); //     IRQSTAT: joystick bit stayed clear
+    k.emit(encode.andi(6, 6, 8));
+    k.checkEqImm(19, 6, 0);
+
+    k.pass();
+    return image;
+}
+
 /// test_prog.flapp (Block 5, task 5.5): a standalone program image built
 /// with encode.zig — loads at the canonical $04100 (D10), writes the PASS
 /// marker, and exits via SYSPWR. Exercises the full .flapp path: header
@@ -1176,6 +1331,7 @@ const builders = [_]Builder{
     .{ .name = "test_cpu_stack.rom", .build = buildStack },
     .{ .name = "test_cpu_irq.rom", .build = buildIrq },
     .{ .name = "test_io_timer.rom", .build = buildIoTimer },
+    .{ .name = "test_io_kbd.rom", .build = buildIoKbd },
     .{ .name = "test_vic_bitmap.rom", .build = buildVicBitmap },
     .{ .name = "test_vic_text.rom", .build = buildVicText },
     .{ .name = "test_vic_sprite.rom", .build = buildVicSprite },
