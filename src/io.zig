@@ -169,7 +169,7 @@ const Timer = struct {
 
 // ---------------------------------------------------------------------------
 // Keyboard (§5.3). The 16-entry queue and register semantics live here;
-// SDL enqueues via `keyEvent` in Block 8.
+// input.zig (Block 8) feeds `keyEvent`/`setModifiers`/`setLocks` from SDL.
 // ---------------------------------------------------------------------------
 
 const Keyboard = struct {
@@ -178,7 +178,7 @@ const Keyboard = struct {
     len: usize = 0,
     kmod: u16 = 0, // bit 0 shift | 1 ctrl | 2 alt | 3 super
     irq_enable: bool = false, // KCTRL bit 0
-    locks: u16 = 0, // KSTAT bits 2 (caps) / 3 (num), host-mirrored in Block 8
+    locks: u16 = 0, // KSTAT bits 2 (caps) / 3 (num), host-mirrored via setLocks
 
     fn kstat(kb: *const Keyboard) u16 {
         var v: u16 = 0;
@@ -267,7 +267,9 @@ pub const Io = struct {
     }
 
     // ------------------------------------------------------------------
-    // Block 8 entry points (SDL input) — usable by unit tests today.
+    // Host-input entry points (Block 8) — input.zig calls these; the
+    // harness injects through them (--key-at/--joy-at); unit tests below
+    // drive them directly.
     // ------------------------------------------------------------------
 
     /// Keyboard event from the host. Raises IRQ bit 2 if KCTRL bit 0 is set.
@@ -275,6 +277,19 @@ pub const Io = struct {
         if (io.keyboard.enqueue(scancode) and io.keyboard.irq_enable) {
             io.raise(irq_keyboard);
         }
+    }
+
+    /// Live modifier state from the host (§5.3 KMOD): bit 0 shift, 1 ctrl,
+    /// 2 alt, 3 super. Overwrites any guest write — KMOD is host-fed.
+    pub fn setModifiers(io: *Io, mods: u16) void {
+        io.keyboard.kmod = mods & 0x000F;
+    }
+
+    /// Host caps/num lock state (§5.3 KSTAT bits 2/3 mirror the host
+    /// keyboard LEDs, audit G19).
+    pub fn setLocks(io: *Io, caps: bool, num: bool) void {
+        io.keyboard.locks = (@as(u16, @intFromBool(caps)) << 2) |
+            (@as(u16, @intFromBool(num)) << 3);
     }
 
     /// Joystick state from the host. Any bit transition of either port
@@ -341,7 +356,7 @@ pub const Io = struct {
             },
             kstat_addr => {}, // read-only
             kdata_addr => {}, // writes undefined → ignored (the D47 RMW read still dequeued)
-            kmod_addr => io.keyboard.kmod = value & 0x000F, // host-fed in Block 8
+            kmod_addr => io.keyboard.kmod = value & 0x000F, // host-fed (setModifiers overwrites)
             kctrl_addr => {
                 io.keyboard.irq_enable = (value & 0x0001) != 0;
                 if (value & 0x0002 != 0) io.keyboard.flush(); // write-1, self-clearing (§5.3)
@@ -534,6 +549,24 @@ test "4.8 keyboard: queue, dequeue-on-read, overflow drop, flush, KCTRL" {
     // KMOD round-trips its 4 defined bits.
     io.write16(kmod_addr, 0xFFFF);
     try expectEqual(@as(u16, 0x000F), io.read16(kmod_addr));
+}
+
+test "8.3/8.4 host setters: KMOD live state; KSTAT lock mirroring" {
+    var io = Io.init();
+    // Modifiers: only the four defined bits stick; host overwrites guest.
+    io.write16(kmod_addr, 0x0005); // guest write (shift | alt)
+    io.setModifiers(0xFFFF);
+    try expectEqual(@as(u16, 0x000F), io.read16(kmod_addr));
+    io.setModifiers(0x0002); // ctrl only
+    try expectEqual(@as(u16, 0x0002), io.read16(kmod_addr));
+    // Locks mirror into KSTAT bits 2/3 without disturbing the queue flags.
+    io.setLocks(true, false);
+    try expectEqual(@as(u16, 0x0004), io.read16(kstat_addr));
+    io.setLocks(false, true);
+    io.keyEvent(0x0004); // event-available bit composes with the lock bits
+    try expectEqual(@as(u16, 0x0009), io.read16(kstat_addr));
+    io.setLocks(false, false);
+    try expectEqual(@as(u16, 0x0001), io.read16(kstat_addr));
 }
 
 test "4.9 joystick: default zero, state read, transition IRQ via JCTRL" {

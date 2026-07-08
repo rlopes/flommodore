@@ -1,8 +1,9 @@
-//! Flommodore — `main.zig` (Block 5).
+//! Flommodore — `main.zig` (Blocks 5, 8).
 //!
 //! The emulator: machine composition, the **scanline-quantum main loop**
-//! (plan 5.1), SDL3 window and events (5.3), 60 Hz frame pacing (5.4), and
-//! `.flapp` loading (5.5).
+//! (plan 5.1), SDL3 window and events (5.3), 60 Hz frame pacing (5.4),
+//! `.flapp` loading (5.5), and host input forwarding (Block 8 — the SDL
+//! boundary; the mapping itself lives in input.zig).
 //!
 //! CLI (Phase 8 §8.10 subset — `--debug`/`--sym` arrive with Block 9/11):
 //!   flommodore [--rom file.rom] [program.flapp] [--max-frames N]
@@ -24,6 +25,7 @@ const util = @import("util");
 const rom_mod = @import("rom");
 const cpu_mod = @import("cpu");
 const flapp = @import("flapp");
+const input_mod = @import("input");
 const machine_mod = @import("machine");
 const Machine = machine_mod.Machine;
 
@@ -50,6 +52,39 @@ const audio_frame_bytes: usize = 735 * 2 * 2;
 const audio_high_water: c_int = @intCast(8 * audio_frame_bytes);
 /// Sleep coarse until this close to the deadline, then spin (task 5.4).
 const spin_margin_ns: u64 = 1_500_000;
+
+// ---------------------------------------------------------------------------
+// SDL → machine translation (Block 8). Everything below the event loop is
+// SDL-free (input.zig), so these two helpers are the entire boundary.
+// ---------------------------------------------------------------------------
+
+/// SDL_Keymod snapshot → input.zig terms. SDL_KMOD_CAPS/NUM reflect the
+/// host lock *state* — exactly the G19 "mirror the host LEDs" requirement.
+fn modsFromSdl(mods: sdl.SDL_Keymod) input_mod.Mods {
+    return .{
+        .shift = (mods & sdl.SDL_KMOD_SHIFT) != 0,
+        .ctrl = (mods & sdl.SDL_KMOD_CTRL) != 0,
+        .alt = (mods & sdl.SDL_KMOD_ALT) != 0,
+        .gui = (mods & sdl.SDL_KMOD_GUI) != 0,
+        .caps = (mods & sdl.SDL_KMOD_CAPS) != 0,
+        .num = (mods & sdl.SDL_KMOD_NUM) != 0,
+    };
+}
+
+/// SDL_GamepadButton → the §5.4 inputs (task 8.6): dpad → directions,
+/// south face button (Xbox A) → fire 1, east (Xbox B) → fire 2. Everything
+/// else has no 9-pin equivalent and is dropped.
+fn padButtonFromSdl(button: u8) ?input_mod.PadButton {
+    return switch (@as(c_int, button)) {
+        sdl.SDL_GAMEPAD_BUTTON_DPAD_UP => .dpad_up,
+        sdl.SDL_GAMEPAD_BUTTON_DPAD_DOWN => .dpad_down,
+        sdl.SDL_GAMEPAD_BUTTON_DPAD_LEFT => .dpad_left,
+        sdl.SDL_GAMEPAD_BUTTON_DPAD_RIGHT => .dpad_right,
+        sdl.SDL_GAMEPAD_BUTTON_SOUTH => .fire1,
+        sdl.SDL_GAMEPAD_BUTTON_EAST => .fire2,
+        else => null,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // CLI.
@@ -179,6 +214,20 @@ pub fn main(init: std.process.Init) !void {
     var queue_max: c_int = 0;
     var audio_drops: u64 = 0;
 
+    // Host input (Block 8). The gamepad subsystem is optional the same way
+    // audio is: a headless/driverless host still runs, keyboard-only.
+    if (!sdl.SDL_InitSubSystem(sdl.SDL_INIT_GAMEPAD)) {
+        util.logWarn("SDL gamepad init failed: {s} — keyboard input only", .{sdl.SDL_GetError()});
+    }
+    var input = input_mod.Input.init(machine.io);
+    input.syncModifiers(modsFromSdl(sdl.SDL_GetModState())); // seed lock state
+    // SDL handles for the pads assigned to the two ports (input.zig owns
+    // the port assignment; SDL only delivers events for opened gamepads).
+    var pad_handles: [2]?*sdl.SDL_Gamepad = .{ null, null };
+    defer for (pad_handles) |h| {
+        if (h) |g| sdl.SDL_CloseGamepad(g);
+    };
+
     util.logInfo("Flommodore running — 14.4 MHz, 240,000 cycles/frame, 60 Hz", .{});
 
     // ------------------------------------------------------------------
@@ -240,12 +289,53 @@ pub fn main(init: std.process.Init) !void {
         machine.aur.clearSamples();
 
         // Frame-end actions (task 5.3): events first, so quit is prompt.
+        // Enqueuing at the frame boundary bounds input latency at one frame
+        // (~16.7 ms) — indistinguishable from hardware keyboard latency.
         var event: sdl.SDL_Event = undefined;
         while (sdl.SDL_PollEvent(&event)) {
             switch (event.type) {
                 sdl.SDL_EVENT_QUIT => running = false,
-                sdl.SDL_EVENT_KEY_DOWN => {
-                    if (event.key.key == sdl.SDLK_ESCAPE) running = false;
+                sdl.SDL_EVENT_KEY_DOWN, sdl.SDL_EVENT_KEY_UP => {
+                    // Escape is host-reserved: quit (task 5.3, input.zig
+                    // decision j — never forwarded to the guest).
+                    if (event.key.scancode == sdl.SDL_SCANCODE_ESCAPE) {
+                        if (event.key.down) running = false;
+                        continue;
+                    }
+                    // KMOD/lock state first, so a program woken by the key
+                    // IRQ reads modifiers consistent with its scancode.
+                    input.syncModifiers(modsFromSdl(event.key.mod));
+                    input.keyEvent(event.key.scancode, event.key.down, event.key.repeat);
+                },
+                sdl.SDL_EVENT_GAMEPAD_ADDED => {
+                    const id = event.gdevice.which;
+                    if (input.padAdded(id)) |port| {
+                        pad_handles[port] = sdl.SDL_OpenGamepad(id);
+                        if (pad_handles[port] == null) {
+                            util.logWarn("gamepad open failed: {s}", .{sdl.SDL_GetError()});
+                            _ = input.padRemoved(id);
+                        } else {
+                            util.logInfo("gamepad {d} → joystick port {d}", .{ id, @as(u8, port) + 1 });
+                        }
+                    }
+                },
+                sdl.SDL_EVENT_GAMEPAD_REMOVED => {
+                    const id = event.gdevice.which;
+                    if (input.padRemoved(id)) |port| {
+                        if (pad_handles[port]) |g| sdl.SDL_CloseGamepad(g);
+                        pad_handles[port] = null;
+                        util.logInfo("gamepad {d} left port {d}", .{ id, @as(u8, port) + 1 });
+                    }
+                },
+                sdl.SDL_EVENT_GAMEPAD_BUTTON_DOWN, sdl.SDL_EVENT_GAMEPAD_BUTTON_UP => {
+                    if (padButtonFromSdl(event.gbutton.button)) |button| {
+                        input.padButton(event.gbutton.which, button, event.gbutton.down);
+                    }
+                },
+                sdl.SDL_EVENT_GAMEPAD_AXIS_MOTION => switch (@as(c_int, event.gaxis.axis)) {
+                    sdl.SDL_GAMEPAD_AXIS_LEFTX => input.padAxisX(event.gaxis.which, event.gaxis.value),
+                    sdl.SDL_GAMEPAD_AXIS_LEFTY => input.padAxisY(event.gaxis.which, event.gaxis.value),
+                    else => {},
                 },
                 else => {},
             }
