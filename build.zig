@@ -70,6 +70,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "aur1", .module = aur_mod },
         },
     });
+    const input_mod = b.createModule(.{
+        .root_source_file = b.path("src/input.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "io", .module = io_mod },
+        },
+    });
     const bus_mod = b.createModule(.{
         .root_source_file = b.path("src/bus.zig"),
         .target = target,
@@ -174,6 +182,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "encode", .module = encode_mod },
             .{ .name = "cpu", .module = cpu_mod },
             .{ .name = "io", .module = io_mod },
+            .{ .name = "input", .module = input_mod },
             .{ .name = "flapp", .module = flapp_mod },
             .{ .name = "machine", .module = machine_mod },
             .{ .name = "vic256", .module = vic_mod },
@@ -334,6 +343,7 @@ pub fn build(b: *std.Build) void {
         rom_mod,
         aur_mod,
         io_mod,
+        input_mod,
         bus_mod,
         flapp_mod,
         vic_mod,
