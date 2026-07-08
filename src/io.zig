@@ -336,6 +336,16 @@ pub const Io = struct {
         };
     }
 
+    /// Side-effect-free register read for the debugger's memory viewer
+    /// (Block 9): identical to read16 except KDATA shows the queue head
+    /// WITHOUT dequeuing — the only register with a read side effect.
+    pub fn peek16(io: *Io, addr: u32) u16 {
+        if (addr == kdata_addr) {
+            return if (io.keyboard.len == 0) 0x0000 else io.keyboard.queue[io.keyboard.head];
+        }
+        return io.read16(addr);
+    }
+
     pub fn write16(io: *Io, addr: u32, value: u16) void {
         std.debug.assert(addr >= io_base and addr <= 0x80FFF);
         if (addr >= timer_a_base and addr < timer_a_base + 8) return io.timer_a.write(addr - timer_a_base, value);
@@ -599,4 +609,16 @@ test "4.1 dispatch: adjacent registers never combine; reserved reads zero" {
     }
     try expectEqual(@as(u16, 0), io.read16(0x80050)); // reserved expansion
     try expectEqual(@as(u16, 0), io.read16(0x80FFF));
+}
+
+test "9.x peek16 is side-effect-free: KDATA head stays queued" {
+    var io = Io.init();
+    io.keyEvent(0x0004);
+    io.keyEvent(0x8004);
+    try expectEqual(@as(u16, 0x0004), io.peek16(kdata_addr)); // head, no dequeue
+    try expectEqual(@as(u16, 0x0004), io.peek16(kdata_addr)); // still there
+    try expectEqual(@as(u16, 0x0001), io.peek16(kstat_addr)); // other regs = read16
+    try expectEqual(@as(u16, 0x0004), io.read16(kdata_addr)); // real read dequeues
+    try expectEqual(@as(u16, 0x8004), io.read16(kdata_addr));
+    try expectEqual(@as(u16, 0x0000), io.peek16(kdata_addr)); // empty → $0000
 }
