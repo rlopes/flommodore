@@ -50,7 +50,6 @@ pub const shadow_base: u32 = 0x3C000; // fixed shadow window (D9)
 pub const syscfg_addr: u32 = io_mod.syscfg_addr;
 
 pub const Region = enum { ram, io, open_bus, rom };
-
 pub fn regionOf(addr: u32) Region {
     std.debug.assert(addr <= util.addr_mask);
     if (addr <= ram_end) return .ram;
@@ -59,12 +58,59 @@ pub fn regionOf(addr: u32) Region {
     return .rom;
 }
 
+// ---------------------------------------------------------------------------
+// Watchpoints (Block 9, task 9.8). The set lives in the debugger; the bus
+// holds an optional pointer and notes every access against it — a single
+// null test per access is the entire cost when no debugger is attached.
+// Debugger decisions (continuing input.zig's f–j list):
+//   l. Watchpoints observe BUS accesses, i.e. the CPU: instruction fetches
+//      count as reads, and the D47 byte-write RMW counts as a write only.
+//      VIC/AUR fetches go straight to RAM and are architectural rendering,
+//      not program activity — they never trigger.
+// ---------------------------------------------------------------------------
+
+pub const WatchKind = enum { read, write };
+
+pub const WatchSet = struct {
+    pub const max = 16;
+    pub const Entry = struct { addr: u32, on_read: bool, on_write: bool };
+    pub const Hit = struct { watch_addr: u32, access_addr: u32, kind: WatchKind };
+
+    entries: [max]Entry = undefined,
+    count: usize = 0,
+    /// Latched on the first matching access; the debugger consumes and
+    /// clears it. Further hits are ignored until then (one stop per stop).
+    hit: ?Hit = null,
+
+    /// Note one access of `width` bytes starting at `addr` (pre-masked).
+    /// Each covered byte address (with $FFFFF wrap) is matched.
+    pub fn note(w: *WatchSet, addr: u32, width: u2, kind: WatchKind) void {
+        if (w.count == 0 or w.hit != null) return;
+        var b: u32 = 0;
+        while (b < width) : (b += 1) {
+            const a = util.maskAddr(addr +% b);
+            for (w.entries[0..w.count]) |e| {
+                const match = switch (kind) {
+                    .read => e.on_read,
+                    .write => e.on_write,
+                };
+                if (match and e.addr == a) {
+                    w.hit = .{ .watch_addr = e.addr, .access_addr = addr, .kind = kind };
+                    return;
+                }
+            }
+        }
+    }
+};
+
 pub const Bus = struct {
     ram: *Ram,
     rom: *Rom,
     /// The I/O region (Block 4). Owns SYSCFG; the bus queries it for the
     /// shadow mapping.
     io: *Io,
+    /// Debugger watchpoints (Block 9). Null unless a debugger is attached.
+    watch: ?*WatchSet = null,
 
     pub fn init(ram: *Ram, rom: *Rom, io: *Io) Bus {
         return .{ .ram = ram, .rom = rom, .io = io };
@@ -74,12 +120,17 @@ pub const Bus = struct {
         return bus.io.shadowEnabled();
     }
 
+    inline fn watchNote(bus: *Bus, addr: u32, width: u2, kind: WatchKind) void {
+        if (bus.watch) |w| w.note(addr, width, kind);
+    }
+
     // ------------------------------------------------------------------
     // Byte access — the routing primitive.
     // ------------------------------------------------------------------
 
     pub fn read8(bus: *Bus, addr_in: u32) u8 {
         const addr = util.maskAddr(addr_in);
+        bus.watchNote(addr, 1, .read);
         return switch (regionOf(addr)) {
             .ram => bus.ram.readByte(addr),
             // Low byte of the register (§3.1). Non-const: KDATA dequeues on
@@ -95,6 +146,7 @@ pub const Bus = struct {
 
     pub fn write8(bus: *Bus, addr_in: u32, value: u8) void {
         const addr = util.maskAddr(addr_in);
+        bus.watchNote(addr, 1, .write);
         switch (regionOf(addr)) {
             .ram => bus.ram.writeByte(addr, value),
             .io => {
@@ -120,6 +172,7 @@ pub const Bus = struct {
         const a0 = util.maskAddr(addr_in);
         const a1 = util.maskAddr(addr_in +% 1); // wraps $FFFFF → $00000 (§1.7)
         if (regionOf(a0) == .io and regionOf(a1) == .io) {
+            bus.watchNote(a0, 2, .read);
             return bus.io.read16(a0); // 16-bit register at the exact address (D14)
         }
         const lo: u16 = bus.read8(a0);
@@ -131,6 +184,7 @@ pub const Bus = struct {
         const a0 = util.maskAddr(addr_in);
         const a1 = util.maskAddr(addr_in +% 1);
         if (regionOf(a0) == .io and regionOf(a1) == .io) {
+            bus.watchNote(a0, 2, .write);
             bus.io.write16(a0, value); // exact register (D14)
             return;
         }
@@ -359,4 +413,40 @@ test "bus: full address-space walk verifies routing everywhere (task 2.5)" {
     while (addr <= util.addr_mask) : (addr += 1) {
         try testing.expectEqual(@as(u8, @truncate((addr - rom_base) *% 7)), f.bus.read8(addr));
     }
+}
+
+test "9.8 watchpoints: read/write/kind matching, width coverage, one-shot latch" {
+    var f = try Fixture.setup();
+    defer f.teardown();
+    const bus = &f.bus;
+    var w = WatchSet{};
+    w.entries[0] = .{ .addr = 0x00100, .on_read = true, .on_write = true };
+    w.entries[1] = .{ .addr = 0x00200, .on_read = false, .on_write = true };
+    w.count = 2;
+    bus.watch = &w;
+
+    // Write-only watch ignores reads...
+    _ = bus.read16(0x00200);
+    try testing.expectEqual(@as(?WatchSet.Hit, null), w.hit);
+    // ...but latches on a write, recording watch and access addresses.
+    bus.write8(0x00200, 0xAA);
+    try testing.expectEqual(@as(u32, 0x00200), w.hit.?.watch_addr);
+    try testing.expectEqual(WatchKind.write, w.hit.?.kind);
+    // One-shot: further matches are swallowed until the debugger clears it.
+    bus.write16(0x00100, 0x1234);
+    try testing.expectEqual(@as(u32, 0x00200), w.hit.?.watch_addr);
+    w.hit = null;
+
+    // A 16-bit access one byte below covers the watched address (the RAM
+    // path composes per byte, so the recorded access is the matching byte).
+    _ = bus.read16(0x000FF);
+    try testing.expectEqual(@as(u32, 0x00100), w.hit.?.watch_addr);
+    try testing.expectEqual(@as(u32, 0x00100), w.hit.?.access_addr);
+    try testing.expectEqual(WatchKind.read, w.hit.?.kind);
+    w.hit = null;
+
+    // Detached bus: zero effect.
+    bus.watch = null;
+    bus.write16(0x00100, 0xBEEF);
+    try testing.expectEqual(@as(?WatchSet.Hit, null), w.hit);
 }
