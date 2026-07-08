@@ -37,6 +37,13 @@ const Options = struct {
     expect_pass: bool = false,
     irq_at: [max_irqs]u64 = undefined,
     irq_count: usize = 0,
+    /// Host-input injection (Block 8, cycle mode): `--key-at CYCLE:HHHH`
+    /// enqueues a §5.3 scancode event word; `--joy-at CYCLE:PORT:HH` sets a
+    /// §5.4 joystick state byte. Cycles ascending per list, like --irq-at.
+    key_at: [max_events]KeyEvent = undefined,
+    key_count: usize = 0,
+    joy_at: [max_events]JoyEvent = undefined,
+    joy_count: usize = 0,
     /// Frame mode (Block 6): run N full scanline-quantum frames through the
     /// shared machine loop instead of raw cycles.
     frames: u64 = 0,
@@ -50,7 +57,36 @@ const Options = struct {
     dump_wav: ?[]const u8 = null,
 
     const max_irqs = 16;
+    const max_events = 16;
+
+    const KeyEvent = struct { cycle: u64, code: u16 };
+    const JoyEvent = struct { cycle: u64, port: u1, state: u8 };
 };
+
+/// Parse "CYCLE:HHHH" (key) — cycle decimal, event word hex.
+fn parseKeyAt(text: []const u8) !Options.KeyEvent {
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.BadFormat;
+    return .{
+        .cycle = try std.fmt.parseInt(u64, text[0..colon], 10),
+        .code = try std.fmt.parseInt(u16, text[colon + 1 ..], 16),
+    };
+}
+
+/// Parse "CYCLE:PORT:HH" (joystick) — port 1-based like the registers.
+fn parseJoyAt(text: []const u8) !Options.JoyEvent {
+    var it = std.mem.splitScalar(u8, text, ':');
+    const cycle_s = it.next() orelse return error.BadFormat;
+    const port_s = it.next() orelse return error.BadFormat;
+    const state_s = it.next() orelse return error.BadFormat;
+    if (it.next() != null) return error.BadFormat;
+    const port = try std.fmt.parseInt(u8, port_s, 10);
+    if (port < 1 or port > 2) return error.BadPort;
+    return .{
+        .cycle = try std.fmt.parseInt(u64, cycle_s, 10),
+        .port = @intCast(port - 1),
+        .state = try std.fmt.parseInt(u8, state_s, 16),
+    };
+}
 
 /// Test-ROM result protocol addresses (see tests/genroms.zig).
 const result_addr: u32 = 0x00080;
@@ -98,6 +134,24 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingValue;
             opts.dump_wav = args[i];
+        } else if (std.mem.eql(u8, arg, "--key-at")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            if (opts.key_count >= Options.max_events) return error.TooManyEvents;
+            const ev = try parseKeyAt(args[i]);
+            if (opts.key_count > 0 and ev.cycle < opts.key_at[opts.key_count - 1].cycle)
+                return error.EventsNotAscending;
+            opts.key_at[opts.key_count] = ev;
+            opts.key_count += 1;
+        } else if (std.mem.eql(u8, arg, "--joy-at")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            if (opts.joy_count >= Options.max_events) return error.TooManyEvents;
+            const ev = try parseJoyAt(args[i]);
+            if (opts.joy_count > 0 and ev.cycle < opts.joy_at[opts.joy_count - 1].cycle)
+                return error.EventsNotAscending;
+            opts.joy_at[opts.joy_count] = ev;
+            opts.joy_count += 1;
         } else if (std.mem.eql(u8, arg, "--irq-at")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -123,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     const opts = parseArgs(args) catch {
-        std.log.err("usage: harness (--rom <path> | --flapp <path>) [--max-cycles N | --frames N] [--golden HEX] [--dump-ppm f.ppm] [--irq-at N]... [--expect-pass] [--quiet]", .{});
+        std.log.err("usage: harness (--rom <path> | --flapp <path>) [--max-cycles N | --frames N] [--golden HEX] [--dump-ppm f.ppm] [--irq-at N]... [--key-at C:HHHH]... [--joy-at C:P:HH]... [--expect-pass] [--quiet]", .{});
         return error.BadUsage;
     };
     if (opts.quiet) util.setLevel(.silent);
@@ -225,7 +279,19 @@ pub fn main(init: std.process.Init) !void {
         // step the CPU, tick the devices.
         var irq_idx: usize = 0;
         var injected = false;
+        var key_idx: usize = 0;
+        var joy_idx: usize = 0;
         while (cycles < opts.max_cycles and !cpu.halted and !io_dev.power_off) : (cycles += 1) {
+            // Host-input injection (Block 8) before the IRQ line is
+            // sampled, so an event at cycle N is deliverable at cycle N —
+            // same convention as --irq-at. `while`, not `if`: same-cycle
+            // bursts are allowed (a real host can flood the queue).
+            while (key_idx < opts.key_count and cycles >= opts.key_at[key_idx].cycle) : (key_idx += 1) {
+                io_dev.keyEvent(opts.key_at[key_idx].code);
+            }
+            while (joy_idx < opts.joy_count and cycles >= opts.joy_at[joy_idx].cycle) : (joy_idx += 1) {
+                io_dev.setJoystick(opts.joy_at[joy_idx].port, opts.joy_at[joy_idx].state);
+            }
             if (irq_idx < opts.irq_count and cycles >= opts.irq_at[irq_idx]) {
                 injected = true; // --irq-at: asserted until delivered
             }
@@ -325,4 +391,28 @@ test "harness: argument parsing" {
     try testing.expectError(error.MissingRom, parseArgs(&.{"harness"}));
     try testing.expectError(error.MissingValue, parseArgs(&.{ "harness", "--rom" }));
     try testing.expectError(error.UnknownArgument, parseArgs(&.{ "harness", "--bogus" }));
+}
+
+test "harness: --key-at / --joy-at parsing (Block 8)" {
+    const o = try parseArgs(&.{
+        "harness",   "--rom",         "x.rom",
+        "--key-at",  "1000:000B",     "--key-at",
+        "1000:800B", "--key-at",      "2500:0004",
+        "--joy-at",  "8000:1:09",     "--joy-at",
+        "9000:2:40", "--expect-pass",
+    });
+    try testing.expectEqual(@as(usize, 3), o.key_count);
+    try testing.expectEqual(Options.KeyEvent{ .cycle = 1000, .code = 0x000B }, o.key_at[0]);
+    try testing.expectEqual(Options.KeyEvent{ .cycle = 1000, .code = 0x800B }, o.key_at[1]); // same cycle OK
+    try testing.expectEqual(Options.KeyEvent{ .cycle = 2500, .code = 0x0004 }, o.key_at[2]);
+    try testing.expectEqual(@as(usize, 2), o.joy_count);
+    try testing.expectEqual(Options.JoyEvent{ .cycle = 8000, .port = 0, .state = 0x09 }, o.joy_at[0]);
+    try testing.expectEqual(Options.JoyEvent{ .cycle = 9000, .port = 1, .state = 0x40 }, o.joy_at[1]);
+
+    // Malformed inputs are rejected, not misparsed.
+    try testing.expectError(error.EventsNotAscending, parseArgs(&.{ "harness", "--rom", "x", "--key-at", "200:0001", "--key-at", "100:0002" }));
+    try testing.expectError(error.BadFormat, parseArgs(&.{ "harness", "--rom", "x", "--key-at", "1000" }));
+    try testing.expectError(error.BadPort, parseArgs(&.{ "harness", "--rom", "x", "--joy-at", "100:3:01" }));
+    try testing.expectError(error.BadFormat, parseArgs(&.{ "harness", "--rom", "x", "--joy-at", "100:1:01:9" }));
+    try testing.expectError(error.MissingValue, parseArgs(&.{ "harness", "--rom", "x", "--key-at" }));
 }
