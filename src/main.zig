@@ -97,7 +97,7 @@ fn padButtonFromSdl(button: u8) ?input_mod.PadButton {
 const Console = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     lines: std.ArrayList([]u8) = .empty,
     closed: bool = false,
 
@@ -107,31 +107,31 @@ const Console = struct {
         while (true) {
             const line = rdr.interface.takeDelimiterExclusive('\n') catch break;
             const copy = con.gpa.dupe(u8, line) catch break;
-            con.mutex.lock();
+            con.mutex.lockUncancelable(con.io);
             con.lines.append(con.gpa, copy) catch {
-                con.mutex.unlock();
+                con.mutex.unlock(con.io);
                 con.gpa.free(copy);
                 break;
             };
-            con.mutex.unlock();
+            con.mutex.unlock(con.io);
         }
-        con.mutex.lock();
+        con.mutex.lockUncancelable(con.io);
         con.closed = true;
-        con.mutex.unlock();
+        con.mutex.unlock(con.io);
     }
 
     /// Pop one queued line; the caller owns (and frees) it.
     fn pop(con: *Console) ?[]u8 {
-        con.mutex.lock();
-        defer con.mutex.unlock();
+        con.mutex.lockUncancelable(con.io);
+        defer con.mutex.unlock(con.io);
         if (con.lines.items.len == 0) return null;
         return con.lines.orderedRemove(0);
     }
 
     /// True once stdin hit EOF and every queued line was consumed.
     fn isClosed(con: *Console) bool {
-        con.mutex.lock();
-        defer con.mutex.unlock();
+        con.mutex.lockUncancelable(con.io);
+        defer con.mutex.unlock(con.io);
         return con.closed and con.lines.items.len == 0;
     }
 };
