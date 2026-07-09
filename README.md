@@ -4,23 +4,23 @@ A fully specified fantasy computer — Gab-16 CPU (16-bit RISC, 20-bit address
 bus), VIC-256 video, AUR-1 sound, 512KB RAM — implemented as a reference
 emulator and toolchain in **Zig 0.16** with **SDL3**.
 
-**Block 9 — Debugger — console monitor implemented** (this branch, pending
-local verification): the machine is inspectable. `--debug` (or F12 in the
-window) drops into a console monitor: registers, symbol-annotated
-disassembly built on the shared `encode.zig` opcode table, hex+ASCII memory
-dumps through a side-effect-free peek path (inspecting KDATA cannot dequeue
-the keyboard queue or trip your own watchpoints), single-step, step-over
-CALL/CALLA, 16 breakpoints, bus-level read/write watchpoints, and `.flsym`
-symbol loading (`--sym`, plus auto-load beside the `.flapp`). Paused and
-stepped execution drive the exact `Machine.stepFrameCycle` path as free
-running — timing is bit-identical, and pausing mid-frame presents the
-partially rendered frame, so raster effects are directly inspectable. Traps
-break into the monitor only while the debugger is armed (decision k in
+**Block 9 — Debugger — console monitor complete**: the machine is
+inspectable. `--debug` (or F12 in the window) drops into a console
+monitor: registers, symbol-annotated disassembly built on the shared
+`encode.zig` opcode table, hex+ASCII memory dumps through a
+side-effect-free peek path (inspecting KDATA cannot dequeue the keyboard
+queue or trip your own watchpoints), single-step, step-over CALL/CALLA,
+16 breakpoints, bus-level read/write watchpoints, and `.flsym` symbol
+loading (`--sym`, plus auto-load beside the `.flapp`). Paused and stepped
+execution drive the exact `Machine.stepFrameCycle` path as free running —
+timing is bit-identical, and pausing mid-frame presents the partially
+rendered frame, so raster effects are directly inspectable. Traps break
+into the monitor only while the debugger is armed (decision k in
 `src/debugger.zig`) — architectural BRK-vector use by guest programs is
 untouched. The debugger core is SDL-free and unit-tested headlessly. The
-ImGui overlay (plan 9.12–9.14) remains a second pass; the 9.1 cimgui spike
-is deferred to a display-equipped environment — per audit P5 the console
-monitor is the primary deliverable regardless.
+ImGui overlay (plan 9.12–9.14) remains a second pass; the 9.1 cimgui
+spike is deferred to a display-equipped environment — per audit P5 the
+console monitor is the primary deliverable regardless.
 
 **★ Milestone 3 — Interactive Machine — reached** (Block 8): the machine
 listens. SDL3 keyboard events forward to the §5.3 scancode queue nearly
