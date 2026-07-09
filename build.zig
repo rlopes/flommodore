@@ -169,6 +169,17 @@ pub fn build(b: *std.Build) void {
     });
 
     // ------------------------------------------------------------------
+    // flas assembler (Block 10) — src/tools/assembler/ per Phase 8 §8.9.
+    // encode.zig is the ONLY encoder (audit P1): codegen imports it, no
+    // module here carries a second encoding table.
+    // ------------------------------------------------------------------
+    const asm_lexer_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/assembler/lexer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
     // Chosen over (a) the official libsdl-org/SDL tarball, which has no
     // build.zig and therefore cannot produce a Zig dependency artifact,
@@ -381,6 +392,7 @@ pub fn build(b: *std.Build) void {
         cpu_mod,
         disasm_mod,
         debugger_mod,
+        asm_lexer_mod,
         genroms_module,
         harness_module,
     };
