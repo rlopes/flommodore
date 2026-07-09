@@ -64,32 +64,57 @@ pub const Machine = struct {
 
     /// One master cycle. The AUR ticks with cycle granularity so the
     /// §4.9 software-PCM technique (timer IRQ writing VVOL) works.
-    pub inline fn cycle(m: *Machine) void {
+    /// Returns the CPU step event — the Block 9 debugger watches for
+    /// `.trapped`; runFrame ignores it.
+    pub inline fn cycle(m: *Machine) cpu_mod.Event {
         m.cpu.irq_line = m.io.irqLine();
-        _ = m.cpu.step(&m.bus);
+        const event = m.cpu.step(&m.bus);
         m.io.tick();
         if (m.aur.tick(m.ram)) m.io.raise(io_mod.irq_audio);
+        return event;
+    }
+
+    /// Sub-frame position for the resumable frame loop (Block 9): the
+    /// debugger pauses and single-steps *inside* a frame without losing
+    /// the scanline-quantum structure. runFrame drives the same path, so
+    /// paused/stepped execution is bit-identical to free running.
+    pub const FrameState = struct {
+        timing: util.ModeTiming,
+        line: u32 = 0,
+        cycle_in_line: u32 = 0,
+    };
+
+    /// Start a frame: latch geometry (VIC DECISION A) exactly as before.
+    pub fn beginFrame(m: *Machine) FrameState {
+        return .{ .timing = m.vic.startFrame() };
+    }
+
+    /// Advance exactly one master cycle within a frame, handling line
+    /// start (raster/VBLANK IRQs) and line render at the boundaries.
+    /// Returns the CPU event and whether the frame just completed.
+    pub fn stepFrameCycle(m: *Machine, fs: *FrameState) struct { event: cpu_mod.Event, frame_done: bool } {
+        if (fs.cycle_in_line == 0) {
+            const irqs = m.vic.startLine(fs.line);
+            if (irqs.vblank) m.io.raise(io_mod.irq_vblank);
+            if (irqs.raster) m.io.raise(io_mod.irq_raster);
+        }
+        const event = m.cycle();
+        fs.cycle_in_line += 1;
+        if (fs.cycle_in_line == fs.timing.cycles_per_line) {
+            m.vic.renderLine(fs.line, m.ram, m.rom);
+            fs.cycle_in_line = 0;
+            fs.line += 1;
+            if (fs.line == fs.timing.total_lines) return .{ .event = event, .frame_done = true };
+        }
+        return .{ .event = event, .frame_done = false };
     }
 
     /// One full frame — exactly 240,000 cycles in every mode (D17/D41,
     /// util.mode_timing). Frame geometry latches at startFrame (VIC
     /// DECISION A), so the whole frame runs one line structure.
     pub fn runFrame(m: *Machine) void {
-        const timing = m.vic.startFrame();
-        var line: u32 = 0;
-        while (line < timing.total_lines) : (line += 1) {
-            const irqs = m.vic.startLine(line);
-            if (irqs.vblank) m.io.raise(io_mod.irq_vblank);
-            if (irqs.raster) m.io.raise(io_mod.irq_raster);
-            var c: u32 = 0;
-            while (c < timing.cycles_per_line) : (c += 1) {
-                m.cycle();
-            }
-            m.vic.renderLine(line, m.ram, m.rom);
-        }
-        // Frame complete: aur.samples[0..aur.sample_count] holds this
-        // frame's stereo output (exactly 735 pairs at ASRATE 0). The owner
-        // presents/hashes it and calls aur.clearSamples().
+        var fs = m.beginFrame();
+        while (!m.stepFrameCycle(&fs).frame_done) {}
     }
 };
 
