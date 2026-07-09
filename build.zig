@@ -178,6 +178,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const asm_parser_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/assembler/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "lexer", .module = asm_lexer_mod },
+        },
+    });
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -393,6 +401,7 @@ pub fn build(b: *std.Build) void {
         disasm_mod,
         debugger_mod,
         asm_lexer_mod,
+        asm_parser_mod,
         genroms_module,
         harness_module,
     };
