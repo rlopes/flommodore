@@ -186,6 +186,16 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lexer", .module = asm_lexer_mod },
         },
     });
+    const asm_macro_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/assembler/macro.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "parser", .module = asm_parser_mod },
+            // Mnemonic NAMES only (decision y) — no encodings used here.
+            .{ .name = "encode", .module = encode_mod },
+        },
+    });
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -402,6 +412,7 @@ pub fn build(b: *std.Build) void {
         debugger_mod,
         asm_lexer_mod,
         asm_parser_mod,
+        asm_macro_mod,
         genroms_module,
         harness_module,
     };
