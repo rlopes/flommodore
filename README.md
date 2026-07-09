@@ -4,6 +4,24 @@ A fully specified fantasy computer — Gab-16 CPU (16-bit RISC, 20-bit address
 bus), VIC-256 video, AUR-1 sound, 512KB RAM — implemented as a reference
 emulator and toolchain in **Zig 0.16** with **SDL3**.
 
+**Block 9 — Debugger — console monitor implemented** (this branch, pending
+local verification): the machine is inspectable. `--debug` (or F12 in the
+window) drops into a console monitor: registers, symbol-annotated
+disassembly built on the shared `encode.zig` opcode table, hex+ASCII memory
+dumps through a side-effect-free peek path (inspecting KDATA cannot dequeue
+the keyboard queue or trip your own watchpoints), single-step, step-over
+CALL/CALLA, 16 breakpoints, bus-level read/write watchpoints, and `.flsym`
+symbol loading (`--sym`, plus auto-load beside the `.flapp`). Paused and
+stepped execution drive the exact `Machine.stepFrameCycle` path as free
+running — timing is bit-identical, and pausing mid-frame presents the
+partially rendered frame, so raster effects are directly inspectable. Traps
+break into the monitor only while the debugger is armed (decision k in
+`src/debugger.zig`) — architectural BRK-vector use by guest programs is
+untouched. The debugger core is SDL-free and unit-tested headlessly. The
+ImGui overlay (plan 9.12–9.14) remains a second pass; the 9.1 cimgui spike
+is deferred to a display-equipped environment — per audit P5 the console
+monitor is the primary deliverable regardless.
+
 **★ Milestone 3 — Interactive Machine — reached** (Block 8): the machine
 listens. SDL3 keyboard events forward to the §5.3 scancode queue nearly
 verbatim — SDL3 scancodes *are* USB HID usage-page 0x07 values — through a
@@ -53,7 +71,7 @@ zig build -Doptimize=ReleaseFast     # Debug is cycle-exact but below real time
 ./zig-out/bin/flommodore tests/roms/test_prog.flapp
 ```
 
-Next: Block 9 — debugger (console first) and Block 10 — assembler → ★ Milestone 4.
+Next: Block 10 — assembler (`flas`) → ★ Milestone 4.
 
 ## Build
 
@@ -75,6 +93,33 @@ zig build -Dtarget=x86_64-windows-gnu
 zig build -Dtarget=aarch64-linux
 zig build -Dtarget=x86_64-macos      # macOS host only (needs the Apple SDK)
 ```
+
+## Debugger
+
+```sh
+./zig-out/bin/flommodore --debug program.flapp        # start paused at entry
+./zig-out/bin/flommodore --debug --sym prog.flsym --rom custom.rom
+```
+
+F12 pauses/resumes at any time; a `prog.flsym` sitting beside `prog.flapp`
+auto-loads (master spec §8.7). Commands at the `dbg>` prompt:
+
+| Command | Action |
+|---|---|
+| `r` | registers: R0–R15, PC, FLAGS, SP, LR, SSP, USP, IVT, CYC |
+| `d [ADDR] [N]` | disassemble (defaults: PC, 8) — symbols annotate labels and targets |
+| `m ADDR [LEN]` | hex + ASCII memory dump (side-effect-free; KDATA is peeked) |
+| `s [N]` | step N instructions |
+| `n` | step over CALL/CALLA |
+| `c` | continue at full speed |
+| `b ADDR` / `bl` / `bc N\|all` | breakpoints (16, Phase 7 §7.11) |
+| `w ADDR [r\|w\|rw]` / `wl` / `wc N\|all` | bus watchpoints — fetches count as reads |
+| `sym` | list symbols; every ADDR accepts `$hex`, decimal, or a symbol name |
+| `q` | quit the emulator |
+
+Pausing mid-frame presents the partial frame — the screen shows exactly
+what the machine has drawn so far. Piped scripts work for headless use:
+`printf "r\nd\nc\n" | flommodore --debug --max-frames 2 prog.flapp`.
 
 ## Spec
 
