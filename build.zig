@@ -140,6 +140,33 @@ pub fn build(b: *std.Build) void {
     });
     machine_mod.addImport("cpu", cpu_mod);
     machine_mod.addImport("encode", encode_mod); // machine.zig tests only
+    const disasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/disasm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "encode", .module = encode_mod },
+            .{ .name = "cpu", .module = cpu_mod },
+        },
+    });
+    const debugger_mod = b.createModule(.{
+        .root_source_file = b.path("src/debugger.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "util", .module = util_mod },
+            .{ .name = "encode", .module = encode_mod },
+            .{ .name = "cpu", .module = cpu_mod },
+            .{ .name = "bus", .module = bus_mod },
+            .{ .name = "io", .module = io_mod },
+            .{ .name = "machine", .module = machine_mod },
+            .{ .name = "disasm", .module = disasm_mod },
+            // ram/rom for direct (side-effect-free) memory-view reads.
+            .{ .name = "ram", .module = ram_mod },
+            .{ .name = "rom", .module = rom_mod },
+        },
+    });
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -186,6 +213,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "flapp", .module = flapp_mod },
             .{ .name = "machine", .module = machine_mod },
             .{ .name = "vic256", .module = vic_mod },
+            .{ .name = "disasm", .module = disasm_mod },
+            .{ .name = "debugger", .module = debugger_mod },
         },
     });
     exe_module.linkLibrary(sdl_lib); // 0.16: linking is a Module property
@@ -350,6 +379,8 @@ pub fn build(b: *std.Build) void {
         machine_mod,
         encode_mod,
         cpu_mod,
+        disasm_mod,
+        debugger_mod,
         genroms_module,
         harness_module,
     };
