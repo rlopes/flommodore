@@ -208,6 +208,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "encode", .module = encode_mod },
         },
     });
+    const asm_objfile_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/assembler/objfile.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "codegen", .module = asm_codegen_mod },
+        },
+    });
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -426,6 +434,7 @@ pub fn build(b: *std.Build) void {
         asm_parser_mod,
         asm_macro_mod,
         asm_codegen_mod,
+        asm_objfile_mod,
         genroms_module,
         harness_module,
     };
