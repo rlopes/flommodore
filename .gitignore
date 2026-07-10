@@ -8,3 +8,6 @@ zig-pkg/
 /docgen_tmp/
 
 .DS_Store
+
+# Generated test ROMs (rebuilt by `zig build genroms`); nop_loop.rom stays tracked.
+tests/roms/test_*.rom
