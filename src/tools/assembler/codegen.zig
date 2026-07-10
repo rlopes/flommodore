@@ -1008,7 +1008,7 @@ test "hello.asm end to end: forward reference, EQU, DB" {
         \\    CALLA SYS_PUTSTR
         \\    HLT
         \\msg:
-        \\    DB \"HELLO\", 0
+        \\    DB "HELLO", 0
         \\
     , &no_incbins);
     const sec = obj.sections[0];
@@ -1067,7 +1067,7 @@ test "directives (task 10.8): DW/DD/DS/ALIGN/INCBIN and multiple ORG sections" {
         \\    DD $DEADBEEF, vec
         \\vec:
         \\    DS 3
-        \\    INCBIN \"blob.bin\"
+        \\    INCBIN "blob.bin"
         \\    ORG $FFFC0
         \\    DD vec
         \\
@@ -1102,7 +1102,7 @@ test "relocatable mode (task 10.7): LO16/HI4/ABS16/ABS32/ABS26/PCREL26" {
         \\    BNE  start
         \\    SECTION data
         \\msg:
-        \\    DB \"X\", 0
+        \\    DB "X", 0
         \\ptr16:
         \\    DW msg
         \\ptr32:
@@ -1175,7 +1175,7 @@ test "codegen errors: ranges, duplicates, pass-1 rule, bss data" {
         .{ .src = "ORG $100\nADD R1, R2\n", .needle = "expected 3 operand(s)" },
         .{ .src = "ORG $100\nMFSR R1, 9\n", .needle = "out of range 0" },
         .{ .src = "ORG $100\nALIGN 0\n", .needle = "ALIGN 0" },
-        .{ .src = "ORG $100\nINCBIN \\\"nope.bin\\\"\n", .needle = "not provided" },
+        .{ .src = "ORG $100\nINCBIN \"nope.bin\"\n", .needle = "not provided" },
     };
     for (cases) |case| {
         const items = try macro.expandSource(arena, case.src);
