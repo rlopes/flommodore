@@ -216,6 +216,33 @@ pub fn build(b: *std.Build) void {
             .{ .name = "codegen", .module = asm_codegen_mod },
         },
     });
+    const asm_listing_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/assembler/listing.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "codegen", .module = asm_codegen_mod },
+        },
+    });
+    const flas_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/assembler/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "parser", .module = asm_parser_mod },
+            .{ .name = "macro", .module = asm_macro_mod },
+            .{ .name = "codegen", .module = asm_codegen_mod },
+            .{ .name = "objfile", .module = asm_objfile_mod },
+            .{ .name = "listing", .module = asm_listing_mod },
+        },
+    });
+    const flas_exe = b.addExecutable(.{
+        .name = "flas",
+        .root_module = flas_module,
+    });
+    b.installArtifact(flas_exe);
+    const asm_step = b.step("asm", "Build the flas assembler (Phase 8 \u{a7}8.9)");
+    asm_step.dependOn(&b.addInstallArtifact(flas_exe, .{}).step);
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -435,6 +462,7 @@ pub fn build(b: *std.Build) void {
         asm_macro_mod,
         asm_codegen_mod,
         asm_objfile_mod,
+        asm_listing_mod,
         genroms_module,
         harness_module,
     };
