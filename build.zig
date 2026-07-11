@@ -438,6 +438,37 @@ pub fn build(b: *std.Build) void {
     genroms_step.dependOn(&genroms_run.step);
 
     // ------------------------------------------------------------------
+    // Block 10 e2e acceptance: assemble the .asm rewrite of test_cpu_alu
+    // with the REAL flas CLI and byte-compare the reconstructed absolute
+    // image against the genroms-generated .rom (tests/cmprom.zig). Runs
+    // as part of `zig build test` and standalone via `zig build asmtest`.
+    // ------------------------------------------------------------------
+    const flas_alu_run = b.addRunArtifact(flas_exe);
+    flas_alu_run.addFileArg(b.path("tests/asm/test_cpu_alu.asm"));
+    flas_alu_run.addArg("-o");
+    const alu_flobj = flas_alu_run.addOutputFileArg("test_cpu_alu.flobj");
+
+    const cmprom_module = b.createModule(.{
+        .root_source_file = b.path("tests/cmprom.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "rom", .module = rom_mod },
+        },
+    });
+    const cmprom_exe = b.addExecutable(.{
+        .name = "cmprom",
+        .root_module = cmprom_module,
+    });
+    const cmprom_run = b.addRunArtifact(cmprom_exe);
+    cmprom_run.addFileArg(alu_flobj);
+    cmprom_run.addArg(b.pathFromRoot("tests/roms/test_cpu_alu.rom"));
+    cmprom_run.step.dependOn(&genroms_run.step); // the .rom must exist first
+    cmprom_run.has_side_effects = true; // reads a source-tree artifact
+    const asmtest_step = b.step("asmtest", "Block 10 e2e: flas output vs genroms ROM");
+    asmtest_step.dependOn(&cmprom_run.step);
+
+    // ------------------------------------------------------------------
     // Tests. The `test` step is created exactly ONCE; each per-module test
     // binary gets its own run artifact which the single step depends on.
     // ------------------------------------------------------------------
@@ -470,4 +501,5 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+    test_step.dependOn(&cmprom_run.step); // Block 10 e2e acceptance
 }
