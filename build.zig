@@ -245,6 +245,21 @@ pub fn build(b: *std.Build) void {
     asm_step.dependOn(&b.addInstallArtifact(flas_exe, .{}).step);
 
     // ------------------------------------------------------------------
+    // fll linker (Block 11) — src/tools/linker/ per Phase 8 §8.9.
+    // The loader round-trips against the assembler's writer in tests.
+    // ------------------------------------------------------------------
+    const lnk_loader_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/linker/loader.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            // Tests only: round-trip through the assembler's writer.
+            .{ .name = "codegen", .module = asm_codegen_mod },
+            .{ .name = "objfile", .module = asm_objfile_mod },
+        },
+    });
+
+    // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
     // Chosen over (a) the official libsdl-org/SDL tarball, which has no
     // build.zig and therefore cannot produce a Zig dependency artifact,
@@ -494,6 +509,7 @@ pub fn build(b: *std.Build) void {
         asm_codegen_mod,
         asm_objfile_mod,
         asm_listing_mod,
+        lnk_loader_mod,
         genroms_module,
         harness_module,
     };
