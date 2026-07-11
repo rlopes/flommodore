@@ -105,11 +105,25 @@ pub const Reloc = struct {
     rtype: RelocType,
 };
 
+/// One listing row source (task 10.10): recorded during pass 2 so the
+/// .flst writer can render address/bytes/source without replaying layout.
+pub const ListingKind = enum { instr, data, label };
+
+pub const ListingEntry = struct {
+    kind: ListingKind,
+    line: u32, // 1-based source line
+    section: u8,
+    offset: u32,
+    size: u32, // 4 for instructions, byte count for data, 0 for labels
+    name: []const u8 = "", // label name (kind == .label)
+};
+
 pub const Object = struct {
     mode: Mode,
     sections: []Section,
     symbols: []Symbol,
     relocs: []Reloc,
+    listing: []ListingEntry,
 };
 
 /// INCBIN resolution (decision ah): path → file bytes, provided by the
@@ -136,6 +150,7 @@ pub const Codegen = struct {
     symbols: std.ArrayList(Symbol) = .empty,
     externals: std.StringHashMapUnmanaged(u16) = .empty,
     relocs: std.ArrayList(Reloc) = .empty,
+    listing: std.ArrayList(ListingEntry) = .empty,
 
     pass: u8 = 1,
 
@@ -168,6 +183,7 @@ pub const Codegen = struct {
             .sections = try g.sections.toOwnedSlice(g.arena),
             .symbols = try g.symbols.toOwnedSlice(g.arena),
             .relocs = try g.relocs.toOwnedSlice(g.arena),
+            .listing = try g.listing.toOwnedSlice(g.arena),
         };
     }
 
@@ -249,7 +265,19 @@ pub const Codegen = struct {
     }
 
     fn defineLabel(g: *Codegen, name: []const u8, item: Item) Error!void {
-        if (g.pass != 1) return;
+        if (g.pass == 2) {
+            // Section/offset were validated in pass 1; record the row.
+            const sec_idx = g.cur.?;
+            try g.listing.append(g.arena, .{
+                .kind = .label,
+                .line = item.line,
+                .section = sec_idx,
+                .offset = g.sections.items[sec_idx].size,
+                .size = 0,
+                .name = name,
+            });
+            return;
+        }
         const sec_idx = g.cur orelse
             return g.fail("label '{s}' before the first ORG/SECTION (decision aa)", .{name}, item.line, item.col);
         if (g.labels.contains(name) or g.equs.contains(name))
@@ -420,6 +448,23 @@ pub const Codegen = struct {
         });
     }
 
+    /// Record a pass-2 listing row for data emitted since `start` (task
+    /// 10.10). bss rows are skipped — there is no payload to render.
+    fn recordData(g: *Codegen, start: u32, item: Item) Error!void {
+        if (g.pass != 2) return;
+        const sec_idx = g.cur.?;
+        const sec = g.sections.items[sec_idx];
+        if (sec.stype == .bss) return;
+        if (sec.size == start) return; // nothing emitted (e.g. ALIGN no-op)
+        try g.listing.append(g.arena, .{
+            .kind = .data,
+            .line = item.line,
+            .section = sec_idx,
+            .offset = start,
+            .size = sec.size - start,
+        });
+    }
+
     // -- Directives (tasks 10.4, 10.8) --------------------------------------
 
     fn directive(g: *Codegen, kind: parser.Directive, args: []Operand, item: Item) Error!void {
@@ -447,14 +492,22 @@ pub const Codegen = struct {
                 const v = try g.evalConst(args[1].payload.expr);
                 try g.equs.put(g.arena, name, v);
             },
-            .db => try g.dataDirective(args, 1, item),
-            .dw => try g.dataDirective(args, 2, item),
-            .dd => try g.dataDirective(args, 4, item),
+            .db, .dw, .dd => |k| {
+                const start = (try g.section()).size;
+                switch (k) {
+                    .db => try g.dataDirective(args, 1, item),
+                    .dw => try g.dataDirective(args, 2, item),
+                    else => try g.dataDirective(args, 4, item),
+                }
+                try g.recordData(start, item);
+            },
             .ds => {
                 if (args.len != 1 or args[0].payload != .expr)
                     return g.fail("DS takes one size expression", .{}, item.line, item.col);
                 const n = try g.evalConst(args[0].payload.expr);
+                const start = (try g.section()).size;
                 try g.emitZeros(n);
+                try g.recordData(start, item);
             },
             .@"align" => {
                 if (args.len != 1 or args[0].payload != .expr)
@@ -464,6 +517,7 @@ pub const Codegen = struct {
                     return g.fail("ALIGN 0 is invalid (decision ag)", .{}, item.line, item.col);
                 const off = (try g.section()).size;
                 try g.emitZeros((n - (off % n)) % n);
+                try g.recordData(off, item);
             },
             .incbin => {
                 if (args.len != 1 or args[0].payload != .string)
@@ -474,7 +528,9 @@ pub const Codegen = struct {
                 const sec = try g.section();
                 if (sec.stype == .bss)
                     return g.fail("initialized data in a bss section (decision ag)", .{}, item.line, item.col);
+                const start = sec.size;
                 try g.emitBytes(bytes, item);
+                try g.recordData(start, item);
             },
             .include => return g.fail("INCLUDE must be resolved before codegen (decision ah) — driver bug", .{}, item.line, item.col),
         }
@@ -613,6 +669,17 @@ pub const Codegen = struct {
             // Pass-1 walk of operands is still needed where evaluation has
             // pass-2 semantics — nothing to do here.
             return;
+        }
+
+        {
+            const sec_idx = g.cur.?;
+            try g.listing.append(g.arena, .{
+                .kind = .instr,
+                .line = item.line,
+                .section = sec_idx,
+                .offset = g.sections.items[sec_idx].size,
+                .size = 4,
+            });
         }
 
         if (is_mov) {
