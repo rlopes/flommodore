@@ -258,6 +258,24 @@ pub fn build(b: *std.Build) void {
             .{ .name = "objfile", .module = asm_objfile_mod },
         },
     });
+    const lnk_script_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/linker/script.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const lnk_resolver_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/linker/resolver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "loader", .module = lnk_loader_mod },
+            .{ .name = "script", .module = lnk_script_mod },
+            // Tests only: assemble fixtures and cross-check header size.
+            .{ .name = "codegen", .module = asm_codegen_mod },
+            .{ .name = "objfile", .module = asm_objfile_mod },
+            .{ .name = "flapp", .module = flapp_mod },
+        },
+    });
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -510,6 +528,8 @@ pub fn build(b: *std.Build) void {
         asm_objfile_mod,
         asm_listing_mod,
         lnk_loader_mod,
+        lnk_script_mod,
+        lnk_resolver_mod,
         genroms_module,
         harness_module,
     };
