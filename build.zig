@@ -276,6 +276,21 @@ pub fn build(b: *std.Build) void {
             .{ .name = "flapp", .module = flapp_mod },
         },
     });
+    const lnk_relocator_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/linker/relocator.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "loader", .module = lnk_loader_mod },
+            .{ .name = "resolver", .module = lnk_resolver_mod },
+            // Field masks derive from the encoder itself (decision ax).
+            .{ .name = "encode", .module = encode_mod },
+            // Tests only: assemble fixtures.
+            .{ .name = "codegen", .module = asm_codegen_mod },
+            .{ .name = "objfile", .module = asm_objfile_mod },
+            .{ .name = "script", .module = lnk_script_mod },
+        },
+    });
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -530,6 +545,7 @@ pub fn build(b: *std.Build) void {
         lnk_loader_mod,
         lnk_script_mod,
         lnk_resolver_mod,
+        lnk_relocator_mod,
         genroms_module,
         harness_module,
     };
