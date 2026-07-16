@@ -291,6 +291,43 @@ pub fn build(b: *std.Build) void {
             .{ .name = "script", .module = lnk_script_mod },
         },
     });
+    const lnk_emitter_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/linker/emitter.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "loader", .module = lnk_loader_mod },
+            .{ .name = "resolver", .module = lnk_resolver_mod },
+            // Tests only: assemble fixtures, relocate them, and
+            // byte-cross-check the locally written header against
+            // flapp.writeHeader (task 11.6 acceptance).
+            .{ .name = "codegen", .module = asm_codegen_mod },
+            .{ .name = "objfile", .module = asm_objfile_mod },
+            .{ .name = "script", .module = lnk_script_mod },
+            .{ .name = "relocator", .module = lnk_relocator_mod },
+            .{ .name = "flapp", .module = flapp_mod },
+            .{ .name = "encode", .module = encode_mod },
+        },
+    });
+    const fll_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/linker/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "loader", .module = lnk_loader_mod },
+            .{ .name = "script", .module = lnk_script_mod },
+            .{ .name = "resolver", .module = lnk_resolver_mod },
+            .{ .name = "relocator", .module = lnk_relocator_mod },
+            .{ .name = "emitter", .module = lnk_emitter_mod },
+        },
+    });
+    const fll_exe = b.addExecutable(.{
+        .name = "fll",
+        .root_module = fll_module,
+    });
+    b.installArtifact(fll_exe);
+    const lnk_step = b.step("lnk", "Build the fll linker (Phase 8 \u{a7}8.9)");
+    lnk_step.dependOn(&b.addInstallArtifact(fll_exe, .{}).step);
 
     // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
@@ -546,6 +583,7 @@ pub fn build(b: *std.Build) void {
         lnk_script_mod,
         lnk_resolver_mod,
         lnk_relocator_mod,
+        lnk_emitter_mod,
         genroms_module,
         harness_module,
     };
