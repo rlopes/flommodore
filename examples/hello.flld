@@ -1,0 +1,11 @@
+; hello.flld — Flommodore Linker Description (Phase 8 8.5)
+;
+; The code rule is first and uses AT: its value is the .flapp load
+; address, and $04100 is the canonical one - the start of free RAM,
+; where the BIOS autoboot scan looks (amendment 2.3 / E4).
+
+ENTRY start              ; entry point symbol name
+
+SECTION code AT $04100   ; place code at the start of free RAM
+SECTION data AFTER code  ; data immediately after code
+SECTION bss  AFTER data  ; zero-initialised space after that
