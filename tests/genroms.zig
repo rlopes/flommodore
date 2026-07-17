@@ -906,6 +906,10 @@ const font_glyphs = [_]Glyph{
     .{ .ch = 'R', .rows = .{ 0xF8, 0x84, 0x84, 0xF8, 0x90, 0x88, 0x84, 0x00 } },
     .{ .ch = 'E', .rows = .{ 0xFC, 0x80, 0x80, 0xF8, 0x80, 0x80, 0xFC, 0x00 } },
     .{ .ch = '!', .rows = .{ 0x30, 0x30, 0x30, 0x30, 0x30, 0x00, 0x30, 0x00 } },
+    // 'H' and ',' complete "HELLO, FLOMMODORE!" for font.rom / task 11.12
+    // (space stays the naturally blank all-zero glyph).
+    .{ .ch = 'H', .rows = .{ 0x84, 0x84, 0x84, 0xFC, 0x84, 0x84, 0x84, 0x00 } },
+    .{ .ch = ',', .rows = .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x30, 0x60 } },
 };
 
 /// test_vic_text.rom: 640×360 text mode (80×45 cells), embedded ROM font at
@@ -957,6 +961,29 @@ fn buildVicText() RomImage {
     k.emit(encode.li(11, 0x600D));
     k.emit(encode.sw(0, result_addr, 11));
     k.emit(encode.hlt());
+    return image;
+}
+
+/// font.rom: the ROM font pages plus a valid RESET vector into a parked
+/// HLT loop. Text mode fetches glyphs from the ROM at $FE000 (Phase 6
+/// §6.1), so a standalone .flapp has no font unless a ROM provides one.
+/// This is the companion image for pre-BIOS .flapp runs (task 11.12),
+/// the §8.10 combined invocation:
+///   flommodore --rom tests/roms/font.rom program.flapp
+/// The .flapp loader overrides PC after reset; booted bare, the ROM just
+/// halts (HLT re-entered in a loop — a device IRQ wakes HLT, and falling
+/// through into zeroed ROM is the Kit.begin trap storm).
+fn buildFontRom() RomImage {
+    var image = RomImage.init();
+    for (font_glyphs) |g| {
+        for (g.rows, 0..) |row_byte, r| {
+            image.writeByte(0xFE000 + 8 * @as(u32, g.ch) + @as(u32, @intCast(r)), row_byte);
+        }
+    }
+    var k = Kit.begin(&image);
+    const parked = k.cur.addr;
+    k.emit(encode.hlt());
+    k.emit(encode.jmpa(parked));
     return image;
 }
 
@@ -1337,6 +1364,7 @@ const builders = [_]Builder{
     .{ .name = "test_vic_sprite.rom", .build = buildVicSprite },
     .{ .name = "test_aur_basic.rom", .build = buildAurBasic },
     .{ .name = "test_aur_fm.rom", .build = buildAurFm },
+    .{ .name = "font.rom", .build = buildFontRom },
 };
 
 pub fn main(init: std.process.Init) !void {
