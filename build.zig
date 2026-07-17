@@ -554,6 +554,45 @@ pub fn build(b: *std.Build) void {
     asmtest_step.dependOn(&cmprom_run.step);
 
     // ------------------------------------------------------------------
+    // Block 11 e2e acceptance (task 11.12): assemble the relocatable
+    // examples/hello.asm with the REAL flas, link it with the REAL fll
+    // against examples/hello.flld, and run the .flapp in the headless
+    // harness with the font ROM (§8.10 combined invocation — text-mode
+    // glyphs come from ROM $FE000, which a bare .flapp cannot provide).
+    // The golden SHA-256 is the 640×360 frame showing "HELLO,
+    // FLOMMODORE!" in white on deep blue at row 2, col 4. Runs as part
+    // of `zig build test` and standalone via `zig build hellotest`.
+    // ------------------------------------------------------------------
+    const flas_hello_run = b.addRunArtifact(flas_exe);
+    flas_hello_run.addFileArg(b.path("examples/hello.asm"));
+    flas_hello_run.addArg("-o");
+    const hello_flobj = flas_hello_run.addOutputFileArg("hello.flobj");
+
+    const fll_hello_run = b.addRunArtifact(fll_exe);
+    fll_hello_run.addFileArg(hello_flobj);
+    fll_hello_run.addArg("-s");
+    fll_hello_run.addFileArg(b.path("examples/hello.flld"));
+    fll_hello_run.addArg("-o");
+    const hello_flapp = fll_hello_run.addOutputFileArg("hello.flapp");
+
+    const hello_run = b.addRunArtifact(harness_exe);
+    hello_run.addArg("--rom");
+    hello_run.addArg(b.pathFromRoot("tests/roms/font.rom"));
+    hello_run.addArg("--flapp");
+    hello_run.addFileArg(hello_flapp);
+    hello_run.addArgs(&.{
+        "--frames",
+        "2",
+        "--golden",
+        "297c302d5f031dfd2d01b7385896f9bc999a846fa1b0307fc14610a786fefcef",
+        "--quiet",
+    });
+    hello_run.step.dependOn(&genroms_run.step); // font.rom must exist first
+    hello_run.has_side_effects = true; // reads a source-tree artifact
+    const hellotest_step = b.step("hellotest", "Block 11 e2e: hello.asm → fll → harness golden frame");
+    hellotest_step.dependOn(&hello_run.step);
+
+    // ------------------------------------------------------------------
     // Tests. The `test` step is created exactly ONCE; each per-module test
     // binary gets its own run artifact which the single step depends on.
     // ------------------------------------------------------------------
@@ -592,4 +631,5 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
     test_step.dependOn(&cmprom_run.step); // Block 10 e2e acceptance
+    test_step.dependOn(&hello_run.step); // Block 11 e2e acceptance
 }

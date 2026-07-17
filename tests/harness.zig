@@ -8,7 +8,8 @@
 //!     BIOS LFSR arrives in Block 12; nothing random exists yet);
 //!   - `--max-cycles N` bounds the run so looping ROMs terminate.
 //!
-//! Usage: `harness (--rom <path> | --flapp <path>) [--max-cycles N] [--quiet]`
+//! Usage: `harness [--rom <path>] [--flapp <path>] [--max-cycles N] [--quiet]`
+//! (at least one of --rom/--flapp; both together is the §8.10 combined form)
 //!
 //! Block 3: steps the Gab-16 CPU for real. Extras:
 //!   - `--irq-at N` (repeatable, ascending): assert the CPU IRQ line once
@@ -166,7 +167,6 @@ fn parseArgs(args: []const []const u8) !Options {
         }
     }
     if (opts.rom_path == null and opts.flapp_path == null) return error.MissingRom;
-    if (opts.rom_path != null and opts.flapp_path != null) return error.RomAndFlapp;
     return opts;
 }
 
@@ -177,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     const opts = parseArgs(args) catch {
-        std.log.err("usage: harness (--rom <path> | --flapp <path>) [--max-cycles N | --frames N] [--golden HEX] [--dump-ppm f.ppm] [--irq-at N]... [--key-at C:HHHH]... [--joy-at C:P:HH]... [--expect-pass] [--quiet]", .{});
+        std.log.err("usage: harness [--rom <path>] [--flapp <path>] (at least one) [--max-cycles N | --frames N] [--golden HEX] [--dump-ppm f.ppm] [--irq-at N]... [--key-at C:HHHH]... [--joy-at C:P:HH]... [--expect-pass] [--quiet]", .{});
         return error.BadUsage;
     };
     if (opts.quiet) util.setLevel(.silent);
@@ -193,10 +193,27 @@ pub fn main(init: std.process.Init) !void {
     _ = ram;
 
     const cpu = &m.cpu;
+    // Load order mirrors the emulator CLI (§8.10): the ROM (if any) is in
+    // place before reset; a .flapp then overrides PC. The combined form —
+    // --rom font.rom --flapp hello.flapp — is how pre-BIOS programs get a
+    // text-mode font (task 11.12): glyphs come from the ROM at $FE000.
     if (opts.rom_path) |path| {
         try rom.loadFromFile(io, std.Io.Dir.cwd(), path);
         util.logInfo("loaded ROM: {s}", .{path});
-        cpu.reset(bus);
+    }
+    cpu.reset(bus);
+    if (opts.flapp_path) |path| {
+        // Standalone .flapp (task 5.5): same pre-BIOS environment the
+        // emulator CLI provides (D12 boot values) — one loader, one truth.
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+        const entry = try flapp_mod.load(bus, bytes);
+        cpu.setReg(cpu_mod.Gab16.sp, 0x01100);
+        cpu.ssp = 0x020F0;
+        cpu.usp = 0x01100;
+        cpu.ivt = 0xFFFC0;
+        cpu.pc = entry;
+        util.logInfo("loaded .flapp: {s} → entry ${X:0>5}", .{ path, entry });
+    } else {
         util.logInfo("RESET → ${X:0>5}", .{cpu.pc});
         if (cpu.pc == 0) {
             // An all-zero vector means an unpopulated image; it would trap
@@ -204,18 +221,6 @@ pub fn main(init: std.process.Init) !void {
             util.logErr("RESET vector is $00000 — not a runnable image", .{});
             return error.EmptyResetVector;
         }
-    } else {
-        // Standalone .flapp (task 5.5): same pre-BIOS environment the
-        // emulator CLI provides (D12 boot values) — one loader, one truth.
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, opts.flapp_path.?, arena, .limited(1 << 20));
-        cpu.reset(bus);
-        const entry = try flapp_mod.load(bus, bytes);
-        cpu.setReg(cpu_mod.Gab16.sp, 0x01100);
-        cpu.ssp = 0x020F0;
-        cpu.usp = 0x01100;
-        cpu.ivt = 0xFFFC0;
-        cpu.pc = entry;
-        util.logInfo("loaded .flapp: {s} → entry ${X:0>5}", .{ opts.flapp_path.?, entry });
     }
 
     var cycles: u64 = 0;
@@ -386,7 +391,10 @@ test "harness: argument parsing" {
 
     const o4 = try parseArgs(&.{ "harness", "--flapp", "p.flapp" });
     try testing.expectEqualStrings("p.flapp", o4.flapp_path.?);
-    try testing.expectError(error.RomAndFlapp, parseArgs(&.{ "harness", "--rom", "x", "--flapp", "y" }));
+    // §8.10 combined mode: ROM (font/BIOS) + .flapp together is legal.
+    const o5 = try parseArgs(&.{ "harness", "--rom", "x", "--flapp", "y" });
+    try testing.expectEqualStrings("x", o5.rom_path.?);
+    try testing.expectEqualStrings("y", o5.flapp_path.?);
 
     try testing.expectError(error.MissingRom, parseArgs(&.{"harness"}));
     try testing.expectError(error.MissingValue, parseArgs(&.{ "harness", "--rom" }));
