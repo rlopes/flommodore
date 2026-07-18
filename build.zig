@@ -640,6 +640,30 @@ pub fn build(b: *std.Build) void {
     const boottest_step = b.step("boottest", "Block 12 e2e: BIOS ROM boots — §6.8 stages 1–4 hold");
     boottest_step.dependOn(&bootcheck_run.step);
 
+    // Console syscalls (tasks 12.5–12.6): tests/syscheck.zig drives the
+    // permanent $FC100 jump-table ABI on the booted machine with
+    // host-injected calls (DECISION bm) and audits the decision-bl
+    // console semantics plus the decision-be register conventions.
+    const syscheck_module = b.createModule(.{
+        .root_source_file = b.path("tests/syscheck.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "rom", .module = rom_mod },
+            .{ .name = "cpu", .module = cpu_mod },
+            .{ .name = "machine", .module = machine_mod },
+            .{ .name = "encode", .module = encode_mod },
+        },
+    });
+    const syscheck_exe = b.addExecutable(.{
+        .name = "syscheck",
+        .root_module = syscheck_module,
+    });
+    const syscheck_run = b.addRunArtifact(syscheck_exe);
+    syscheck_run.addFileArg(bios_rom);
+    const systest_step = b.step("systest", "Block 12 e2e: console syscalls through the $FC100 ABI");
+    systest_step.dependOn(&syscheck_run.step);
+
     // ------------------------------------------------------------------
     // Tests. The `test` step is created exactly ONCE; each per-module test
     // binary gets its own run artifact which the single step depends on.
@@ -681,4 +705,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&cmprom_run.step); // Block 10 e2e acceptance
     test_step.dependOn(&hello_run.step); // Block 11 e2e acceptance
     test_step.dependOn(&bootcheck_run.step); // Block 12 boot verification
+    test_step.dependOn(&syscheck_run.step); // Block 12 console syscalls
 }
