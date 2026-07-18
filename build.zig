@@ -593,6 +593,54 @@ pub fn build(b: *std.Build) void {
     hellotest_step.dependOn(&hello_run.step);
 
     // ------------------------------------------------------------------
+    // Block 12 (part 3/3): the BIOS ROM build — task 12.16 groundwork.
+    // flas assembles src/bios/bios.asm in absolute mode (font.inc and
+    // palette.inc resolve beside it), then `fll --raw --base $FC000
+    // --size 16K` frames the 16KB image. The build graph owns the cached
+    // artifact; `zig build bios` additionally refreshes the gitignored
+    // rom/flommodore.rom so the emulator CLI has a stable path to the
+    // firmware. tests/bootcheck.zig then audits the §6.8 Stage 1–4
+    // postconditions on a real Machine (DECISION bk: a state audit, not
+    // a golden frame — the freshly booted screen is uniformly black).
+    // Runs as part of `zig build test` and standalone via
+    // `zig build boottest`.
+    // ------------------------------------------------------------------
+    const flas_bios_run = b.addRunArtifact(flas_exe);
+    flas_bios_run.addFileArg(b.path("src/bios/bios.asm"));
+    flas_bios_run.addArg("-o");
+    const bios_flobj = flas_bios_run.addOutputFileArg("bios.flobj");
+
+    const fll_bios_run = b.addRunArtifact(fll_exe);
+    fll_bios_run.addArgs(&.{ "--raw", "--base", "$FC000", "--size", "16K" });
+    fll_bios_run.addFileArg(bios_flobj);
+    fll_bios_run.addArg("-o");
+    const bios_rom = fll_bios_run.addOutputFileArg("flommodore.rom");
+
+    const bios_update = b.addUpdateSourceFiles();
+    bios_update.addCopyFileToSource(bios_rom, "rom/flommodore.rom");
+    const bios_step = b.step("bios", "Build the BIOS ROM into rom/flommodore.rom (task 12.16)");
+    bios_step.dependOn(&bios_update.step);
+
+    const bootcheck_module = b.createModule(.{
+        .root_source_file = b.path("tests/bootcheck.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "rom", .module = rom_mod },
+            .{ .name = "cpu", .module = cpu_mod },
+            .{ .name = "machine", .module = machine_mod },
+        },
+    });
+    const bootcheck_exe = b.addExecutable(.{
+        .name = "bootcheck",
+        .root_module = bootcheck_module,
+    });
+    const bootcheck_run = b.addRunArtifact(bootcheck_exe);
+    bootcheck_run.addFileArg(bios_rom);
+    const boottest_step = b.step("boottest", "Block 12 e2e: BIOS ROM boots — §6.8 stages 1–4 hold");
+    boottest_step.dependOn(&bootcheck_run.step);
+
+    // ------------------------------------------------------------------
     // Tests. The `test` step is created exactly ONCE; each per-module test
     // binary gets its own run artifact which the single step depends on.
     // ------------------------------------------------------------------
@@ -632,4 +680,5 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(&cmprom_run.step); // Block 10 e2e acceptance
     test_step.dependOn(&hello_run.step); // Block 11 e2e acceptance
+    test_step.dependOn(&bootcheck_run.step); // Block 12 boot verification
 }
