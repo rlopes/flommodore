@@ -28,6 +28,16 @@
 ; ROM header checksum (decision bh): the CRC-32 field holds $00000000 in
 ; v1 — "not populated". Nothing verifies it, and the assembler cannot hash
 ; its own output; a nonzero value would be a lie.
+;
+; Console semantics (decision bl — the spec names the calls but not the
+; edge behaviour): SYS_PUTCHAR renders every byte as its font glyph except
+; $0A (LF: column 0, row advance), $0D (CR: column 0), and $08 (BS:
+; non-destructive column−1, stopping at column 0). Column 80 wraps like LF;
+; a row advance past row 42 scrolls one line and holds the cursor on row
+; 42. Cells freed by CLRSCR or scrolling become $20 (space) with the
+; current CUR_ATTR. SYS_SETCURSOR clamps out-of-range values to the last
+; column/row; SYS_SETCOLOR masks both indices to 4 bits; SYS_SCROLL clamps
+; R1 to 43 — anything more is already a fully cleared screen.
 ; ============================================================================
 
 ; ----------------------------------------------------------------------------
@@ -110,12 +120,12 @@ ENDMACRO
 ; ============================================================================
     ORG $FC100
 
-    JMPA sys_unimpl          ;  0 SYS_PUTCHAR
-    JMPA sys_unimpl          ;  1 SYS_PUTSTR
-    JMPA sys_unimpl          ;  2 SYS_CLRSCR
-    JMPA sys_unimpl          ;  3 SYS_SETCURSOR
-    JMPA sys_unimpl          ;  4 SYS_SETCOLOR
-    JMPA sys_unimpl          ;  5 SYS_SCROLL
+    JMPA sys_putchar         ;  0 SYS_PUTCHAR
+    JMPA sys_putstr          ;  1 SYS_PUTSTR
+    JMPA sys_clrscr          ;  2 SYS_CLRSCR
+    JMPA sys_setcursor       ;  3 SYS_SETCURSOR
+    JMPA sys_setcolor        ;  4 SYS_SETCOLOR
+    JMPA sys_scroll          ;  5 SYS_SCROLL
     JMPA sys_unimpl          ;  6 SYS_GETKEY
     JMPA sys_unimpl          ;  7 SYS_POLLKEY
     JMPA sys_unimpl          ;  8 SYS_GETCHAR
@@ -306,6 +316,188 @@ dev_init:
 ; System calls (Phase 6 §6.4). Implementations arrive block by block; every
 ; jump-table slot without one lands on sys_unimpl.
 ; ----------------------------------------------------------------------------
+
+; ----------------------------------------------------------------------------
+; Console (tasks 12.5–12.6, decision bl). Cursor state lives in CUR_COL/
+; CUR_ROW/CUR_ATTR; the matrix is the 80×43 window at TEXTMAT (decision bd).
+; ----------------------------------------------------------------------------
+
+; cursor_addr — R4 ← TEXTMAT + CUR_ROW*160 + CUR_COL*2. Clobbers R4, R12.
+cursor_addr:
+    LW   R4, [R0 + CUR_ROW]
+    LI   R12, (CONS_COLS * 2)
+    MUL  R4, R4, R12
+    LW   R12, [R0 + CUR_COL]
+    ADD  R4, R4, R12
+    ADD  R4, R4, R12
+    LI   R12, TEXTMAT
+    ADD  R4, R4, R12
+    RET
+
+; advance_row — cursor down one row, scrolling when it would leave the
+; 43-row console (bl). Clobbers R1–R4, R12.
+advance_row:
+    PUSH LR
+    LW   R12, [R0 + CUR_ROW]
+    ADDI R12, R12, 1
+    CMPI R12, CONS_ROWS
+    BCC  advrow_store
+    CALLA scroll1
+    LI   R12, (CONS_ROWS - 1)
+advrow_store:
+    SW   [R0 + CUR_ROW], R12
+    POP  LR
+    RET
+
+; scroll1 — scroll the console up one line: rows 1–42 copy over rows 0–41
+; (forward byte copy with dst < src, so the overlap is safe), and the
+; freed bottom row clears to ' ' with the current attribute (bl).
+; Clobbers R1–R4, R12.
+scroll1:
+    PUSH LR
+    LI   R1, (TEXTMAT + CONS_COLS * 2)
+    LI   R2, TEXTMAT
+    LI   R3, ((CONS_ROWS - 1) * CONS_COLS * 2)
+    CALLA sys_memcpy
+    LI   R1, (TEXTMAT + (CONS_ROWS - 1) * CONS_COLS * 2)
+    LI   R4, CONS_COLS
+    LI   R2, $20
+    LW   R12, [R0 + CUR_ATTR]
+scroll1_clear:
+    SB   [R1], R2
+    SB   [R1 + 1], R12
+    ADDI R1, R1, 2
+    SUBI R4, R4, 1
+    BNE  scroll1_clear
+    POP  LR
+    RET
+
+; SYS_PUTCHAR (id 0) — print the byte in R1 at the cursor (bl): $0A
+; newline, $0D carriage return, $08 non-destructive backspace; every other
+; value renders as its font glyph. Column 80 wraps; a row advance past row
+; 42 scrolls one line and holds the cursor on row 42. Clobbers R1–R4, R12.
+sys_putchar:
+    PUSH LR
+    ANDI R1, R1, $FF
+    CMPI R1, $0A
+    BEQ  putchar_lf
+    CMPI R1, $0D
+    BEQ  putchar_cr
+    CMPI R1, $08
+    BEQ  putchar_bs
+    CALLA cursor_addr        ; glyph: char + attribute at the cursor cell
+    SB   [R4], R1
+    LW   R12, [R0 + CUR_ATTR]
+    SB   [R4 + 1], R12
+    LW   R12, [R0 + CUR_COL] ; advance the column, wrapping at 80
+    ADDI R12, R12, 1
+    CMPI R12, CONS_COLS
+    BCC  putchar_setcol
+putchar_lf:
+    SW   [R0 + CUR_COL], R0  ; column home, then row advance (shared with wrap)
+    CALLA advance_row
+    JMPA putchar_done
+putchar_cr:
+    SW   [R0 + CUR_COL], R0
+    JMPA putchar_done
+putchar_bs:
+    LW   R12, [R0 + CUR_COL]
+    CMPI R12, 0
+    BEQ  putchar_done
+    SUBI R12, R12, 1
+putchar_setcol:
+    SW   [R0 + CUR_COL], R12
+putchar_done:
+    POP  LR
+    RET
+
+; SYS_PUTSTR (id 1) — print the NUL-terminated string at [R1] through
+; SYS_PUTCHAR, so control characters behave identically. Clobbers R1–R4,
+; R12; R5 is saved around use as the walking pointer.
+sys_putstr:
+    PUSH LR
+    PUSH R5
+    MOV  R5, R1
+putstr_loop:
+    LB   R1, [R5]
+    CMPI R1, 0
+    BEQ  putstr_done
+    CALLA sys_putchar
+    ADDI R5, R5, 1
+    JMPA putstr_loop
+putstr_done:
+    POP  R5
+    POP  LR
+    RET
+
+; SYS_CLRSCR (id 2) — every cell becomes ' ' with the current attribute,
+; cursor homes to (0,0) (bl). Clobbers R1, R2, R4, R12.
+sys_clrscr:
+    LI   R1, TEXTMAT
+    LI   R4, (CONS_COLS * CONS_ROWS)
+    LI   R2, $20
+    LW   R12, [R0 + CUR_ATTR]
+clrscr_loop:
+    SB   [R1], R2
+    SB   [R1 + 1], R12
+    ADDI R1, R1, 2
+    SUBI R4, R4, 1
+    BNE  clrscr_loop
+    SW   [R0 + CUR_COL], R0
+    SW   [R0 + CUR_ROW], R0
+    RET
+
+; SYS_SETCURSOR (id 3) — R1=col, R2=row; out-of-range values clamp to the
+; last column/row (bl). Inputs mask to 16 bits first so the clamp compare
+; and the stored 16-bit variable agree on the value. Clobbers R1, R2.
+sys_setcursor:
+    ANDI R1, R1, $FFFF
+    CMPI R1, CONS_COLS
+    BCC  setcur_col
+    LI   R1, (CONS_COLS - 1)
+setcur_col:
+    SW   [R0 + CUR_COL], R1
+    ANDI R2, R2, $FFFF
+    CMPI R2, CONS_ROWS
+    BCC  setcur_row
+    LI   R2, (CONS_ROWS - 1)
+setcur_row:
+    SW   [R0 + CUR_ROW], R2
+    RET
+
+; SYS_SETCOLOR (id 4) — CUR_ATTR ← bg(R2)<<4 | fg(R1), both masked to
+; palette entries 0–15 (§3.6 text attribute format). Clobbers R1, R2, R12.
+sys_setcolor:
+    ANDI R1, R1, $0F
+    ANDI R2, R2, $0F
+    LI   R12, 4
+    SHL  R2, R2, R12
+    OR   R1, R1, R2
+    SW   [R0 + CUR_ATTR], R1
+    RET
+
+; SYS_SCROLL (id 5) — scroll up R1 lines; values ≥ 43 clamp to 43, beyond
+; which the result (a fully cleared screen) is identical (bl). Clobbers
+; R1–R4, R12; R5 is saved around use as the line counter.
+sys_scroll:
+    PUSH LR
+    PUSH R5
+    ANDI R1, R1, $FFFF
+    CMPI R1, CONS_ROWS
+    BCC  sysscroll_clamped
+    LI   R1, CONS_ROWS
+sysscroll_clamped:
+    MOV  R5, R1
+sysscroll_loop:
+    CMPI R5, 0
+    BEQ  sysscroll_done
+    CALLA scroll1
+    SUBI R5, R5, 1
+    JMPA sysscroll_loop
+sysscroll_done:
+    POP  R5
+    POP  LR
+    RET
 
 ; SYS_MEMCPY (id 15) — copy R3 bytes from [R1] to [R2]. Forward, byte-wise;
 ; overlapping moves with dst > src are the caller's problem (as on the real
