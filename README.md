@@ -4,6 +4,30 @@ A fully specified fantasy computer — Gab-16 CPU (16-bit RISC, 20-bit address
 bus), VIC-256 video, AUR-1 sound, 512KB RAM — implemented as a reference
 emulator and toolchain in **Zig 0.16** with **SDL3**.
 
+**Block 12 — ROM & Boot — in progress**: the machine grows firmware.
+`src/bios/bios.asm` is written in Flommodore assembly and built by the
+machine's own toolchain — `zig build bios` runs flas over it and frames
+the 16KB image with `fll --raw --base $FC000 --size 16K` into
+`rom/flommodore.rom` (task 12.16 in the making). Boot stages 1–4 are
+live: CPU/stack environment, RAM clears, device safe defaults, and the
+ROM→RAM palette copy with the VIC base registers on the ÷16 convention.
+`zig build boottest` audits every §6.8 stage 1–4 postcondition on a real
+headless Machine (decision bk in `tests/bootcheck.zig` — a state audit
+through the debugger's side-effect-free peek path, not a golden frame).
+Next up: the console syscalls on the 80×43 text console (decision bd),
+keyboard input, the IRQ dispatcher, and the READY shell.
+
+**★ Milestone 4 — Working Toolchain — reached** (Blocks 10–11): the
+machine programs itself. `flas` assembles the full Phase 8 language —
+two-pass, macros, INCLUDE, EQU expressions, listings — onto the same
+`encode.zig` opcode table the emulator and disassembler share, so one
+truth encodes and decodes. `fll` links `.flobj` objects through `.flld`
+linker scripts into `.flapp` executables (with `.flsym` symbols for the
+debugger) or, with `--raw`, into bare ROM images. Both ends are pinned:
+`asmtest` proves flas output byte-identical to the generated golden ROM,
+and `hellotest` assembles, links, and runs `examples/hello.asm` to a
+golden frame hash in the headless harness.
+
 **Block 9 — Debugger — console monitor complete**: the machine is
 inspectable. `--debug` (or F12 in the window) drops into a console
 monitor: registers, symbol-annotated disassembly built on the shared
@@ -71,7 +95,7 @@ zig build -Doptimize=ReleaseFast     # Debug is cycle-exact but below real time
 ./zig-out/bin/flommodore tests/roms/test_prog.flapp
 ```
 
-Next: Block 10 — assembler (`flas`) → ★ Milestone 4.
+Next: finish Block 12 — syscalls, shell, autoboot → ★ Milestone 5.
 
 ## Build
 
@@ -81,8 +105,10 @@ Zig package manager (castholm/SDL) — no system packages needed.
 ```sh
 zig build            # build zig-out/bin/flommodore (and the headless harness)
 zig build run        # open the (empty) Flommodore window; ESC or close to quit
-zig build test       # unit tests
+zig build test       # unit tests + asmtest/hellotest/boottest e2e
 zig build genroms    # emit generated test ROMs into tests/roms/
+zig build bios       # flas+fll the BIOS into rom/flommodore.rom
+zig build boottest   # verify the BIOS boots (§6.8 stages 1–4)
 zig build harness -- --rom tests/roms/test_cpu_alu.rom --max-cycles 240000 --expect-pass
 ```
 
