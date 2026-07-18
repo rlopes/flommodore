@@ -120,6 +120,34 @@ zig build -Dtarget=aarch64-linux
 zig build -Dtarget=x86_64-macos      # macOS host only (needs the Apple SDK)
 ```
 
+## Running the BIOS
+
+The firmware is a build product — `zig build bios` assembles
+`src/bios/bios.asm` with the project's own flas and frames the 16KB image
+with `fll --raw --base $FC000 --size 16K` into `rom/flommodore.rom`. Boot
+it in the emulator:
+
+```sh
+zig build bios
+./zig-out/bin/flommodore --rom rom/flommodore.rom
+```
+
+At ★ Milestone 5 this is the complete machine: the boot banner, the
+`READY.` shell (`MEM`, `POKE`, `PEEK`, `RUN`, `RESET`, `VER`, `HELP`), and
+autoboot — a valid `.flapp` at `$04100` starts automatically. Until Block
+12 finishes, the machine boots through §6.8 stages 1–4 (CPU/stack
+environment, RAM clears, device defaults, palette) and parks; the console
+syscalls already work through the permanent `$FC100` jump table.
+
+Headless (no SDL — CI, servers, containers):
+
+```sh
+zig build harness -- --rom rom/flommodore.rom --frames 2 --dump-ppm boot.ppm
+```
+
+and the boot-state verifiers run against a freshly built image any time via
+`zig build boottest` and `zig build systest`.
+
 ## Debugger
 
 ```sh
