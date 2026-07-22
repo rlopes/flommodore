@@ -7,7 +7,7 @@
 //! shell (Block 9 — the monitor itself lives in debugger.zig).
 //!
 //! CLI (Phase 8 §8.10 subset; `--listing` tooling arrives with Block 10/11):
-//!   flommodore [--rom file.rom] [program.flapp] [--max-frames N]
+//!   flommodore [--rom file.rom] [program.flapp] [--autoboot] [--max-frames N]
 //!              [--debug] [--sym file.flsym]
 //!
 //! Loop structure (per frame, exactly 240,000 cycles — D17/D41):
@@ -172,6 +172,10 @@ const Options = struct {
     max_frames: u64 = 0,
     /// Block 9: start paused in the console debugger.
     debug: bool = false,
+    /// Block 12 (DECISION bu): load the .flapp into RAM but do NOT jump to
+    /// it — the ROM boots normally and the BIOS autoboot scan (§6.9) finds
+    /// the FB header at $04100. The cartridge model: insert, power on.
+    autoboot: bool = false,
     /// Block 9: load a .flsym symbol file (master spec §8.7). Overrides the
     /// auto-load companion beside the .flapp.
     sym_path: ?[]const u8 = null,
@@ -192,6 +196,8 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.max_frames = try std.fmt.parseInt(u64, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--debug")) {
             opts.debug = true;
+        } else if (std.mem.eql(u8, arg, "--autoboot")) {
+            opts.autoboot = true;
         } else if (std.mem.eql(u8, arg, "--sym")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -213,7 +219,7 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     const opts = parseArgs(args) catch {
-        util.logErr("usage: flommodore [--rom file.rom] [program.flapp] [--max-frames N] [--debug] [--sym file.flsym]", .{});
+        util.logErr("usage: flommodore [--rom file.rom] [program.flapp] [--autoboot] [--max-frames N] [--debug] [--sym file.flsym]", .{});
         return error.BadUsage;
     };
 
@@ -227,21 +233,30 @@ pub fn main(init: std.process.Init) !void {
     }
     machine.cpu.reset(&machine.bus);
 
-    // Positional .flapp: load and run standalone (task 5.5). Until the BIOS
-    // exists (Block 12) the emulator provides the boot environment the BIOS
-    // would have established (D12): SP $01100, SSP $020F0, IVT $FFFC0.
+    // Positional .flapp: load and run standalone (task 5.5) — the emulator
+    // provides the boot environment the BIOS would have established (D12):
+    // SP $01100, SSP $020F0, IVT $FFFC0 — or, with --autoboot (decision bu),
+    // load the image into RAM only and let the ROM boot find it (§6.9).
     if (opts.flapp_path) |path| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
         const entry = flapp.load(&machine.bus, bytes) catch |err| {
             util.logErr(".flapp load failed: {t}", .{err});
             return err;
         };
-        machine.cpu.setReg(cpu_mod.Gab16.sp, 0x01100);
-        machine.cpu.ssp = 0x020F0;
-        machine.cpu.usp = 0x01100;
-        machine.cpu.ivt = 0xFFFC0;
-        machine.cpu.pc = entry;
-        util.logInfo(".flapp loaded: {s} → entry ${X:0>5}", .{ path, entry });
+        if (opts.autoboot) {
+            if (opts.rom_path == null) {
+                util.logErr("--autoboot needs a --rom to boot (the BIOS does the finding)", .{});
+                return error.AutobootWithoutRom;
+            }
+            util.logInfo(".flapp placed for autoboot: {s} (the ROM boots; §6.9 scans $04100)", .{path});
+        } else {
+            machine.cpu.setReg(cpu_mod.Gab16.sp, 0x01100);
+            machine.cpu.ssp = 0x020F0;
+            machine.cpu.usp = 0x01100;
+            machine.cpu.ivt = 0xFFFC0;
+            machine.cpu.pc = entry;
+            util.logInfo(".flapp loaded: {s} → entry ${X:0>5}", .{ path, entry });
+        }
     } else if (opts.rom_path == null) {
         util.logWarn("no ROM or .flapp given — the machine will trap through an empty vector table", .{});
     }
