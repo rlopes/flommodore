@@ -16,3 +16,7 @@ tests/roms/font.rom
 # The built BIOS firmware (rebuilt by `zig build bios`) — a build product,
 # reproducible bit-exactly from src/bios/ by the deterministic toolchain.
 rom/flommodore.rom
+
+# Built example programs (rebuilt by `zig build examples`).
+examples/*.flapp
+examples/*.flsym

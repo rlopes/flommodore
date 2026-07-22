@@ -116,6 +116,7 @@ zig build genroms    # emit generated test ROMs into tests/roms/
 zig build bios       # flas+fll the BIOS into rom/flommodore.rom
 zig build boottest   # BIOS boots to READY (§6.8 stages 1–6 + golden frame)
 zig build systest    # the full syscall ABI + shell + autoboot, end to end
+zig build examples   # build examples/*.flapp — see Writing your own programs
 zig build harness -- --rom tests/roms/test_cpu_alu.rom --max-cycles 240000 --expect-pass
 ```
 
@@ -154,6 +155,69 @@ zig build harness -- --rom rom/flommodore.rom --frames 2 --dump-ppm boot.ppm
 
 and the boot-state verifiers run against a freshly built image any time via
 `zig build boottest` and `zig build systest`.
+
+## Writing your own programs
+
+The toolchain is two binaries, both built by `zig build` into `zig-out/bin/`:
+`flas` assembles Phase 8 assembly into `.flobj` object files, and `fll`
+links them into runnable `.flapp` executables (placing sections via a
+`.flld` linker script) or raw memory images. A program is a source file
+and a script:
+
+```sh
+./zig-out/bin/flas myprog.asm -o myprog.flobj                   # assemble
+./zig-out/bin/fll myprog.flobj -s myprog.flld -o myprog.flapp   # link
+```
+
+`fll` also writes `myprog.flsym` alongside — the debugger loads it
+automatically. Add `--listing myprog.flst` to `flas` for an
+address/bytes/source listing, and `-v` to `fll` for the memory map.
+
+The `.flld` script names the entry symbol and places the sections; the
+canonical layout puts code at `$04100`, the start of free RAM, which is
+exactly where the BIOS autoboot scan looks:
+
+```
+ENTRY start
+SECTION code AT $04100
+SECTION data AFTER code
+SECTION bss  AFTER data
+```
+
+There are two ways to run the result:
+
+**The cartridge way (with the BIOS).** `--autoboot` places the `.flapp`
+in RAM and lets the ROM boot: the BIOS prints its banner, finds the
+program's header at `$04100` (§6.9), and calls it. A program that ends
+in `RET` drops back to the `READY.` shell — and `RUN 4100` starts it
+again. Your program talks to the machine through the syscall jump table
+(`$FC100 + 4×id`, arguments in R1–R3, result in R1 — see the table at
+the top of `src/bios/bios.asm` for all 29 calls):
+
+```sh
+zig build examples     # builds examples/*.flapp (and the firmware)
+./zig-out/bin/flommodore --rom rom/flommodore.rom --autoboot examples/bios_hello.flapp
+```
+
+`examples/bios_hello.asm` is the template: ~10 instructions that print
+through `SYS_PUTSTR` and return to the shell. (One habit it
+demonstrates: `CALLA` writes LR, so a program that was itself CALLed
+must `PUSH LR` before calling anything and `POP LR` before its `RET`.)
+
+**Standalone (no BIOS).** Without `--autoboot` the emulator jumps
+straight to the `.flapp` entry with the D12 boot environment
+pre-established — no firmware, no syscalls, the hardware is all yours.
+`examples/hello.asm` works this way, driving the VIC-256 registers
+directly (it needs a font, so it runs against the font companion ROM):
+
+```sh
+./zig-out/bin/flommodore --rom tests/roms/font.rom examples/hello.flapp
+```
+
+Both flavours debug the same way: add `--debug` to start paused at the
+entry with your `.flsym` symbols annotating the disassembly. The
+autoboot demo is pinned in CI like everything else — `zig build test`
+boots it to a golden frame.
 
 ## Debugger
 

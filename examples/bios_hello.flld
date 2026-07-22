@@ -1,0 +1,11 @@
+; bios_hello.flld — Flommodore Linker Description (Phase 8 8.5)
+;
+; Identical placement to hello.flld: code AT $04100 puts the .flapp's
+; FB header exactly where the BIOS autoboot scan looks (§6.9 /
+; amendment 2.3), so `--autoboot` runs this program at power-on.
+
+ENTRY start              ; entry point symbol name
+
+SECTION code AT $04100   ; place code at the start of free RAM
+SECTION data AFTER code  ; data immediately after code
+SECTION bss  AFTER data  ; zero-initialised space after that
