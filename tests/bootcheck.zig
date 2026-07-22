@@ -4,19 +4,20 @@
 //! Usage: bootcheck <flommodore.rom>
 //!
 //! Loads the flas+fll-built BIOS ROM into a real Machine, runs exactly one
-//! frame (240,000 cycles — the boot needs ~36K), and audits the §6.8
-//! Stage 1–4 postconditions: the ROM header, the CPU environment (task
-//! 12.1), the RAM clears (12.2), the device safe defaults (12.3), and the
-//! palette copy + VIC base registers (12.4).
+//! frame (240,000 cycles — the full boot needs ~50K), and audits the §6.8
+//! Stage 1–6 postconditions: the ROM header, the CPU environment (task
+//! 12.1), the RAM clears (12.2), the device safe defaults (12.3), the
+//! palette copy + VIC base registers (12.4), the banner (12.12), and the
+//! stage-6 IRQ unmasking with the shell parked in its GETLINE poll
+//! (12.13).
 //!
-//! DECISION bk: boot verification is a state audit, not a golden frame.
-//! The freshly booted screen is a uniformly black text matrix — its frame
-//! hash could not distinguish a working boot from a dead one — and pinning
-//! shell_entry's PC would churn the check every time BIOS code grows. So
-//! bootcheck asserts `halted` plus the observable Stage 1–4 postconditions,
-//! reading RAM directly and I/O through the debugger's side-effect-free
-//! `peek16` path (inspecting boot state must not dequeue the keyboard
-//! queue it just flushed). Addresses and expected values are transcribed
+//! DECISION bk: boot verification is a state audit — pinning the shell's
+//! PC would churn the check every time BIOS code grows. bootcheck asserts
+//! the observable Stage 1–6 postconditions, reading RAM directly and I/O
+//! through the debugger's side-effect-free `peek16` path (inspecting boot
+//! state must not dequeue the keyboard queue it just flushed); the
+//! build-graph golden boot frame covers the visible pixels. Addresses and
+//! expected values are transcribed
 //! from Phase 6 §6.8, Phase 3 §3.8, and Phase 5 — not from bios.asm — so
 //! the BIOS and its test cannot share a typo.
 //!
@@ -44,7 +45,6 @@ const cur_attr_addr: u32 = 0x01104; // expected $0001: white on black
 const palram: u32 = 0x02100; // 768 B palette RAM
 const satram: u32 = 0x02400; // 512 B sprite attribute table
 const textmat: u32 = 0x02600; // 80×43×2 = 6880 B text matrix
-const textmat_len: u32 = 80 * 43 * 2;
 const rom_palette_off: u32 = 0xFF800 - rom_base; // §6.6 default palette
 
 // --- Phase 3 §3.8 VIC registers --------------------------------------------
@@ -103,8 +103,8 @@ pub fn main(init: std.process.Init) !void {
     check(reset_vec >= rom_base + 0x200, "RESET vector in kernel area", reset_vec, rom_base + 0x200);
 
     // ------------------------------------------------------------------
-    // Boot: load, reset, one full frame. All IRQ sources are masked at
-    // this stage, so the shell_entry HLT parks the CPU for good.
+    // Boot: load, reset, one full frame — plenty for the ~50K-cycle boot;
+    // the rest of the frame is the shell polling an empty keyboard queue.
     // ------------------------------------------------------------------
     const gpa = init.gpa;
     const m = try machine_mod.Machine.create(gpa);
@@ -114,33 +114,39 @@ pub fn main(init: std.process.Init) !void {
     checkEq(m.cpu.pc, reset_vec, "PC from RESET vector");
     m.runFrame();
 
-    // Stage 1 — CPU & stack environment (task 12.1).
-    check(m.cpu.halted, "CPU parked in shell_entry HLT", 0, 1);
+    // Stage 1 — CPU & stack environment (task 12.1). The booted machine
+    // is BUSY: the shell's GETLINE polls KSTAT with four registers saved
+    // (LR/R5/R6/R7 — hence SP exactly 16 below the boot value).
+    check(!m.cpu.halted, "CPU busy in the shell (not halted)", 1, 0);
+    check(m.cpu.pc >= 0xFC200 and m.cpu.pc < 0xFE000, "PC inside the kernel", m.cpu.pc, 0xFC200);
     check(m.cpu.flags & cpu_mod.flag_s != 0, "FLAGS.S (supervisor)", m.cpu.flags, cpu_mod.flag_s);
-    check(m.cpu.flags & cpu_mod.flag_i == 0, "FLAGS.I clear (Stage 6 pending)", m.cpu.flags, 0);
-    checkEq(m.cpu.getReg(cpu_mod.Gab16.sp), boot_sp, "SP");
+    check(m.cpu.flags & cpu_mod.flag_i != 0, "FLAGS.I set (Stage 6 ran)", m.cpu.flags, cpu_mod.flag_i);
+    checkEq(m.cpu.getReg(cpu_mod.Gab16.sp), boot_sp - 16, "SP (GETLINE's four saves)");
     checkEq(m.cpu.ssp, boot_ssp, "SSP");
     checkEq(m.cpu.usp, boot_sp, "USP mirrors boot SP");
     checkEq(m.cpu.ivt, boot_ivt, "IVT");
 
-    // Stage 2 — RAM clears (task 12.2): the text matrix must be untouched
-    // zeros; CUR_ATTR proves the System Variables were written *after*
-    // their clear.
-    var mat_nonzero: u32 = 0;
-    var off: u32 = 0;
-    while (off < textmat_len) : (off += 1) {
-        if (m.ram.readByte(textmat + off) != 0) mat_nonzero += 1;
-    }
-    checkEq(mat_nonzero, 0, "text matrix zeroed (bytes off)");
+    // Stages 2 + 5 — the matrix went through the stage-2 clear, the
+    // stage-5 CLRSCR, and the banner: row 0 opens with the stars, READY.
+    // sits on row 3, and the cursor waits at the start of row 4.
+    checkEq(m.ram.readByte(textmat), '*', "banner stars at (0,0)");
+    checkEq(m.ram.readByte(textmat + 3 * 160), 'R', "READY. on row 3");
+    const cc = @as(u32, m.ram.readByte(0x01100)) | (@as(u32, m.ram.readByte(0x01101)) << 8);
+    const cr = @as(u32, m.ram.readByte(0x01102)) | (@as(u32, m.ram.readByte(0x01103)) << 8);
+    checkEq(cc, 0, "cursor column home for input");
+    checkEq(cr, 4, "cursor on the input row");
     const cur_attr = @as(u32, m.ram.readByte(cur_attr_addr)) |
         (@as(u32, m.ram.readByte(cur_attr_addr + 1)) << 8);
     checkEq(cur_attr, 0x0001, "CUR_ATTR white-on-black");
+    const rng = @as(u32, m.ram.readByte(0x01106)) |
+        (@as(u32, m.ram.readByte(0x01107)) << 8);
+    checkEq(rng, 0x0001, "RNG_STATE seeded $0001 (amendment G18)");
 
     // Stage 3 — device safe defaults (task 12.3), through peek16 so the
     // audit itself is side-effect-free.
     checkEq(m.io.peek16(reg_tactrl), 0, "TACTRL disabled");
     checkEq(m.io.peek16(reg_tbctrl), 0, "TBCTRL disabled");
-    checkEq(m.io.peek16(reg_irqmask), 0, "IRQMASK all masked");
+    checkEq(m.io.peek16(reg_irqmask), 0x15, "IRQMASK: timer A + keyboard + VBLANK (Stage 6)");
     checkEq(m.io.peek16(reg_kctrl), 0x0001, "KCTRL key IRQ enabled, flush clear");
     checkEq(m.io.peek16(reg_jctrl), 0, "JCTRL passive");
     checkEq(m.io.peek16(reg_amvol), 0, "AUR master volume muted");
@@ -174,7 +180,7 @@ pub fn main(init: std.process.Init) !void {
         return error.BootCheckFailed;
     }
     std.debug.print(
-        "bootcheck: {s} boots clean — §6.8 stages 1–4 postconditions hold ({d} cycles budgeted, CPU halted at ${X:0>5})\n",
+        "bootcheck: {s} boots clean to READY. — §6.8 stages 1–6 postconditions hold ({d} cycles budgeted, shell polling at ${X:0>5})\n",
         .{ args[1], @as(u32, 240_000), m.cpu.pc },
     );
 }

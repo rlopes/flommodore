@@ -4,18 +4,22 @@ A fully specified fantasy computer — Gab-16 CPU (16-bit RISC, 20-bit address
 bus), VIC-256 video, AUR-1 sound, 512KB RAM — implemented as a reference
 emulator and toolchain in **Zig 0.16** with **SDL3**.
 
-**Block 12 — ROM & Boot — in progress**: the machine grows firmware.
-`src/bios/bios.asm` is written in Flommodore assembly and built by the
-machine's own toolchain — `zig build bios` runs flas over it and frames
-the 16KB image with `fll --raw --base $FC000 --size 16K` into
-`rom/flommodore.rom` (task 12.16 in the making). Boot stages 1–4 are
-live: CPU/stack environment, RAM clears, device safe defaults, and the
-ROM→RAM palette copy with the VIC base registers on the ÷16 convention.
-`zig build boottest` audits every §6.8 stage 1–4 postcondition on a real
-headless Machine (decision bk in `tests/bootcheck.zig` — a state audit
-through the debugger's side-effect-free peek path, not a golden frame).
-Next up: the console syscalls on the 80×43 text console (decision bd),
-keyboard input, the IRQ dispatcher, and the READY shell.
+**★ Milestone 5 — Complete Machine — reached** (Block 12): the machine
+has firmware and a voice. `src/bios/bios.asm` — 3.8KB of Flommodore
+assembly built by the machine's own toolchain (`zig build bios`) — boots
+through all six §6.8 stages to the banner and the `READY.` shell, with
+all 29 system calls live behind the permanent `$FC100` jump table:
+console (80×43 text, scroll, cursor), keyboard (HID-to-ASCII with shift,
+line editing), video (modes, palette, VBLANK, FILLSCR), sound (AUR-1
+one-call-one-note), memory, timers, and the IRQ dispatcher with
+CALL/RET handlers via `SYS_IRQSET`. Autoboot probes `$04100` for the
+`.flapp` `FB` header and runs what it finds. Three verifiers pin it:
+`boottest` (every stage 1–6 postcondition plus a golden boot frame),
+`systest` (the whole ABI exercised by host-injected calls, ~130 checks,
+ending with the published §8.3 `hello.asm` typed into the shell as `RUN
+4100` and printing through `SYS_PUTSTR`), and the five VIC/AUR goldens
+untouched. The ImGui debug panels (9.12–9.14) remain the one deferred
+nicety.
 
 **★ Milestone 4 — Working Toolchain — reached** (Blocks 10–11): the
 machine programs itself. `flas` assembles the full Phase 8 language —
@@ -95,7 +99,9 @@ zig build -Doptimize=ReleaseFast     # Debug is cycle-exact but below real time
 ./zig-out/bin/flommodore tests/roms/test_prog.flapp
 ```
 
-Next: finish Block 12 — syscalls, shell, autoboot → ★ Milestone 5.
+★ Milestone 5 reached — the Flommodore is a complete machine. Ideas
+beyond the plan: the FL language (a future phase), storage for `LOAD`,
+and the deferred ImGui debug panels.
 
 ## Build
 
@@ -105,10 +111,11 @@ Zig package manager (castholm/SDL) — no system packages needed.
 ```sh
 zig build            # build zig-out/bin/flommodore (and the headless harness)
 zig build run        # open the (empty) Flommodore window; ESC or close to quit
-zig build test       # unit tests + asmtest/hellotest/boottest e2e
+zig build test       # unit tests + asmtest/hellotest/boottest/systest e2e
 zig build genroms    # emit generated test ROMs into tests/roms/
 zig build bios       # flas+fll the BIOS into rom/flommodore.rom
-zig build boottest   # verify the BIOS boots (§6.8 stages 1–4)
+zig build boottest   # BIOS boots to READY (§6.8 stages 1–6 + golden frame)
+zig build systest    # the full syscall ABI + shell + autoboot, end to end
 zig build harness -- --rom tests/roms/test_cpu_alu.rom --max-cycles 240000 --expect-pass
 ```
 
@@ -132,12 +139,12 @@ zig build bios
 ./zig-out/bin/flommodore --rom rom/flommodore.rom
 ```
 
-At ★ Milestone 5 this is the complete machine: the boot banner, the
-`READY.` shell (`MEM`, `POKE`, `PEEK`, `RUN`, `RESET`, `VER`, `HELP`), and
-autoboot — a valid `.flapp` at `$04100` starts automatically. Until Block
-12 finishes, the machine boots through §6.8 stages 1–4 (CPU/stack
-environment, RAM clears, device defaults, palette) and parks; the console
-syscalls already work through the permanent `$FC100` jump table.
+This is the complete machine: the boot banner, the `READY.` shell
+(`MEM`, `POKE`, `PEEK`, `RUN`, `LOAD`, `RESET`, `VER`, `HELP` — hex
+arguments, optional `$`), and autoboot: a valid `.flapp` at `$04100`
+starts automatically and drops back to `READY.` if it returns. Type
+`RUN 4100` to start a loaded program by hand; the published Phase 8
+§8.3 `hello.asm` runs exactly as printed.
 
 Headless (no SDL — CI, servers, containers):
 
