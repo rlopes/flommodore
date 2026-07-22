@@ -94,12 +94,17 @@ pub const vector_len: u32 = 16;
 
 /// Raw padded image (task 11.10, amendment §8.6): absolute inputs
 /// placed at (load − base), zero-padded to `size`, no header. Enforces
-/// decision ba: bounds, overlap, and non-empty vector slots.
+/// decision ba: bounds, overlap, and — for ROM images — non-empty
+/// vector slots. `require_vectors=false` is the --overlay mode
+/// (DECISION bt): a padded RAM image a host or test loads directly;
+/// §8.6's vector requirement is a ROM-replacement rule and does not
+/// apply to an overlay.
 pub fn emitRaw(
     arena: std.mem.Allocator,
     objs: []const loader.Object,
     base: u32,
     size: u32,
+    require_vectors: bool,
     err_msg_out: ?*[]const u8,
 ) Error![]u8 {
     if (objs.len == 0)
@@ -138,7 +143,9 @@ pub fn emitRaw(
         }
     }
 
-    // Vector-slot check (amendment §8.6 / decision ba).
+    // Vector-slot check (amendment §8.6 / decision ba; skipped for
+    // overlays, decision bt).
+    if (!require_vectors) return image;
     if (vector_base < base or vector_base + vector_len > base + size)
         return fail(arena, err_msg_out, "image window [${X:0>5}..${X:0>5}) does not cover the vector slots ${X:0>5}-${X:0>5}", .{ base, base + size, vector_base, vector_base + vector_len - 1 });
     const vecs = image[vector_base - base ..][0..vector_len];
@@ -344,7 +351,7 @@ test "emitRaw: reproduces an absolute image; vector and overlap rules (decision 
             \\
         );
         const objs = [_]loader.Object{a};
-        const image = try emitRaw(arena, &objs, 0xFC000, 16384, &msg);
+        const image = try emitRaw(arena, &objs, 0xFC000, 16384, true, &msg);
         try testing.expectEqual(@as(usize, 16384), image.len);
         try testing.expectEqual(encode.nop(), std.mem.readInt(u32, image[0x200..0x204], .little));
         try testing.expectEqual(encode.hlt(), std.mem.readInt(u32, image[0x204..0x208], .little));
@@ -356,7 +363,7 @@ test "emitRaw: reproduces an absolute image; vector and overlap rules (decision 
     {
         const a = try makeObj(arena, "rom.flobj", "    ORG $FC200\n    NOP\n");
         const objs = [_]loader.Object{a};
-        try testing.expectError(Error.Emit, emitRaw(arena, &objs, 0xFC000, 16384, &msg));
+        try testing.expectError(Error.Emit, emitRaw(arena, &objs, 0xFC000, 16384, true, &msg));
         try testing.expect(std.mem.indexOf(u8, msg, "vector slots") != null);
         try testing.expect(std.mem.indexOf(u8, msg, "empty") != null);
     }
@@ -365,7 +372,7 @@ test "emitRaw: reproduces an absolute image; vector and overlap rules (decision 
     {
         const a = try makeObj(arena, "rom.flobj", "    ORG $10000\n    NOP\n");
         const objs = [_]loader.Object{a};
-        try testing.expectError(Error.Emit, emitRaw(arena, &objs, 0x10000, 4096, &msg));
+        try testing.expectError(Error.Emit, emitRaw(arena, &objs, 0x10000, 4096, true, &msg));
         try testing.expect(std.mem.indexOf(u8, msg, "does not cover the vector slots") != null);
     }
 
@@ -374,7 +381,7 @@ test "emitRaw: reproduces an absolute image; vector and overlap rules (decision 
         const a = try makeObj(arena, "a.flobj", "    ORG $FC200\n    NOP\n    NOP\n");
         const b = try makeObj(arena, "b.flobj", "    ORG $FC204\n    NOP\n");
         const objs = [_]loader.Object{ a, b };
-        try testing.expectError(Error.Emit, emitRaw(arena, &objs, 0xFC000, 16384, &msg));
+        try testing.expectError(Error.Emit, emitRaw(arena, &objs, 0xFC000, 16384, true, &msg));
         try testing.expect(std.mem.indexOf(u8, msg, "overlap") != null);
     }
 
@@ -382,15 +389,25 @@ test "emitRaw: reproduces an absolute image; vector and overlap rules (decision 
     {
         const a = try makeObj(arena, "a.flobj", "    SECTION code\n    NOP\n");
         const objs = [_]loader.Object{a};
-        try testing.expectError(Error.Emit, emitRaw(arena, &objs, 0xFC000, 16384, &msg));
+        try testing.expectError(Error.Emit, emitRaw(arena, &objs, 0xFC000, 16384, true, &msg));
         try testing.expect(std.mem.indexOf(u8, msg, "link with a script") != null);
+    }
+
+    // Overlay mode (decision bt): a RAM image far from the vector slots
+    // emits fine without them — bounds and padding still enforced.
+    {
+        const a = try makeObj(arena, "ram.flobj", "    ORG $04100\n    NOP\n");
+        const objs = [_]loader.Object{a};
+        const image = try emitRaw(arena, &objs, 0x04100, 256, false, &msg);
+        try testing.expectEqual(@as(usize, 256), image.len);
+        try testing.expect(!std.mem.allEqual(u8, image[0..4], 0));
     }
 
     // Section outside the window.
     {
         const a = try makeObj(arena, "a.flobj", "    ORG $FB000\n    NOP\n    ORG $FFFC0\n    DD $FC200\n");
         const objs = [_]loader.Object{a};
-        try testing.expectError(Error.Emit, emitRaw(arena, &objs, 0xFC000, 16384, &msg));
+        try testing.expectError(Error.Emit, emitRaw(arena, &objs, 0xFC000, 16384, true, &msg));
         try testing.expect(std.mem.indexOf(u8, msg, "outside the image window") != null);
     }
 }

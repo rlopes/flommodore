@@ -26,6 +26,7 @@ const emitter = @import("emitter");
 const usage =
     \\usage: fll inputs.flobj... -s script.flld [-o out.flapp] [-v] [--version N]
     \\       fll --raw --base $ADDR --size N[K] inputs.flobj... [-o out.rom] [-v]
+    \\       fll --overlay --base $ADDR --size N[K] inputs.flobj... [-o out.bin] [-v]
     \\
 ;
 
@@ -36,6 +37,7 @@ const Options = struct {
     verbose: bool,
     version_override: ?u16,
     raw: bool,
+    overlay: bool,
     base: ?u32,
     size: ?u32,
 };
@@ -75,6 +77,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Options {
     var verbose = false;
     var version_override: ?u16 = null;
     var raw = false;
+    var overlay = false;
     var base: ?u32 = null;
     var size: ?u32 = null;
 
@@ -99,6 +102,13 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Options {
             version_override = @intCast(n);
         } else if (std.mem.eql(u8, a, "--raw")) {
             raw = true;
+        } else if (std.mem.eql(u8, a, "--overlay")) {
+            // DECISION bt: --overlay is --raw for RAM images — a padded
+            // absolute image a host or test loads into RAM, not a ROM
+            // replacement, so the §8.6 vector-slot requirement does not
+            // apply. Everything else (bounds, overlap, padding) holds.
+            raw = true;
+            overlay = true;
         } else if (std.mem.eql(u8, a, "--base")) {
             i += 1;
             if (i >= args.len) return error.BadUsage;
@@ -127,6 +137,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Options {
         .verbose = verbose,
         .version_override = version_override,
         .raw = raw,
+        .overlay = overlay,
         .base = base,
         .size = size,
     };
@@ -167,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (opts.raw) {
         var err_msg: []const u8 = "";
-        const image = emitter.emitRaw(arena, objs, opts.base.?, opts.size.?, &err_msg) catch |err| {
+        const image = emitter.emitRaw(arena, objs, opts.base.?, opts.size.?, !opts.overlay, &err_msg) catch |err| {
             std.debug.print("fll: error: {s}\n", .{err_msg});
             return err;
         };
