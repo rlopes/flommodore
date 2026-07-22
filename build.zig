@@ -599,9 +599,10 @@ pub fn build(b: *std.Build) void {
     // --size 16K` frames the 16KB image. The build graph owns the cached
     // artifact; `zig build bios` additionally refreshes the gitignored
     // rom/flommodore.rom so the emulator CLI has a stable path to the
-    // firmware. tests/bootcheck.zig then audits the §6.8 Stage 1–4
-    // postconditions on a real Machine (DECISION bk: a state audit, not
-    // a golden frame — the freshly booted screen is uniformly black).
+    // firmware. tests/bootcheck.zig then audits the §6.8 Stage 1–6
+    // postconditions on a real Machine (DECISION bk: a state audit
+    // through side-effect-free reads, plus — now that the boot paints
+    // the banner — the task-12.16 golden boot frame below).
     // Runs as part of `zig build test` and standalone via
     // `zig build boottest`.
     // ------------------------------------------------------------------
@@ -615,6 +616,21 @@ pub fn build(b: *std.Build) void {
     fll_bios_run.addFileArg(bios_flobj);
     fll_bios_run.addArg("-o");
     const bios_rom = fll_bios_run.addOutputFileArg("flommodore.rom");
+
+    // The published §8.3 hello (tests/asm/hello.asm — the Block 10
+    // listing fixture, absolute at $04100) built through the same
+    // toolchain, as a raw memory image for syscheck's Milestone-5
+    // acceptance: typed RUN 4100, SYS_PUTSTR output, SYS_GETKEY, HLT.
+    const flas_hello83_run = b.addRunArtifact(flas_exe);
+    flas_hello83_run.addFileArg(b.path("tests/asm/hello.asm"));
+    flas_hello83_run.addArg("-o");
+    const hello83_flobj = flas_hello83_run.addOutputFileArg("hello83.flobj");
+
+    const fll_hello83_run = b.addRunArtifact(fll_exe);
+    fll_hello83_run.addArgs(&.{ "--overlay", "--base", "$04100", "--size", "256" });
+    fll_hello83_run.addFileArg(hello83_flobj);
+    fll_hello83_run.addArg("-o");
+    const hello83_raw = fll_hello83_run.addOutputFileArg("hello83.raw");
 
     const bios_update = b.addUpdateSourceFiles();
     bios_update.addCopyFileToSource(bios_rom, "rom/flommodore.rom");
@@ -637,13 +653,15 @@ pub fn build(b: *std.Build) void {
     });
     const bootcheck_run = b.addRunArtifact(bootcheck_exe);
     bootcheck_run.addFileArg(bios_rom);
-    const boottest_step = b.step("boottest", "Block 12 e2e: BIOS ROM boots — §6.8 stages 1–4 hold");
+    const boottest_step = b.step("boottest", "Block 12 e2e: BIOS boots to READY — §6.8 stages 1–6 + the golden boot frame");
     boottest_step.dependOn(&bootcheck_run.step);
 
-    // Console syscalls (tasks 12.5–12.6): tests/syscheck.zig drives the
-    // permanent $FC100 jump-table ABI on the booted machine with
-    // host-injected calls (DECISION bm) and audits the decision-bl
-    // console semantics plus the decision-be register conventions.
+    // Syscalls, shell, and autoboot (tasks 12.5–12.16): tests/syscheck.zig
+    // drives the permanent $FC100 jump-table ABI on the booted machine
+    // with host-injected calls (DECISION bm), audits every syscall family
+    // and the decision-be register conventions, runs the IRQ dispatcher
+    // end to end, and finishes with autoboot + the published §8.3 hello
+    // typed into the shell.
     const syscheck_module = b.createModule(.{
         .root_source_file = b.path("tests/syscheck.zig"),
         .target = target,
@@ -661,8 +679,25 @@ pub fn build(b: *std.Build) void {
     });
     const syscheck_run = b.addRunArtifact(syscheck_exe);
     syscheck_run.addFileArg(bios_rom);
-    const systest_step = b.step("systest", "Block 12 e2e: console syscalls through the $FC100 ABI");
+    syscheck_run.addFileArg(hello83_raw);
+    const systest_step = b.step("systest", "Block 12 e2e: the full syscall ABI + shell + autoboot");
     systest_step.dependOn(&syscheck_run.step);
+
+    // The golden boot frame (task 12.16): two frames of the bare BIOS
+    // must render the banner and READY. pixel-for-pixel. The hash was
+    // computed once from the verified boot screen (decoded against the
+    // ROM font) and pins the whole visible boot path.
+    const bootgolden_run = b.addRunArtifact(harness_exe);
+    bootgolden_run.addArg("--rom");
+    bootgolden_run.addFileArg(bios_rom);
+    bootgolden_run.addArgs(&.{
+        "--frames",
+        "2",
+        "--golden",
+        "68021ca11b9031ec3d2cfda8e7f590a0257418594497a009e8d83f033e12ded3",
+        "--quiet",
+    });
+    boottest_step.dependOn(&bootgolden_run.step);
 
     // ------------------------------------------------------------------
     // Tests. The `test` step is created exactly ONCE; each per-module test
@@ -705,5 +740,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&cmprom_run.step); // Block 10 e2e acceptance
     test_step.dependOn(&hello_run.step); // Block 11 e2e acceptance
     test_step.dependOn(&bootcheck_run.step); // Block 12 boot verification
-    test_step.dependOn(&syscheck_run.step); // Block 12 console syscalls
+    test_step.dependOn(&syscheck_run.step); // Block 12 syscalls/shell/autoboot
+    test_step.dependOn(&bootgolden_run.step); // Block 12 golden boot frame
 }
