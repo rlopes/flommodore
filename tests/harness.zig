@@ -35,6 +35,9 @@ const Options = struct {
     flapp_path: ?[]const u8 = null,
     max_cycles: u64 = util.cycles_per_frame, // one frame by default
     quiet: bool = false,
+    /// Decision bu (mirrors the emulator): place the .flapp in RAM but let
+    /// the ROM boot find it — the §6.9 autoboot path, not the PC override.
+    autoboot: bool = false,
     expect_pass: bool = false,
     irq_at: [max_irqs]u64 = undefined,
     irq_count: usize = 0,
@@ -113,6 +116,8 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.max_cycles = try std.fmt.parseInt(u64, args[i], 10);
         } else if (std.mem.eql(u8, arg, "--quiet")) {
             opts.quiet = true;
+        } else if (std.mem.eql(u8, arg, "--autoboot")) {
+            opts.autoboot = true;
         } else if (std.mem.eql(u8, arg, "--expect-pass")) {
             opts.expect_pass = true;
         } else if (std.mem.eql(u8, arg, "--frames")) {
@@ -177,7 +182,7 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     const opts = parseArgs(args) catch {
-        std.log.err("usage: harness [--rom <path>] [--flapp <path>] (at least one) [--max-cycles N | --frames N] [--golden HEX] [--dump-ppm f.ppm] [--irq-at N]... [--key-at C:HHHH]... [--joy-at C:P:HH]... [--expect-pass] [--quiet]", .{});
+        std.log.err("usage: harness [--rom <path>] [--flapp <path>] (at least one) [--autoboot] [--max-cycles N | --frames N] [--golden HEX] [--dump-ppm f.ppm] [--irq-at N]... [--key-at C:HHHH]... [--joy-at C:P:HH]... [--expect-pass] [--quiet]", .{});
         return error.BadUsage;
     };
     if (opts.quiet) util.setLevel(.silent);
@@ -205,14 +210,24 @@ pub fn main(init: std.process.Init) !void {
     if (opts.flapp_path) |path| {
         // Standalone .flapp (task 5.5): same pre-BIOS environment the
         // emulator CLI provides (D12 boot values) — one loader, one truth.
+        // With --autoboot (decision bu) the image is placed in RAM only
+        // and the ROM boots normally: the §6.9 scan finds it at $04100.
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
         const entry = try flapp_mod.load(bus, bytes);
-        cpu.setReg(cpu_mod.Gab16.sp, 0x01100);
-        cpu.ssp = 0x020F0;
-        cpu.usp = 0x01100;
-        cpu.ivt = 0xFFFC0;
-        cpu.pc = entry;
-        util.logInfo("loaded .flapp: {s} → entry ${X:0>5}", .{ path, entry });
+        if (opts.autoboot) {
+            if (opts.rom_path == null) {
+                util.logErr("--autoboot needs a --rom to boot", .{});
+                return error.AutobootWithoutRom;
+            }
+            util.logInfo("placed .flapp for autoboot: {s} (RESET → ${X:0>5})", .{ path, cpu.pc });
+        } else {
+            cpu.setReg(cpu_mod.Gab16.sp, 0x01100);
+            cpu.ssp = 0x020F0;
+            cpu.usp = 0x01100;
+            cpu.ivt = 0xFFFC0;
+            cpu.pc = entry;
+            util.logInfo("loaded .flapp: {s} → entry ${X:0>5}", .{ path, entry });
+        }
     } else {
         util.logInfo("RESET → ${X:0>5}", .{cpu.pc});
         if (cpu.pc == 0) {
