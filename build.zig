@@ -637,6 +637,48 @@ pub fn build(b: *std.Build) void {
     const bios_step = b.step("bios", "Build the BIOS ROM into rom/flommodore.rom (task 12.16)");
     bios_step.dependOn(&bios_update.step);
 
+    // ------------------------------------------------------------------
+    // `zig build examples`: build the examples/ programs into runnable,
+    // gitignored .flapp files beside their sources. bios_hello is the
+    // BIOS-era demo — run it the cartridge way (decision bu):
+    //   flommodore --rom rom/flommodore.rom --autoboot examples/bios_hello.flapp
+    // ------------------------------------------------------------------
+    const flas_bhello_run = b.addRunArtifact(flas_exe);
+    flas_bhello_run.addFileArg(b.path("examples/bios_hello.asm"));
+    flas_bhello_run.addArg("-o");
+    const bhello_flobj = flas_bhello_run.addOutputFileArg("bios_hello.flobj");
+
+    const fll_bhello_run = b.addRunArtifact(fll_exe);
+    fll_bhello_run.addFileArg(bhello_flobj);
+    fll_bhello_run.addArg("-s");
+    fll_bhello_run.addFileArg(b.path("examples/bios_hello.flld"));
+    fll_bhello_run.addArg("-o");
+    const bhello_flapp = fll_bhello_run.addOutputFileArg("bios_hello.flapp");
+
+    const examples_update = b.addUpdateSourceFiles();
+    examples_update.addCopyFileToSource(hello_flapp, "examples/hello.flapp");
+    examples_update.addCopyFileToSource(bhello_flapp, "examples/bios_hello.flapp");
+    const examples_step = b.step("examples", "Build examples/*.flapp (run bios_hello with --rom + --autoboot)");
+    examples_step.dependOn(&examples_update.step);
+    examples_step.dependOn(&bios_update.step); // bios_hello needs the firmware too
+
+    // The autoboot demo, pinned: place bios_hello.flapp in RAM, boot the
+    // BIOS, and the §6.9 scan must run it — banner, the program's two
+    // lines, READY. (hash from a font-decoded screen, like the others).
+    const bhello_run = b.addRunArtifact(harness_exe);
+    bhello_run.addArg("--rom");
+    bhello_run.addFileArg(bios_rom);
+    bhello_run.addArg("--autoboot");
+    bhello_run.addArg("--flapp");
+    bhello_run.addFileArg(bhello_flapp);
+    bhello_run.addArgs(&.{
+        "--frames",
+        "2",
+        "--golden",
+        "a3375e7f5ad24c55cc3e52d6254c01fe7c7182352384ea0a56b89840eb15c17e",
+        "--quiet",
+    });
+
     const bootcheck_module = b.createModule(.{
         .root_source_file = b.path("tests/bootcheck.zig"),
         .target = target,
@@ -742,4 +784,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&bootcheck_run.step); // Block 12 boot verification
     test_step.dependOn(&syscheck_run.step); // Block 12 syscalls/shell/autoboot
     test_step.dependOn(&bootgolden_run.step); // Block 12 golden boot frame
+    test_step.dependOn(&bhello_run.step); // examples autoboot demo golden
 }
