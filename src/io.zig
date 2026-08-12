@@ -3,7 +3,8 @@
 //! The I/O region `$80000–$80FFF` (Phase 5): register dispatch, system
 //! configuration, both timers, the IRQ controller, and the keyboard /
 //! joystick register sets (queues and state live here; SDL feeds them in
-//! Block 8; AUR-1 and VIC-256 registers arrive in Blocks 6–7).
+//! Block 8; AUR-1 and VIC-256 registers arrive in Blocks 6–7, FDD-1
+//! storage in Block 14).
 //!
 //! Access model (D14/§3.1, composition per D47): every register is a 16-bit
 //! value at its exact address; registers narrower than 16 bits read back
@@ -36,6 +37,7 @@ const std = @import("std");
 const util = @import("util");
 const vic_mod = @import("vic256");
 const aur_mod = @import("aur1");
+const storage_mod = @import("storage");
 
 // ---------------------------------------------------------------------------
 // Register addresses (Phase 5 §5.1–§5.5; audit Appendix D).
@@ -69,7 +71,7 @@ pub const irqstat_addr: u32 = 0x80040;
 pub const irqmask_addr: u32 = 0x80041;
 pub const irqack_addr: u32 = 0x80042;
 
-/// IRQ source bits (§5.5). Bit 7 is reserved.
+/// IRQ source bits (§5.5, bit 7 assigned by amendment v1.3 D53).
 pub const irq_timer_a: u8 = 1 << 0;
 pub const irq_timer_b: u8 = 1 << 1;
 pub const irq_keyboard: u8 = 1 << 2;
@@ -77,7 +79,8 @@ pub const irq_joystick: u8 = 1 << 3;
 pub const irq_vblank: u8 = 1 << 4;
 pub const irq_raster: u8 = 1 << 5;
 pub const irq_audio: u8 = 1 << 6;
-const irq_defined_mask: u8 = 0x7F;
+pub const irq_storage: u8 = 1 << 7; // FDD-1 completion (v1.3 D53)
+const irq_defined_mask: u8 = 0xFF;
 
 /// Machine ID (§5.1): $F1 = Flommodore.
 pub const machine_id: u8 = 0xF1;
@@ -236,6 +239,11 @@ pub const Io = struct {
     /// AUR-1 register dispatch ($80100–$801FF), wired by machine.zig
     /// (Block 7). Same null semantics.
     aur: ?*aur_mod.Aur = null,
+    /// FDD-1 register dispatch ($80050–$8005F), wired by machine.zig
+    /// (Block 14). Same null semantics — with no device attached the
+    /// window reads $0000 and ignores writes, exactly as the reserved
+    /// expansion did before it.
+    storage: ?*storage_mod.Storage = null,
 
     pub fn init() Io {
         return .{};
@@ -317,6 +325,9 @@ pub const Io = struct {
         if (addr >= aur_mod.base_addr and addr <= aur_mod.end_addr) {
             return if (io.aur) |dev| dev.read(addr) else 0x0000;
         }
+        if (addr >= storage_mod.base_addr and addr <= storage_mod.end_addr) {
+            return if (io.storage) |dev| dev.read(addr) else 0x0000;
+        }
         return switch (addr) {
             syscfg_addr => io.syscfg,
             sysid_addr => machine_id, // read-only (§5.1)
@@ -356,6 +367,10 @@ pub const Io = struct {
         }
         if (addr >= aur_mod.base_addr and addr <= aur_mod.end_addr) {
             if (io.aur) |dev| dev.write(addr, value);
+            return;
+        }
+        if (addr >= storage_mod.base_addr and addr <= storage_mod.end_addr) {
+            if (io.storage) |dev| dev.write(addr, value);
             return;
         }
         switch (addr) {
@@ -522,9 +537,9 @@ test "4.5/4.6 IRQ controller: raw IRQSTAT, mask, w1c ack, device gate" {
     try expectEqual(@as(u16, 0), io.read16(irqack_addr)); // DECISION e
     // TxSTAT is independent of IRQACK (separate latch).
     try expectEqual(@as(u16, 1), io.read16(timer_a_base + 6) & 1);
-    // Reserved bit 7 can't be set or masked.
+    // All eight sources are defined now that FDD-1 owns bit 7 (v1.3 D53).
     io.write16(irqmask_addr, 0xFFFF);
-    try expectEqual(@as(u16, 0x7F), io.read16(irqmask_addr));
+    try expectEqual(@as(u16, 0xFF), io.read16(irqmask_addr));
 }
 
 test "4.8 keyboard: queue, dequeue-on-read, overflow drop, flush, KCTRL" {
@@ -607,7 +622,10 @@ test "4.1 dispatch: adjacent registers never combine; reserved reads zero" {
         if (addr == kdata_addr) continue; // side-effecting; tested above
         _ = io.read16(addr);
     }
-    try expectEqual(@as(u16, 0), io.read16(0x80050)); // reserved expansion
+    // $80050–$8005F is the FDD-1 window (v1.3 §2.2); with no device
+    // wired it answers $0000, like the reserved expansion above it.
+    try expectEqual(@as(u16, 0), io.read16(0x80050));
+    try expectEqual(@as(u16, 0), io.read16(0x80060)); // reserved expansion
     try expectEqual(@as(u16, 0), io.read16(0x80FFF));
 }
 
