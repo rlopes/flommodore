@@ -60,6 +60,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ram", .module = ram_mod },
         },
     });
+    const storage_mod = b.createModule(.{
+        .root_source_file = b.path("src/storage.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ram", .module = ram_mod },
+        },
+    });
     const io_mod = b.createModule(.{
         .root_source_file = b.path("src/io.zig"),
         .target = target,
@@ -68,6 +76,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "util", .module = util_mod },
             .{ .name = "vic256", .module = vic_mod },
             .{ .name = "aur1", .module = aur_mod },
+            .{ .name = "storage", .module = storage_mod },
         },
     });
     const input_mod = b.createModule(.{
@@ -122,6 +131,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "bus", .module = bus_mod },
             .{ .name = "vic256", .module = vic_mod },
             .{ .name = "aur1", .module = aur_mod },
+            .{ .name = "storage", .module = storage_mod },
         },
     });
     const cpu_mod = b.createModule(.{
@@ -466,6 +476,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ram", .module = host_ram },
         },
     });
+    const host_storage = b.createModule(.{
+        .root_source_file = b.path("src/storage.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{
+            .{ .name = "ram", .module = host_ram },
+        },
+    });
     const host_io = b.createModule(.{
         .root_source_file = b.path("src/io.zig"),
         .target = b.graph.host,
@@ -474,6 +492,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "util", .module = host_util },
             .{ .name = "vic256", .module = host_vic },
             .{ .name = "aur1", .module = host_aur },
+            .{ .name = "storage", .module = host_storage },
         },
     });
     const host_bus = b.createModule(.{
@@ -751,6 +770,7 @@ pub fn build(b: *std.Build) void {
         ram_mod,
         rom_mod,
         aur_mod,
+        storage_mod,
         io_mod,
         input_mod,
         bus_mod,
