@@ -8,7 +8,7 @@
 //!
 //! CLI (Phase 8 §8.10 subset; `--listing` tooling arrives with Block 10/11):
 //!   flommodore [--rom file.rom] [program.flapp] [--autoboot] [--max-frames N]
-//!              [--debug] [--sym file.flsym]
+//!              [--debug] [--sym file.flsym] [--disk img | --disk-ro img]
 //!
 //! Loop structure (per frame, exactly 240,000 cycles — D17/D41):
 //!   for each of TOTAL_LINES scanlines:
@@ -16,7 +16,7 @@
 //!     ── scanline hook: the VIC-256 renders this line and may raise the
 //!        raster IRQ here (Block 6)
 //!   frame end: VBLANK/present (Block 6), audio push (Block 7),
-//!              SDL event poll, pacing sleep
+//!              disk write-back (Block 14), SDL event poll, pacing sleep
 //! Pacing never sleeps inside a scanline quantum (5.4): the frame runs
 //! flat-out, then sleeps coarse + spins the remainder at the boundary.
 //!
@@ -52,6 +52,8 @@ const audio_frame_bytes: usize = 735 * 2 * 2;
 const audio_high_water: c_int = @intCast(8 * audio_frame_bytes);
 /// Sleep coarse until this close to the deadline, then spin (task 5.4).
 const spin_margin_ns: u64 = 1_500_000;
+/// Upper bound on an attached sector image: 65,535 × 512 (v1.3 D54/STO-b).
+const max_disk_bytes: usize = 65_535 * 512;
 
 // ---------------------------------------------------------------------------
 // SDL → machine translation (Block 8). Everything below the event loop is
@@ -83,6 +85,34 @@ fn padButtonFromSdl(button: u8) ?input_mod.PadButton {
         sdl.SDL_GAMEPAD_BUTTON_SOUTH => .fire1,
         sdl.SDL_GAMEPAD_BUTTON_EAST => .fire2,
         else => null,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// FDD-1 write-back (Block 14). storage.zig is host-I/O-free by design
+// (v1.3 §7.5), so the file side lives here.
+// ---------------------------------------------------------------------------
+
+/// Write the whole sector image back to its file. Whole-file rather than
+/// positional: images are small, this only runs when a guest write command
+/// actually completed, and it reuses the one file-writing call pattern
+/// already proven everywhere else in the tree.
+fn flushDisk(io: std.Io, path: []const u8, image: []const u8) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, image);
+}
+
+/// Drain the device's pending-flush notice (STO-c) and, if a write landed,
+/// commit it. `anytype` keeps main.zig free of a storage import — it only
+/// ever reaches the device through the Machine that owns it. A failed
+/// flush warns rather than killing the session: losing the emulator over a
+/// full disk would cost the user everything else they were doing.
+fn flushDiskIfDirty(io: std.Io, path: ?[]const u8, storage: anytype) void {
+    if (storage.takeDirty() == null) return;
+    const p = path orelse return;
+    flushDisk(io, p, storage.image) catch |err| {
+        util.logWarn("disk flush failed: {t}", .{err});
     };
 }
 
@@ -179,6 +209,10 @@ const Options = struct {
     /// Block 9: load a .flsym symbol file (master spec §8.7). Overrides the
     /// auto-load companion beside the .flapp.
     sym_path: ?[]const u8 = null,
+    /// Block 14: raw sector image for the FDD-1 (v1.3 §2.9). --disk-ro
+    /// attaches the same image with the write-protect bit set.
+    disk_path: ?[]const u8 = null,
+    disk_ro: bool = false,
 };
 
 fn parseArgs(args: []const []const u8) !Options {
@@ -202,6 +236,12 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingValue;
             opts.sym_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--disk") or std.mem.eql(u8, arg, "--disk-ro")) {
+            if (opts.disk_path != null) return error.TooManyDisks; // one drive (v1.3 appendix)
+            opts.disk_ro = std.mem.eql(u8, arg, "--disk-ro");
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            opts.disk_path = args[i];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             return error.UnknownArgument;
         } else {
@@ -219,7 +259,7 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     const opts = parseArgs(args) catch {
-        util.logErr("usage: flommodore [--rom file.rom] [program.flapp] [--autoboot] [--max-frames N] [--debug] [--sym file.flsym]", .{});
+        util.logErr("usage: flommodore [--rom file.rom] [program.flapp] [--autoboot] [--max-frames N] [--debug] [--sym file.flsym] [--disk img | --disk-ro img]", .{});
         return error.BadUsage;
     };
 
@@ -230,6 +270,19 @@ pub fn main(init: std.process.Init) !void {
     if (opts.rom_path) |path| {
         try machine.rom.loadFromFile(io, std.Io.Dir.cwd(), path);
         util.logInfo("ROM loaded: {s}", .{path});
+    }
+    // --disk: FDD-1 media (Block 14, v1.3 §2.9) — a raw sector image held
+    // in memory for the session and written back at the frame boundary
+    // after a guest write completes. With no --disk the device reports no
+    // media and every command completes with STERR 1, never a hang.
+    if (opts.disk_path) |path| {
+        const image = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_disk_bytes));
+        machine.storage.attach(image, opts.disk_ro);
+        util.logInfo("disk attached: {s} ({d} sectors{s})", .{
+            path,
+            machine.storage.sectorCount(),
+            if (opts.disk_ro) ", write-protected" else "",
+        });
     }
     machine.cpu.reset(&machine.bus);
 
@@ -479,6 +532,14 @@ pub fn main(init: std.process.Init) !void {
             machine.aur.clearSamples();
         }
 
+        // Disk write-back (Block 14): a completed guest write reaches the
+        // host file at the next loop boundary. Per-frame rather than per
+        // command — an interactive session must not lose a save because the
+        // window closed, and ~16.7 ms of exposure is the same order as a
+        // real drive's write cache. Checked every iteration, not just on
+        // completed frames: a debugger single-step can finish a command too.
+        flushDiskIfDirty(io, opts.disk_path, machine.storage);
+
         // Events (task 5.3): polled every iteration so quit/F12 stay prompt
         // even while paused. Enqueuing at the frame boundary bounds input
         // latency at one frame (~16.7 ms) — indistinguishable from hardware
@@ -579,6 +640,10 @@ pub fn main(init: std.process.Init) !void {
             // state.)
         }
     }
+
+    // A write that completed in the final iteration has no next boundary
+    // to be flushed at — catch it on the way out.
+    flushDiskIfDirty(io, opts.disk_path, machine.storage);
 
     // start_ns is rebased after debugger pauses (paused wall time excluded,
     // prior frames accounted at exactly 60 Hz), so fps stays meaningful.
