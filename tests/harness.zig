@@ -8,7 +8,8 @@
 //!     BIOS LFSR arrives in Block 12; nothing random exists yet);
 //!   - `--max-cycles N` bounds the run so looping ROMs terminate.
 //!
-//! Usage: `harness [--rom <path>] [--flapp <path>] [--max-cycles N] [--quiet]`
+//! Usage: `harness [--rom <path>] [--flapp <path>] [--disk <img>]
+//!         [--max-cycles N] [--quiet]`
 //! (at least one of --rom/--flapp; both together is the §8.10 combined form)
 //!
 //! Block 3: steps the Gab-16 CPU for real. Extras:
@@ -19,6 +20,11 @@
 //!   - `--expect-pass`: enforce the test-ROM protocol — the CPU must HLT
 //!     with $600D at $00080, else exit nonzero and report the failing
 //!     check number from $00084.
+//!
+//! Block 14: `--disk <img>` / `--disk-ro <img>` attach a raw sector image
+//! to the FDD-1 (amendment v1.3 §2.9). The image is held in memory and
+//! written back once at the end of the run if a guest write completed —
+//! see `flushDisk` for why whole-file rather than positional.
 
 const std = @import("std");
 const util = @import("util");
@@ -59,6 +65,10 @@ const Options = struct {
     audio_golden: ?[]const u8 = null,
     /// Write the accumulated audio as a 44.1 kHz stereo S16 WAV.
     dump_wav: ?[]const u8 = null,
+    /// Block 14: raw sector image for the FDD-1 (v1.3 §2.9). --disk-ro
+    /// attaches the same image with the write-protect bit set.
+    disk_path: ?[]const u8 = null,
+    disk_ro: bool = false,
 
     const max_irqs = 16;
     const max_events = 16;
@@ -96,6 +106,9 @@ fn parseJoyAt(text: []const u8) !Options.JoyEvent {
 const result_addr: u32 = 0x00080;
 const failnum_addr: u32 = 0x00084;
 const result_pass: u16 = 0x600D;
+
+/// Upper bound on an attached sector image: 65,535 × 512 (v1.3 D54/STO-b).
+const max_disk_bytes: usize = 65_535 * 512;
 
 fn parseArgs(args: []const []const u8) !Options {
     var opts: Options = .{};
@@ -140,6 +153,12 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingValue;
             opts.dump_wav = args[i];
+        } else if (std.mem.eql(u8, arg, "--disk") or std.mem.eql(u8, arg, "--disk-ro")) {
+            if (opts.disk_path != null) return error.TooManyDisks; // one drive (v1.3 appendix)
+            opts.disk_ro = std.mem.eql(u8, arg, "--disk-ro");
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            opts.disk_path = args[i];
         } else if (std.mem.eql(u8, arg, "--key-at")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -182,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
     const opts = parseArgs(args) catch {
-        std.log.err("usage: harness [--rom <path>] [--flapp <path>] (at least one) [--autoboot] [--max-cycles N | --frames N] [--golden HEX] [--dump-ppm f.ppm] [--irq-at N]... [--key-at C:HHHH]... [--joy-at C:P:HH]... [--expect-pass] [--quiet]", .{});
+        std.log.err("usage: harness [--rom <path>] [--flapp <path>] (at least one) [--autoboot] [--max-cycles N | --frames N] [--golden HEX] [--dump-ppm f.ppm] [--disk img | --disk-ro img] [--irq-at N]... [--key-at C:HHHH]... [--joy-at C:P:HH]... [--expect-pass] [--quiet]", .{});
         return error.BadUsage;
     };
     if (opts.quiet) util.setLevel(.silent);
@@ -195,7 +214,6 @@ pub fn main(init: std.process.Init) !void {
     const rom = m.rom;
     const io_dev = m.io;
     const bus = &m.bus;
-    _ = ram;
 
     const cpu = &m.cpu;
     // Load order mirrors the emulator CLI (§8.10): the ROM (if any) is in
@@ -205,6 +223,18 @@ pub fn main(init: std.process.Init) !void {
     if (opts.rom_path) |path| {
         try rom.loadFromFile(io, std.Io.Dir.cwd(), path);
         util.logInfo("loaded ROM: {s}", .{path});
+    }
+    // FDD-1 media (Block 14, v1.3 §2.9): a raw sector image, held in
+    // memory for the run. With no --disk the device reports no media and
+    // every command completes with STERR 1 — never a hang.
+    if (opts.disk_path) |path| {
+        const image = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_disk_bytes));
+        m.storage.attach(image, opts.disk_ro);
+        util.logInfo("attached disk: {s} ({d} sectors{s})", .{
+            path,
+            m.storage.sectorCount(),
+            if (opts.disk_ro) ", write-protected" else "",
+        });
     }
     cpu.reset(bus);
     if (opts.flapp_path) |path| {
@@ -238,6 +268,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // True once any guest write command has completed (STO-c).
+    var disk_dirty = false;
     var cycles: u64 = 0;
     if (opts.frames > 0) {
         // Frame mode (Block 6): whole scanline-quantum frames via the
@@ -255,6 +287,7 @@ pub fn main(init: std.process.Init) !void {
                 try wav_samples.appendSlice(arena, produced);
             }
             m.aur.clearSamples();
+            if (m.storage.takeDirty() != null) disk_dirty = true;
         }
         cycles = @as(u64, frame) * util.cycles_per_frame;
         util.logInfo("ran {d} frames ({d} cycles); {d}×{d} output", .{
@@ -319,6 +352,8 @@ pub fn main(init: std.process.Init) !void {
             const event = cpu.step(bus);
             io_dev.tick();
             if (m.aur.tick(m.ram)) io_dev.raise(io_mod.irq_audio); // parity with machine.cycle
+            if (m.storage.tick(ram)) io_dev.raise(io_mod.irq_storage); // …and the FDD-1
+            if (m.storage.takeDirty() != null) disk_dirty = true;
             if (event == .irq_entered and injected) {
                 injected = false;
                 irq_idx += 1;
@@ -327,6 +362,9 @@ pub fn main(init: std.process.Init) !void {
         if (irq_idx < opts.irq_count) {
             util.logWarn("{d} of {d} --irq-at pulses were never delivered", .{ opts.irq_count - irq_idx, opts.irq_count });
         }
+    }
+    if (disk_dirty) {
+        if (opts.disk_path) |path| try flushDisk(io, path, m.storage.image);
     }
     util.logInfo("ran {d} cycles; halted={}, power_off={}, PC=${X:0>5}", .{ cycles, cpu.halted, io_dev.power_off, cpu.pc });
     if (opts.expect_pass) {
@@ -343,6 +381,21 @@ pub fn main(init: std.process.Init) !void {
         }
         util.logInfo("test ROM passed", .{});
     }
+}
+
+/// Write the whole sector image back after a completed guest write (STO-c).
+/// Whole-file rather than positional: images are small, a flush only
+/// happens when a write command actually completed, and this reuses the
+/// one file-writing call pattern already proven everywhere else in the
+/// tree. Deviation from v1.3 §2.9 worth naming — the commit reaches the
+/// host file at the END of the run, not before busy clears. Inside the
+/// machine the ordering §2.9 describes still holds exactly, because the
+/// sector image is the device's own memory.
+fn flushDisk(io: std.Io, path: []const u8, image: []const u8) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, image);
+    util.logInfo("flushed disk: {s} ({d} bytes)", .{ path, image.len });
 }
 
 /// Minimal RIFF/WAVE writer: stereo S16 at 44.1 kHz.
@@ -414,6 +467,25 @@ test "harness: argument parsing" {
     try testing.expectError(error.MissingRom, parseArgs(&.{"harness"}));
     try testing.expectError(error.MissingValue, parseArgs(&.{ "harness", "--rom" }));
     try testing.expectError(error.UnknownArgument, parseArgs(&.{ "harness", "--bogus" }));
+}
+
+test "harness: --disk / --disk-ro parsing (Block 14)" {
+    const o1 = try parseArgs(&.{ "harness", "--rom", "x.rom", "--disk", "work.fldisk" });
+    try testing.expectEqualStrings("work.fldisk", o1.disk_path.?);
+    try testing.expect(!o1.disk_ro);
+
+    const o2 = try parseArgs(&.{ "harness", "--rom", "x.rom", "--disk-ro", "master.fldisk" });
+    try testing.expectEqualStrings("master.fldisk", o2.disk_path.?);
+    try testing.expect(o2.disk_ro);
+
+    // No disk at all is the default: the device reports no media (v1.3 §2.8).
+    const o3 = try parseArgs(&.{ "harness", "--rom", "x.rom" });
+    try testing.expect(o3.disk_path == null);
+
+    // One drive only, and the value is required.
+    try testing.expectError(error.TooManyDisks, parseArgs(&.{ "harness", "--rom", "x", "--disk", "a", "--disk", "b" }));
+    try testing.expectError(error.TooManyDisks, parseArgs(&.{ "harness", "--rom", "x", "--disk", "a", "--disk-ro", "b" }));
+    try testing.expectError(error.MissingValue, parseArgs(&.{ "harness", "--rom", "x", "--disk" }));
 }
 
 test "harness: --key-at / --joy-at parsing (Block 8)" {
