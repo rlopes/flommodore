@@ -106,9 +106,9 @@
 ; 16×16 bytes with live bus reads — peeking KDATA dequeues, as on the
 ; machines this imitates. LOAD and SAVE reach the FDD-1 through the §4.1
 ; syscalls in storage.inc: SAVE needs a 16-byte-aligned source, and LOAD
-; only accepts images whose header loads at $04100. Autoboot validates magic, entry offset ≥ 12, and min-RAM ≤
-; 512; a present-but-invalid header earns the diagnostic, a silent
-; absence goes straight to the shell (§6.9).
+; only accepts images whose header loads at $04100. Autoboot validates
+; magic, entry offset ≥ 12, and min-RAM ≤ 512; a present-but-invalid header
+; earns the diagnostic, a silent absence goes straight to the shell (§6.9).
 ; ============================================================================
 
 ; ----------------------------------------------------------------------------
@@ -697,6 +697,16 @@ dev_init:
     ; Joystick: reads enabled (passive), transition IRQ off.
     LOAD_ADDR R4, JOYP
     SW   [R4 + 2], R0        ; JCTRL = 0
+
+    ; FDD-1: completion IRQ off (v1.3 §2.8). STLBA/STBUF/STCMD reset to 0 in
+    ; hardware and STSTAT/STERR are read-only, so STCTRL is the only storage
+    ; register boot has an opinion to state — and it must be off, or a
+    ; program that never touches the disk could still be interrupted by
+    ; source 7 after some earlier program armed it. SYS_RESET re-runs boot
+    ; WITHOUT a hardware reset, so this is not merely restating the reset
+    ; state: on that path STCTRL can genuinely arrive here set.
+    LOAD_ADDR R4, STOR
+    SW   [R4 + 4], R0        ; STCTRL = 0
 
     ; AUR-1: one silent-default routine for boot and SYS_SNDINIT alike
     ; (decision bp) — SNDINIT is the implementation, dev_init a caller.
