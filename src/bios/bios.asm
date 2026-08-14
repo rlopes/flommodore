@@ -104,8 +104,9 @@
 ; autoboot transfer control with CALL, so a program that ends in RET drops
 ; back to the READY prompt (HLT works as published too — §8.3). MEM dumps
 ; 16×16 bytes with live bus reads — peeking KDATA dequeues, as on the
-; machines this imitates. LOAD prints its reserved-for-storage
-; diagnostic. Autoboot validates magic, entry offset ≥ 12, and min-RAM ≤
+; machines this imitates. LOAD and SAVE reach the FDD-1 through the §4.1
+; syscalls in storage.inc: SAVE needs a 16-byte-aligned source, and LOAD
+; only accepts images whose header loads at $04100. Autoboot validates magic, entry offset ≥ 12, and min-RAM ≤
 ; 512; a present-but-invalid header earns the diagnostic, a silent
 ; absence goes straight to the shell (§6.9).
 ; ============================================================================
@@ -231,7 +232,7 @@ ENDMACRO
     JMPA sys_dskread         ; 30 SYS_DSKREAD
     JMPA sys_dskwrite        ; 31 SYS_DSKWRITE
     JMPA sys_dskfind         ; 32 SYS_DSKFIND
-    JMPA sys_unimpl          ; 33 — SYS_DSKCREAT (next commit)
+    JMPA sys_dskcreat        ; 33 SYS_DSKCREAT
     JMPA sys_unimpl          ; 34
     JMPA sys_unimpl          ; 35
     JMPA sys_unimpl          ; 36
@@ -394,7 +395,11 @@ shell_loop:
     LOAD_ADDR R6, str_cmd_load
     CALLA match_cmd
     CMPI R1, 1
-    BEQ  do_load
+    BEQ  stor_load
+    LOAD_ADDR R6, str_cmd_save
+    CALLA match_cmd
+    CMPI R1, 1
+    BEQ  stor_save
     LOAD_ADDR R6, str_cmd_reset
     CALLA match_cmd
     CMPI R1, 1
@@ -470,11 +475,6 @@ do_run:
     CMPI R2, 0
     BEQ  shell_syntax
     CALL R1
-    JMPA shell_loop
-
-do_load:
-    LOAD_ADDR R1, str_noload
-    CALLA sys_putstr
     JMPA shell_loop
 
 do_ver:
@@ -633,12 +633,10 @@ str_syntax:
     DB "?SYNTAX ERROR", $0A, 0
 str_badboot:
     DB "?BAD BOOT HEADER", $0A, 0
-str_noload:
-    DB "?LOAD NOT SUPPORTED", $0A, 0
 str_ver:
     DB "FLOMMODORE BIOS V1.0  ROM 16K  GAB-16", $0A, 0
 str_help:
-    DB "MEM POKE PEEK RUN LOAD RESET VER HELP", $0A, 0
+    DB "MEM POKE PEEK RUN LOAD SAVE RESET VER HELP", $0A, 0
 str_cmd_mem:
     DB "MEM", 0
 str_cmd_poke:
@@ -649,6 +647,8 @@ str_cmd_run:
     DB "RUN", 0
 str_cmd_load:
     DB "LOAD", 0
+str_cmd_save:
+    DB "SAVE", 0
 str_cmd_reset:
     DB "RESET", 0
 str_cmd_ver:
