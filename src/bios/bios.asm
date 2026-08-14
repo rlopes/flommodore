@@ -124,6 +124,14 @@
     EQU KBD,      $80020     ; +0 KSTAT +1 KDATA +2 KMOD +3 KCTRL
     EQU JOYP,     $80030     ; +0 JOY1 +1 JOY2 +2 JCTRL
     EQU IRQC,     $80040     ; +0 IRQSTAT +1 IRQMASK +2 IRQACK
+    EQU STOR,     $80050     ; +0 STCMD +1 STSTAT +2 STLBA +3 STBUF +4 STCTRL +5 STERR
+
+    ; FLFS v1 (amendment v1.3 §3): sector 0 volume header, sector 1 the
+    ; directory, sector 2 onward data. Entries are 32 B; name byte $00 ends
+    ; the directory, $E5 marks a deleted slot.
+    EQU FLFS_DIRLBA,  1
+    EQU FLFS_ENTRIES, 16
+    EQU FLFS_ENTSZ,   32
 
     EQU AUR,      $80100     ; voice n at n*$10; master block at +$40
     EQU VIC,      $80200     ; register offsets per Phase 3 §3.8
@@ -219,11 +227,11 @@ ENDMACRO
     JMPA sys_irqset          ; 26 SYS_IRQSET
     JMPA sys_rand            ; 27 SYS_RAND
     JMPA sys_seed            ; 28 SYS_SEED
-    JMPA sys_unimpl          ; 29 — reserved
-    JMPA sys_unimpl          ; 30
-    JMPA sys_unimpl          ; 31
-    JMPA sys_unimpl          ; 32
-    JMPA sys_unimpl          ; 33
+    JMPA sys_dskstat         ; 29 SYS_DSKSTAT
+    JMPA sys_dskread         ; 30 SYS_DSKREAD
+    JMPA sys_dskwrite        ; 31 SYS_DSKWRITE
+    JMPA sys_dskfind         ; 32 SYS_DSKFIND
+    JMPA sys_unimpl          ; 33 — SYS_DSKCREAT (next commit)
     JMPA sys_unimpl          ; 34
     JMPA sys_unimpl          ; 35
     JMPA sys_unimpl          ; 36
@@ -1387,6 +1395,14 @@ memcmp_diff:                 ; flags still hold the byte CMP
 memcmp_gt:
     LI   R1, 1
     RET
+
+; ----------------------------------------------------------------------------
+; Storage syscalls — amendment v1.3 §4.1 (Block 15). Split into its own
+; include the way the font and palette are: bios.asm is 1,650 lines and the
+; storage half of Block 15 is still growing (SYS_DSKCREAT, LOAD, SAVE), so
+; the code that changes lives in a file small enough to reread.
+; ----------------------------------------------------------------------------
+    INCLUDE "storage.inc"
 
 ; Unimplemented / reserved syscall: return with R1 = $FFFF (decision bj —
 ; a caller probing a reserved slot gets a recognisable "no" instead of an
