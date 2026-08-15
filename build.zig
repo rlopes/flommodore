@@ -388,6 +388,24 @@ pub fn build(b: *std.Build) void {
     notes_step.dependOn(&notes_update.step);
 
     // ------------------------------------------------------------------
+    // sndlib (Block 16) — the AUR-1 runtime, assembled once and linked
+    // into anything that wants to make a noise. It INCLUDEs the generated
+    // note table, and flas resolves an include relative to the including
+    // file, so src/lib/notes.inc has to exist in the SOURCE tree before
+    // this runs: hence the explicit dependency on notes_update rather
+    // than a cache path, and has_side_effects to stop Zig caching a run
+    // whose real input it cannot see.
+    // ------------------------------------------------------------------
+    const flas_sndlib_run = b.addRunArtifact(flas_exe);
+    flas_sndlib_run.addFileArg(b.path("src/lib/sndlib.asm"));
+    flas_sndlib_run.addArg("-o");
+    const sndlib_flobj = flas_sndlib_run.addOutputFileArg("sndlib.flobj");
+    flas_sndlib_run.step.dependOn(&notes_update.step);
+    flas_sndlib_run.has_side_effects = true;
+    const sndlib_step = b.step("sndlib", "Assemble src/lib/sndlib.asm");
+    sndlib_step.dependOn(&flas_sndlib_run.step);
+
+    // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
     // Chosen over (a) the official libsdl-org/SDL tarball, which has no
     // build.zig and therefore cannot produce a Zig dependency artifact,
@@ -761,9 +779,36 @@ pub fn build(b: *std.Build) void {
     fll_bhello_run.addArg("-o");
     const bhello_flapp = fll_bhello_run.addOutputFileArg("bios_hello.flapp");
 
+    // sndlib_demo: the first program in the tree linked from TWO objects,
+    // so it is also the first exercise of fll resolving a symbol across an
+    // object boundary. Everything before it linked one object.
+    const flas_snddemo_run = b.addRunArtifact(flas_exe);
+    flas_snddemo_run.addFileArg(b.path("examples/sndlib_demo.asm"));
+    flas_snddemo_run.addArg("-o");
+    const snddemo_flobj = flas_snddemo_run.addOutputFileArg("sndlib_demo.flobj");
+
+    const fll_snddemo_run = b.addRunArtifact(fll_exe);
+    fll_snddemo_run.addFileArg(snddemo_flobj);
+    fll_snddemo_run.addFileArg(sndlib_flobj);
+    fll_snddemo_run.addArg("-s");
+    fll_snddemo_run.addFileArg(b.path("examples/sndlib_demo.flld"));
+    fll_snddemo_run.addArg("-o");
+    const snddemo_flapp = fll_snddemo_run.addOutputFileArg("sndlib_demo.flapp");
+
+    // No --rom: sndlib drives the chip directly, so the demo needs no BIOS.
+    // No --quiet either, yet — the audio hash it prints is what a golden
+    // gets pinned to once this has run once.
+    const snddemo_run = b.addRunArtifact(harness_exe);
+    snddemo_run.addArg("--flapp");
+    snddemo_run.addFileArg(snddemo_flapp);
+    snddemo_run.addArgs(&.{ "--frames", "6", "--expect-pass" });
+    const snddemo_step = b.step("sndtest", "Block 16 e2e: sndlib_demo links, runs, and sounds");
+    snddemo_step.dependOn(&snddemo_run.step);
+
     const examples_update = b.addUpdateSourceFiles();
     examples_update.addCopyFileToSource(hello_flapp, "examples/hello.flapp");
     examples_update.addCopyFileToSource(bhello_flapp, "examples/bios_hello.flapp");
+    examples_update.addCopyFileToSource(snddemo_flapp, "examples/sndlib_demo.flapp");
     const examples_step = b.step("examples", "Build examples/*.flapp (run bios_hello with --rom + --autoboot)");
     examples_step.dependOn(&examples_update.step);
     examples_step.dependOn(&bios_update.step); // bios_hello needs the firmware too
@@ -896,4 +941,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&bhello_run.step); // examples autoboot demo golden
     test_step.dependOn(&storage_rom_run.step); // Block 14 FDD-1 test ROM
     test_step.dependOn(&readback_rom_run.step); // Block 14 AUR-1 readback ROM
+    test_step.dependOn(&snddemo_run.step); // Block 16 sndlib links and sounds
 }
