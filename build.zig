@@ -359,6 +359,35 @@ pub fn build(b: *std.Build) void {
     disk_step.dependOn(&b.addInstallArtifact(fldisk_exe, .{}).step);
 
     // ------------------------------------------------------------------
+    // flsnd — AUR-1 sound bank tool (Block 16). Also the ONE encoder of
+    // pitch: VFREQ is a phase increment, so `flsnd notes` generates the
+    // note table rather than anyone typing 96 hand-computed constants.
+    // `zig build notes` refreshes the gitignored src/lib/notes.inc that
+    // sndlib.asm includes, the same way `zig build bios` refreshes
+    // rom/flommodore.rom.
+    // ------------------------------------------------------------------
+    const flsnd_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/flsnd/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const flsnd_exe = b.addExecutable(.{
+        .name = "flsnd",
+        .root_module = flsnd_module,
+    });
+    b.installArtifact(flsnd_exe);
+    const snd_step = b.step("snd", "Build the flsnd sound bank tool");
+    snd_step.dependOn(&b.addInstallArtifact(flsnd_exe, .{}).step);
+
+    const notes_run = b.addRunArtifact(flsnd_exe);
+    notes_run.addArg("notes");
+    const notes_inc = notes_run.addOutputFileArg("notes.inc");
+    const notes_update = b.addUpdateSourceFiles();
+    notes_update.addCopyFileToSource(notes_inc, "src/lib/notes.inc");
+    const notes_step = b.step("notes", "Generate src/lib/notes.inc (the C0-B7 note table)");
+    notes_step.dependOn(&notes_update.step);
+
+    // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
     // Chosen over (a) the official libsdl-org/SDL tarball, which has no
     // build.zig and therefore cannot produce a Zig dependency artifact,
@@ -846,6 +875,7 @@ pub fn build(b: *std.Build) void {
         asm_objfile_mod,
         asm_listing_mod,
         fldisk_module,
+        flsnd_module,
         lnk_loader_mod,
         lnk_script_mod,
         lnk_resolver_mod,

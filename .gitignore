@@ -20,3 +20,8 @@ rom/flommodore.rom
 # Built example programs (rebuilt by `zig build examples`).
 examples/*.flapp
 examples/*.flsym
+
+# The generated note table (rebuilt by `zig build notes`). VFREQ is a phase
+# increment, so this is derived from one formula in flsnd — checking it in
+# would invite someone to edit the copy instead of the generator.
+src/lib/notes.inc
