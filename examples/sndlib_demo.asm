@@ -3,23 +3,31 @@
 ;
 ;   flommodore examples/sndlib_demo.flapp
 ;
-; Two patches, so the demo covers both halves of the library:
+; Three patches, chosen to reach every branch in snd_tick:
 ;
-;   patch 0  a plain square A4 — snd_load_patch, snd_note_on, snd_note_off
-;   patch 1  a pulse wave with a width sweep and an arpeggio — snd_tick
+;   patch 0  a plain square A4 — load, note on/off, and the all-tables-off
+;            path through snd_tick
+;   patch 1  pulse-width sweep + arpeggio — targets 2 and 1, absolute mode
+;   patch 2  filter sweep + vibrato — targets 3 and 4, DELTA mode, with a
+;            looping table and a one-shot table
 ;
-; Patch 1 is the one that matters. snd_tick is 178 instructions of nested
-; table walking, and without a patch carrying mod tables the audio golden
-; would not touch a single line of it.
+; Patch 2 exists because of what patch 1 cannot reach. Its tables are short
+; enough that neither ever runs past its length, so the loop-point branch
+; and the one-shot hold in tick_advance never execute — and those carry an
+; $FF special case and a length-1 that are the easiest things here to get
+; off by one.
 ;
 ; AND THE DEMO CHECKS THE RESULT, rather than only that it survived. A
 ; $600D and a stable hash prove the program ran and is deterministic; they
-; do not prove the tables walked to the right values. So after the mod
-; frames it reads VPULSE and VFREQ back off the chip and compares them
-; against the values the descriptors imply:
+; do not prove the tables walked to the right values. A table stepping at
+; twice the intended rate would pass both. So after each phase it reads the
+; chip registers back and compares them against values derived from the
+; descriptors:
 ;
-;   table 0, speed 1, absolute, 6 frames -> step 5 -> VPULSE = $C0
-;   table 1, speed 2, absolute, 6 frames -> step 2 -> A3 + 7 = E4 = $01EA
+;   patch 1, 6 frames:  VPULSE = $C0        (speed 1 -> step 5)
+;                       VFREQ  = $01EA      (speed 2 -> step 2, A3+7 = E4)
+;   patch 2, 6 frames:  AFCUT  = $10 / $00  (delta, wraps to loop point 2)
+;                       VFREQ  = $0276      (delta, one-shot holds at -24)
 ;
 ; A mismatch reports its check number at $00084 alongside $0BAD, the same
 ; protocol the generated test ROMs use.
@@ -35,6 +43,7 @@
 
     EQU VIC,  $80200             ; +$17 VSTAT, bit 0 = VBLANK
     EQU AUR1, $80100             ; voice 0 block
+    EQU AURG, $80140             ; AUR-1 globals
 
 MACRO LOAD_ADDR reg, addr
     LI   \reg, (\addr & $FFFF)
@@ -75,7 +84,7 @@ plain_frames:
     LI   R1, 0
     CALLA snd_note_off
 
-    ; ---- patch 1: pulse width sweep + arpeggio ----------------------
+    ; ---- patch 1: pulse width sweep + arpeggio, absolute mode -------
     LI   R11, 13
     LI   R1, 1
     CALLA snd_load_patch
@@ -97,9 +106,6 @@ mod_frames:
     SUBI R6, R6, 1
     BNE  mod_frames
 
-    ; ---- did the tables actually apply? -----------------------------
-    ; Read the registers back rather than trusting the hash. These are
-    ; the values the descriptors imply, not values observed from a run.
     LOAD_ADDR R4, AUR1
     LI   R11, 1
     LB   R1, [R4 + $06]          ; VPULSE — table 0 step 5
@@ -112,6 +118,51 @@ mod_frames:
     LI   R11, 3
     LB   R1, [R4 + $01]          ; VFREQHI
     CMPI R1, $01
+    BNE  fail
+
+    LI   R1, 0
+    CALLA snd_note_off
+
+    ; ---- patch 2: delta mode, a looping table and a one-shot --------
+    LI   R11, 15
+    LI   R1, 2
+    CALLA snd_load_patch
+    CMPI R1, 0
+    BNE  fail
+    LI   R11, 16
+    LI   R1, 0
+    LI   R2, 57                  ; A4 = $028E, the vibrato's centre
+    CALLA snd_note_on
+    CMPI R1, 0
+    BNE  fail
+
+    ; Six frames. The cutoff table (length 4, loop 2) wraps on frame 5;
+    ; the pitch table (length 3, one-shot) holds its last step from frame
+    ; 4 on, so its accumulator keeps falling: 0, -8, -16, -24.
+    LI   R6, 6
+delta_frames:
+    CALLA wait_vblank
+    CALLA snd_tick
+    SUBI R6, R6, 1
+    BNE  delta_frames
+
+    LOAD_ADDR R4, AURG
+    LI   R11, 4
+    LB   R1, [R4 + $06]          ; AFCUTHI — accumulator back down to 16
+    CMPI R1, $10
+    BNE  fail
+    LI   R11, 5
+    LB   R1, [R4 + $05]          ; AFCUTLO — always 0: the byte is the top 8
+    CMPI R1, $00
+    BNE  fail
+    LOAD_ADDR R4, AUR1
+    LI   R11, 6
+    LB   R1, [R4 + $00]          ; VFREQLO — $028E - 24 = $0276
+    CMPI R1, $76
+    BNE  fail
+    LI   R11, 7
+    LB   R1, [R4 + $01]          ; VFREQHI
+    CMPI R1, $02
     BNE  fail
 
     LI   R1, 0
@@ -151,7 +202,7 @@ vb_wait:
     RET
 
 ; ============================================================================
-; An embedded .flsnd bank: two patches, no wavetables, two mod tables.
+; An embedded .flsnd bank: three patches, no wavetables, four mod tables.
 ; Layout per amendment v1.3 §5.3 (header) and §5.2 (patch record).
 ; ============================================================================
     SECTION data
@@ -159,13 +210,12 @@ vb_wait:
 bank:
     DB $46, $53                  ; magic 'F','S'
     DB $01, $00                  ; version 1
-    DB 2                         ; patch count
+    DB 3                         ; patch count
     DB 0                         ; wavetable count
-    DB 2                         ; mod-table count
+    DB 4                         ; mod-table count
     DB 0, 0, 0, 0, 0, 0, 0, 0, 0 ; reserved
 
     ; ================= patch 0 — "DEMO SQUARE" =======================
-    ; voice 0 (+$00)
     DB $00, $00                  ; VFREQ — snd_note_on overwrites this
     DB $01                       ; VWAVE  square
     DB $00                       ; VCTRL  no ring/sync; gate cleared on load
@@ -182,7 +232,6 @@ bank:
     DB $00                       ; reserved
     DS 48                        ; voices 1-3 silent
 
-    ; global block (+$40)
     DB $FF                       ; AMVOL
     DB $0F                       ; AMVOLL
     DB $0F                       ; AMVOLR
@@ -205,7 +254,6 @@ bank:
     DS 32                        ; mod descriptors (+$60) — none
 
     ; ================= patch 1 — "MOD PULSE ARP" =====================
-    ; voice 0 (+$00)
     DB $00, $00                  ; VFREQ
     DB $04                       ; VWAVE  pulse — VPULSE actually matters
     DB $00                       ; VCTRL
@@ -222,7 +270,6 @@ bank:
     DB $00                       ; reserved
     DS 48                        ; voices 1-3 silent
 
-    ; global block (+$40)
     DB $FF                       ; AMVOL
     DB $0F                       ; AMVOLL
     DB $0F                       ; AMVOLR
@@ -246,6 +293,48 @@ bank:
     DB $00, $00, $00, $00, $00, $00, $00, $00   ; 2: off
     DB $00, $00, $00, $00, $00, $00, $00, $00   ; 3: off
 
+    ; ================= patch 2 — "DELTA FILT VIB" ====================
+    DB $00, $00                  ; VFREQ
+    DB $03                       ; VWAVE  sawtooth — plenty for a filter
+    DB $00                       ; VCTRL
+    DB $00                       ; VADSR0 instant attack
+    DB $F4                       ; VADSR1 sustain 15, release idx 4
+    DB $00                       ; VPULSE
+    DB $FF                       ; VVOL
+    DB $00, $00                  ; VMOD
+    DB $00                       ; VFBK
+    DB $00                       ; wavetable slot
+    DB $03                       ; mod mask — tables 0 and 1
+    DB $0F                       ; VVOLR
+    DB $0F                       ; VVOLL
+    DB $00                       ; reserved
+    DS 48                        ; voices 1-3 silent
+
+    DB $FF                       ; AMVOL
+    DB $0F                       ; AMVOLL
+    DB $0F                       ; AMVOLR
+    DB $01                       ; AMVOICE
+    DB $01                       ; AMFILT — voice 0 through the filter
+    DB $00, $00                  ; AFCUT — the delta table drives it from 0
+    DB $04                       ; AFRESON
+    DB $00                       ; AFMODE low-pass
+    DB $00                       ; ASRATE
+    DB $00                       ; AIRQEN
+    DB $00                       ; architecture: 4x mono
+    DB $00                       ; transpose
+    DB $01                       ; tick divider
+    DB $00                       ; flags
+    DB $00                       ; reserved
+    DB "DELTA FILT VIB  "        ; name (+$50)
+
+    ; Both tables are delta mode, and both exercise an end-of-table rule
+    ; that patch 1 never reaches: table 0 wraps to a loop point, table 1
+    ; is one-shot and holds its last step.
+    DB $03, $02, $04, $02, $01, $01, $00, $00   ; 0: cutoff, loop to step 2
+    DB $04, $03, $03, $FF, $01, $01, $00, $00   ; 1: pitch, one-shot
+    DB $00, $00, $00, $00, $00, $00, $00, $00   ; 2: off
+    DB $00, $00, $00, $00, $00, $00, $00, $00   ; 3: off
+
     ; ================= mod tables (32 bytes each) ====================
     ; slot 0 — pulse duty, unsigned in absolute mode (SND-d): a sweep out
     ; to nearly square and back, which is audible as a widening tone.
@@ -255,3 +344,11 @@ bank:
     ; plus the octave. Signed in absolute mode, but all four are positive.
     DB $00, $04, $07, $0C
     DS 28
+    ; slot 2 — cutoff deltas. Always signed in delta mode, so $F8 is -8:
+    ; up, up, down, hold — then the loop point sends it round from step 2.
+    DB $10, $10, $F8, $00
+    DS 28
+    ; slot 3 — pitch deltas: up, up, down. One-shot, so once the table
+    ; ends the last step repeats and the accumulator keeps falling.
+    DB $04, $04, $F8
+    DS 29
