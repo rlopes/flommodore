@@ -12,9 +12,17 @@
 ; table walking, and without a patch carrying mod tables the audio golden
 ; would not touch a single line of it.
 ;
-; Reports through the $00080 = $600D test-ROM protocol, so the headless
-; harness asserts both that it ran and — via the audio golden — that the
-; right sound came out.
+; AND THE DEMO CHECKS THE RESULT, rather than only that it survived. A
+; $600D and a stable hash prove the program ran and is deterministic; they
+; do not prove the tables walked to the right values. So after the mod
+; frames it reads VPULSE and VFREQ back off the chip and compares them
+; against the values the descriptors imply:
+;
+;   table 0, speed 1, absolute, 6 frames -> step 5 -> VPULSE = $C0
+;   table 1, speed 2, absolute, 6 frames -> step 2 -> A3 + 7 = E4 = $01EA
+;
+; A mismatch reports its check number at $00084 alongside $0BAD, the same
+; protocol the generated test ROMs use.
 ;
 ; Built from TWO objects, its own and sndlib.flobj, so it is also the
 ; tree's exercise of fll resolving symbols across an object boundary.
@@ -25,7 +33,8 @@
 
     SECTION code
 
-    EQU VIC, $80200              ; +$17 VSTAT, bit 0 = VBLANK
+    EQU VIC,  $80200             ; +$17 VSTAT, bit 0 = VBLANK
+    EQU AUR1, $80100             ; voice 0 block
 
 MACRO LOAD_ADDR reg, addr
     LI   \reg, (\addr & $FFFF)
@@ -36,6 +45,7 @@ start:
     LI   R1, $1100
     MOV  SP, R1                  ; the D12 boot stack; sndlib pushes
 
+    LI   R11, 10
     LI   R1, (bank & $FFFF)
     LUI  R1, (bank >> 16)
     CALLA snd_init
@@ -43,10 +53,12 @@ start:
     BNE  fail
 
     ; ---- patch 0: a plain square A4 ---------------------------------
+    LI   R11, 11
     LI   R1, 0
     CALLA snd_load_patch
     CMPI R1, 0
     BNE  fail
+    LI   R11, 12
     LI   R1, 0                   ; voice 0
     LI   R2, 57                  ; A4 — note 57, $028E at ASRATE 0. A
     CALLA snd_note_on            ; literal: EQUs do not cross object files
@@ -64,10 +76,12 @@ plain_frames:
     CALLA snd_note_off
 
     ; ---- patch 1: pulse width sweep + arpeggio ----------------------
+    LI   R11, 13
     LI   R1, 1
     CALLA snd_load_patch
     CMPI R1, 0
     BNE  fail
+    LI   R11, 14
     LI   R1, 0
     LI   R2, 45                  ; A3, so the arpeggio has room above it
     CALLA snd_note_on
@@ -83,6 +97,23 @@ mod_frames:
     SUBI R6, R6, 1
     BNE  mod_frames
 
+    ; ---- did the tables actually apply? -----------------------------
+    ; Read the registers back rather than trusting the hash. These are
+    ; the values the descriptors imply, not values observed from a run.
+    LOAD_ADDR R4, AUR1
+    LI   R11, 1
+    LB   R1, [R4 + $06]          ; VPULSE — table 0 step 5
+    CMPI R1, $C0
+    BNE  fail
+    LI   R11, 2
+    LB   R1, [R4 + $00]          ; VFREQLO — E4 = $01EA
+    CMPI R1, $EA
+    BNE  fail
+    LI   R11, 3
+    LB   R1, [R4 + $01]          ; VFREQHI
+    CMPI R1, $01
+    BNE  fail
+
     LI   R1, 0
     CALLA snd_note_off
     CALLA wait_vblank            ; let the release start before we halt
@@ -94,6 +125,7 @@ parked:
     JMPA parked                  ; a late IRQ wakes HLT; re-park
 
 fail:
+    SW   [R0 + $84], R11         ; which check
     LI   R11, $0BAD
     SW   [R0 + $80], R11
 fail_parked:
