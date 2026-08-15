@@ -59,16 +59,27 @@ fn writeNoteTable(w: *std.Io.Writer) !void {
         \\; reg = round(Hz * 65536 / 44100), so this table is valid ONLY at
         \\; ASRATE 0; rates 1 and 2 transpose everything down an octave or two.
         \\;
-        \\; Resolution is the thing to watch in the bottom octave. One LSB spans
-        \\; {d:.0} cents at C0 against {d:.1} cents at A4, so the low notes are
-        \\; coarse: worst tuning error over the whole table is {d:.1} cents, all of
-        \\; it below C2. From C2 up every note is within 4 cents, which is
-        \\; inaudible. C0-C1 are usable for bass but audibly tempered.
+        \\; Resolution is the thing to watch at the bottom. One LSB is a fixed
+        \\; frequency step against a doubling pitch, so the error halves each
+        \\; octave: it spans {d:.0} cents at C0 against {d:.1} cents at A4.
+        \\;
+        \\; Worst tuning error per octave, computed from this table:
+        \\;   C0 {d:>4.1}   C1 {d:>4.1}   C2 {d:>4.1}   C3 {d:>4.1}
+        \\;   C4 {d:>4.1}   C5 {d:>4.1}   C6 {d:>4.1}   C7 {d:>4.1}   cents
+        \\;
+        \\; C0-C1 are usable for bass but audibly tempered; C2 sits about at the
+        \\; threshold of noticeable; from C3 up nothing exceeds 4 cents.
         \\; ============================================================================
         \\
         \\note_table:
         \\
-    , .{ centsPerLsb(0), centsPerLsb(a4_index), worstCents() });
+    , .{
+        centsPerLsb(0),        centsPerLsb(a4_index),
+        worstCentsInOctave(0), worstCentsInOctave(1),
+        worstCentsInOctave(2), worstCentsInOctave(3),
+        worstCentsInOctave(4), worstCentsInOctave(5),
+        worstCentsInOctave(6), worstCentsInOctave(7),
+    });
 
     var octave: u32 = 0;
     while (octave < note_count / 12) : (octave += 1) {
@@ -99,6 +110,16 @@ fn centsPerLsb(index: u32) f64 {
     const r = noteReg(index);
     if (r == 0) return 0;
     return 1200.0 * std.math.log2(@as(f64, @floatFromInt(r + 1)) / @as(f64, @floatFromInt(r)));
+}
+
+fn worstCentsInOctave(octave: u32) f64 {
+    var worst: f64 = 0;
+    var n: u32 = 0;
+    while (n < 12) : (n += 1) {
+        const c = @abs(centsError(octave * 12 + n));
+        if (c > worst) worst = c;
+    }
+    return worst;
 }
 
 fn worstCents() f64 {
@@ -289,11 +310,24 @@ test "flsnd: the table is monotonic and spans the audible range" {
 test "flsnd: tuning error is bounded, and concentrated in the bottom octaves" {
     // The whole table is within a quarter tone…
     try testing.expect(worstCents() < 25.0);
-    // …but that error lives at the bottom: from C2 up nothing exceeds
-    // 4 cents, which is inaudible.
-    var i: u32 = 24; // C2
+    // …and the error falls off as a gradient, roughly halving per octave,
+    // because one LSB is a fixed frequency step against a doubling pitch.
+    //
+    // Stated per octave on purpose. The first version of this test asserted
+    // a single "from C2 up, within 4 cents" bound taken from spot-checking
+    // C2 and C3 — but octave 2 peaks at 6.6 cents on E2, so the claim was
+    // false and the generated header repeated it. Measure each octave.
+    try testing.expect(worstCentsInOctave(0) < 24.0);
+    try testing.expect(worstCentsInOctave(1) < 17.0);
+    try testing.expect(worstCentsInOctave(2) < 7.0);
+    var i: u32 = 36; // C3 — the first octave that is genuinely inaudible
     while (i < note_count) : (i += 1) {
         try testing.expect(@abs(centsError(i)) < 4.0);
+    }
+    // Monotonic improvement: no octave is worse than the one below it.
+    var o: u32 = 1;
+    while (o < 8) : (o += 1) {
+        try testing.expect(worstCentsInOctave(o) <= worstCentsInOctave(o - 1));
     }
     // C0 is the coarse one: one LSB there spans most of a semitone, which
     // is why sndlib documents C0-C1 as tempered rather than accurate.
