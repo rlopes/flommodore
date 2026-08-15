@@ -1,66 +1,91 @@
 ; ============================================================================
-; sndlib_demo.asm — the smallest program that links sndlib (Block 16, 16.8).
+; sndlib_demo.asm — the program that exercises sndlib (Block 16, 16.8).
 ;
 ;   flommodore examples/sndlib_demo.flapp
 ;
-; Plays A4 on voice 0 through a square-wave patch, holds it, releases it,
-; and reports through the $00080 = $600D test-ROM protocol so the headless
-; harness can assert it end to end.
+; Two patches, so the demo covers both halves of the library:
 ;
-; This is the first program in the tree built from TWO objects — its own
-; and sndlib.flobj — so it is also the first real exercise of fll's
-; cross-object symbol resolution. Everything before it linked one object
-; against a script.
+;   patch 0  a plain square A4 — snd_load_patch, snd_note_on, snd_note_off
+;   patch 1  a pulse wave with a width sweep and an arpeggio — snd_tick
 ;
-; The bank is embedded rather than loaded from disk on purpose: the point
-; here is that sndlib works, not that storage does, and an embedded bank
-; keeps the audio hash a pure function of the program.
+; Patch 1 is the one that matters. snd_tick is 178 instructions of nested
+; table walking, and without a patch carrying mod tables the audio golden
+; would not touch a single line of it.
 ;
-; No BIOS needed — sndlib talks to the AUR-1 directly — so this runs as a
-; bare .flapp with no --rom.
+; Reports through the $00080 = $600D test-ROM protocol, so the headless
+; harness asserts both that it ran and — via the audio golden — that the
+; right sound came out.
+;
+; Built from TWO objects, its own and sndlib.flobj, so it is also the
+; tree's exercise of fll resolving symbols across an object boundary.
+;
+; No BIOS: sndlib drives the AUR-1 directly and the frame edge comes from
+; polling the VIC's own VSTAT, so this runs as a bare .flapp with no --rom.
 ; ============================================================================
 
     SECTION code
+
+    EQU VIC, $80200              ; +$17 VSTAT, bit 0 = VBLANK
+
+MACRO LOAD_ADDR reg, addr
+    LI   \reg, (\addr & $FFFF)
+    LUI  \reg, (\addr >> 16)
+ENDMACRO
 
 start:
     LI   R1, $1100
     MOV  SP, R1                  ; the D12 boot stack; sndlib pushes
 
-    ; snd_init validates the bank magic and silences the chip.
     LI   R1, (bank & $FFFF)
     LUI  R1, (bank >> 16)
     CALLA snd_init
     CMPI R1, 0
     BNE  fail
 
-    LI   R1, 0                   ; patch 0 — "DEMO SQUARE"
+    ; ---- patch 0: a plain square A4 ---------------------------------
+    LI   R1, 0
     CALLA snd_load_patch
     CMPI R1, 0
     BNE  fail
-
-    ; Note 57 is A4 = $028E at ASRATE 0. Spelled as a literal because EQUs
-    ; do not cross object files: NOTE_A4 lives in sndlib's translation
-    ; unit, not this one.
     LI   R1, 0                   ; voice 0
-    LI   R2, 57
-    CALLA snd_note_on
+    LI   R2, 57                  ; A4 — note 57, $028E at ASRATE 0. A
+    CALLA snd_note_on            ; literal: EQUs do not cross object files
     CMPI R1, 0
     BNE  fail
 
-    ; Hold ~120k cycles, half a frame — long past the 2 ms attack.
-    LI   R5, 60000
-hold:
-    SUBI R5, R5, 1
-    BNE  hold
+    LI   R6, 2
+plain_frames:
+    CALLA wait_vblank
+    CALLA snd_tick               ; no tables armed — the all-off path
+    SUBI R6, R6, 1
+    BNE  plain_frames
 
     LI   R1, 0
     CALLA snd_note_off
 
-    ; Let the 114 ms release run out before the hash is taken.
-    LI   R5, 60000
-release:
-    SUBI R5, R5, 1
-    BNE  release
+    ; ---- patch 1: pulse width sweep + arpeggio ----------------------
+    LI   R1, 1
+    CALLA snd_load_patch
+    CMPI R1, 0
+    BNE  fail
+    LI   R1, 0
+    LI   R2, 45                  ; A3, so the arpeggio has room above it
+    CALLA snd_note_on
+    CMPI R1, 0
+    BNE  fail
+
+    ; Six frames: the width table (speed 1) walks six of its eight steps
+    ; and the arpeggio (speed 2) walks three of its four.
+    LI   R6, 6
+mod_frames:
+    CALLA wait_vblank
+    CALLA snd_tick
+    SUBI R6, R6, 1
+    BNE  mod_frames
+
+    LI   R1, 0
+    CALLA snd_note_off
+    CALLA wait_vblank            ; let the release start before we halt
 
     LI   R11, $600D
     SW   [R0 + $80], R11
@@ -75,8 +100,26 @@ fail_parked:
     HLT
     JMPA fail_parked
 
+; ----------------------------------------------------------------------------
+; wait_vblank — block until the next 0->1 edge of VSTAT bit 0. Drains any
+; blank already in progress first, so two calls in a row are two frames
+; rather than one. The same shape as SYS_VBLANK, open-coded because this
+; program has no BIOS. Clobbers R4, R12.
+; ----------------------------------------------------------------------------
+wait_vblank:
+    LOAD_ADDR R4, VIC
+vb_drain:
+    LW   R12, [R4 + $17]
+    ANDI R12, R12, 1
+    BNE  vb_drain                ; still blanking — wait for line 0
+vb_wait:
+    LW   R12, [R4 + $17]
+    ANDI R12, R12, 1
+    BEQ  vb_wait                 ; drawing — wait for the blank to start
+    RET
+
 ; ============================================================================
-; An embedded .flsnd bank: one patch, no wavetables, no mod tables.
+; An embedded .flsnd bank: two patches, no wavetables, two mod tables.
 ; Layout per amendment v1.3 §5.3 (header) and §5.2 (patch record).
 ; ============================================================================
     SECTION data
@@ -84,12 +127,13 @@ fail_parked:
 bank:
     DB $46, $53                  ; magic 'F','S'
     DB $01, $00                  ; version 1
-    DB 1                         ; patch count
+    DB 2                         ; patch count
     DB 0                         ; wavetable count
-    DB 0                         ; mod-table count
+    DB 2                         ; mod-table count
     DB 0, 0, 0, 0, 0, 0, 0, 0, 0 ; reserved
 
-    ; --- patch 0: voice block 0 (+$00) --------------------------------
+    ; ================= patch 0 — "DEMO SQUARE" =======================
+    ; voice 0 (+$00)
     DB $00, $00                  ; VFREQ — snd_note_on overwrites this
     DB $01                       ; VWAVE  square
     DB $00                       ; VCTRL  no ring/sync; gate cleared on load
@@ -100,15 +144,13 @@ bank:
     DB $00, $00                  ; VMOD   no FM
     DB $00                       ; VFBK
     DB $00                       ; wavetable slot (unused by a square)
-    DB $00                       ; mod mask
+    DB $00                       ; mod mask — no tables drive this voice
     DB $0F                       ; VVOLR  centre pan
     DB $0F                       ; VVOLL
     DB $00                       ; reserved
+    DS 48                        ; voices 1-3 silent
 
-    ; --- voices 1-3: silent (+$10, +$20, +$30) ------------------------
-    DS 48
-
-    ; --- global block (+$40) ------------------------------------------
+    ; global block (+$40)
     DB $FF                       ; AMVOL
     DB $0F                       ; AMVOLL
     DB $0F                       ; AMVOLR
@@ -127,9 +169,57 @@ bank:
     DB $01                       ; tick divider
     DB $00                       ; flags
     DB $00                       ; reserved
+    DB "DEMO SQUARE     "        ; name (+$50)
+    DS 32                        ; mod descriptors (+$60) — none
 
-    ; --- name (+$50), 16 bytes ----------------------------------------
-    DB "DEMO SQUARE     "
+    ; ================= patch 1 — "MOD PULSE ARP" =====================
+    ; voice 0 (+$00)
+    DB $00, $00                  ; VFREQ
+    DB $04                       ; VWAVE  pulse — VPULSE actually matters
+    DB $00                       ; VCTRL
+    DB $00                       ; VADSR0 instant attack
+    DB $F4                       ; VADSR1 sustain 15, release idx 4
+    DB $80                       ; VPULSE 50% to start; table 0 sweeps it
+    DB $FF                       ; VVOL
+    DB $00, $00                  ; VMOD
+    DB $00                       ; VFBK
+    DB $00                       ; wavetable slot
+    DB $03                       ; mod mask — tables 0 and 1 drive voice 0
+    DB $0F                       ; VVOLR
+    DB $0F                       ; VVOLL
+    DB $00                       ; reserved
+    DS 48                        ; voices 1-3 silent
 
-    ; --- mod-table descriptors (+$60), 4 x 8 bytes --------------------
-    DS 32
+    ; global block (+$40)
+    DB $FF                       ; AMVOL
+    DB $0F                       ; AMVOLL
+    DB $0F                       ; AMVOLR
+    DB $01                       ; AMVOICE
+    DB $00                       ; AMFILT
+    DB $00, $00                  ; AFCUT
+    DB $00                       ; AFRESON
+    DB $00                       ; AFMODE
+    DB $00                       ; ASRATE
+    DB $00                       ; AIRQEN
+    DB $00                       ; architecture: 4x mono
+    DB $00                       ; transpose
+    DB $01                       ; tick divider — every frame
+    DB $00                       ; flags
+    DB $00                       ; reserved
+    DB "MOD PULSE ARP   "        ; name (+$50)
+
+    ; mod descriptors (+$60): target, slot, length, loop, speed, mode, 0, 0
+    DB $02, $00, $08, $00, $01, $00, $00, $00   ; 0: pulse width, every frame
+    DB $01, $01, $04, $00, $02, $00, $00, $00   ; 1: arpeggio, every 2nd
+    DB $00, $00, $00, $00, $00, $00, $00, $00   ; 2: off
+    DB $00, $00, $00, $00, $00, $00, $00, $00   ; 3: off
+
+    ; ================= mod tables (32 bytes each) ====================
+    ; slot 0 — pulse duty, unsigned in absolute mode (SND-d): a sweep out
+    ; to nearly square and back, which is audible as a widening tone.
+    DB $20, $40, $60, $80, $A0, $C0, $A0, $60
+    DS 24
+    ; slot 1 — arpeggio semitones over the sounding note: a major triad
+    ; plus the octave. Signed in absolute mode, but all four are positive.
+    DB $00, $04, $07, $0C
+    DS 28
