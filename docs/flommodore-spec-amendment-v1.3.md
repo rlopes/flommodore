@@ -1,6 +1,6 @@
 # Flommodore — Phase 9 Specification Amendments (v1.3)
 
-**Status: PROPOSED (rev. 4 — corrections folded back from the reference implementation,
+**Status: PROPOSED (rev. 5 — corrections folded back from the reference implementation,
 marked ⟲; D57 reversed on the strength of the task-13.4 measurement) — supersedes the
 listed sections of the v1.1 document set upon acceptance. Amendments v1.1 (Block 0) and v1.2 (Block 3) remain LOCKED and in force
 except where explicitly amended here.**
@@ -31,7 +31,7 @@ wins.
 | D55 | Filesystem FLFS v1 | Sector 0 = volume header, sector 1 = 16-entry directory, sector 2+ = data |
 | D56 ⟲ | Storage syscalls | Ids 29–33: `SYS_DSKSTAT`, `SYS_DSKREAD`, `SYS_DSKWRITE`, `SYS_DSKFIND`, `SYS_DSKCREAT` |
 | D57 ⟲ | `SAVE` residency | **Reversed.** Both `LOAD` and `SAVE` join the BIOS shell, and directory allocation lives in kernel ROM as `SYS_DSKCREAT` — one allocator, not one per application |
-| D58 | `.flsnd` patch scope | A patch is **whole-chip state**: its first 80 bytes are a byte image of `$80100–$8014F` |
+| D58 ⟲ | `.flsnd` patch scope | A patch is **whole-chip state**: its first **75** bytes are a byte image of `$80100–$8014A`, and the five after it are metadata occupying non-loadable register slots |
 
 ---
 
@@ -408,16 +408,28 @@ matters more than the slack suggests.
 
 ### 5.1 Design property
 
-A patch's first 80 bytes are a **byte image of `$80100 – $8014F`** — the four voice
-blocks and the global block — with three substitutions. Loading a patch is a block copy
-plus a short fix-up list, which is what keeps a player routine small enough to be
-obviously correct.
+A patch's first 80 bytes follow the chip's own register layout — the four voice blocks
+and the global block — so loading a patch is a block copy plus a short fix-up list, which
+is what keeps a player routine small enough to be obviously correct.
+
+⟲ **How much of it is genuinely a chip image.** Rev. 1 of this section said all 80 bytes
+were an image of `$80100 – $8014F`. That was true when it was written and stopped being
+true three sections earlier in the same document: §1.2 assigned `AOSCSEL` to `$8014C`,
+which is exactly where §5.2 puts the patch's transpose byte. A 16-byte copy of the global
+block would write transpose into `AOSCSEL` and silently redirect the oscilloscope.
+
+The image therefore ends at `$8014A`: **75 bytes copied**, and five more read as patch
+metadata. Only `$8014D`/`$8014E` are read-only enough that copying onto them would have
+been harmless; `AOSCSEL` is writable, which is what makes this a defect rather than an
+untidiness. Nothing in the layout moves — the extent of the image was simply overstated.
+`sndlib.asm`'s `snd_load_patch` implements the corrected form.
 
 ### 5.2 Patch record — 128 bytes
 
 ```
 +$00 .. +$3F   4 × 16-byte voice blocks   (image of $80100–$8013F)
-+$40 .. +$4F   global block               (image of $80140–$8014F)
++$40 .. +$4A   global block               (image of $80140–$8014A)
++$4B .. +$4F   patch metadata             (NOT chip registers — see below)
 +$50 .. +$5F   name, 16 ASCII bytes, space-padded
 +$60 .. +$7F   4 × 8-byte mod-table descriptors
 ```
@@ -439,16 +451,18 @@ obviously correct.
 | `+D` `+E` | `VVOLR` `VVOLL` | Pan |
 | `+F` | — | Reserved, zero |
 
-**Global block** — chip layout, `+B` repurposed because `ASTAT` is write-1-to-clear and
-is never loaded:
+**Global block** — ⟲ only `+0` … `+A` are loaded. The last five bytes sit on registers a
+loader must not write: `ASTAT` is write-1-to-clear, `AOSCSEL` is live readback state
+owned by whoever is watching the scope, and `AOSC`/`AENV` are read-only.
 
 | Off | Chip register | Patch meaning |
 |---|---|---|
-| `+0` … `+A` | `AMVOL` … `AIRQEN` | Loaded verbatim |
-| `+B` | ~~`ASTAT`~~ | **Architecture**: 0 = 4 × mono, 1 = FM pair 0+1 plus mono 2 and 3, 2 = two FM pairs |
-| `+C` | — | **Transpose**, signed semitones |
-| `+D` | — | **Tick divider** — mod tables advance every N frames (1 = 60 Hz) |
-| `+E` `+F` | — | Flags, reserved |
+| `+0` … `+A` | `AMVOL` … `AIRQEN` | Loaded verbatim — the chip image ends here |
+| `+B` | ~~`ASTAT`~~ (w1c) | **Architecture**: 0 = 4 × mono, 1 = FM pair 0+1 plus mono 2 and 3, 2 = two FM pairs |
+| `+C` | ~~`AOSCSEL`~~ (RW) | **Transpose**, signed semitones — **never written to the chip** (§1.2) |
+| `+D` | ~~`AOSC`~~ (RO) | **Tick divider** — mod tables advance every N frames (1 = 60 Hz) |
+| `+E` | ~~`AENV`~~ (RO) | Flags |
+| `+F` | — | Reserved, zero |
 
 **Mod-table descriptor** — 8 bytes:
 
@@ -547,6 +561,9 @@ Recorded at their use sites in the manner of `AUR-a`–`AUR-j`; candidates for v
 | `STO-e` | `storage.zig` | The write-protect status bit only shows with media present |
 | `STO-f` | `storage.zig` | `STCTRL` bit 0 is sampled at completion, per the §5.5 gate model |
 | `STO-g` | `storage.zig` | Validation happens at completion, not acceptance |
+| `SND-a` ⟲ | `sndlib.asm` | The global-block image ends at `+$0A`; the last five bytes are metadata (D58) |
+| `SND-b` | `sndlib.asm` | The gate bit is masked off on load — loading a patch must not sound it |
+| `SND-c` | `sndlib.asm` | `snd_stop_all` releases gates without tearing down the mix, so the next note needs no reload |
 
 ---
 
@@ -581,7 +598,7 @@ Continuing the v1.2 §3 list:
 | D55 | `LOAD name` requires a name-to-sector mapping; anything more than a flat contiguous directory is a filesystem phase, not this |
 | D56 | Phase 6 §6.4 reserves ids 29–63; storage is the first claim on them |
 | D57 ⟲ | Task 13.4 measured 3,919 bytes free against a ~1.1 KB need, removing the only real objection — and allocation is common to every writer, not specific to any |
-| D58 | The AUR-1's cross-voice features — shared filter, previous-voice ring and sync, fixed FM pairs — make per-voice presets incoherent |
+| D58 ⟲ | The AUR-1's cross-voice features — shared filter, previous-voice ring and sync, fixed FM pairs — make per-voice presets incoherent. The image extent was corrected when `snd_load_patch` was written: §1.2 had claimed `$8014C` for `AOSCSEL` after §5.2 had already spent it |
 
 ---
 
