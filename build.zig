@@ -340,6 +340,25 @@ pub fn build(b: *std.Build) void {
     lnk_step.dependOn(&b.addInstallArtifact(fll_exe, .{}).step);
 
     // ------------------------------------------------------------------
+    // fldisk — FLFS volume tool (Block 15 follow-up). Nothing else can
+    // format a volume: the BIOS allocates files but never formats, so an
+    // unformatted image reports a total-sector count of zero and every
+    // SAVE fails against it. CI cannot test storage at all without this.
+    // ------------------------------------------------------------------
+    const fldisk_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/fldisk/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fldisk_exe = b.addExecutable(.{
+        .name = "fldisk",
+        .root_module = fldisk_module,
+    });
+    b.installArtifact(fldisk_exe);
+    const disk_step = b.step("disk", "Build the fldisk FLFS volume tool");
+    disk_step.dependOn(&b.addInstallArtifact(fldisk_exe, .{}).step);
+
+    // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
     // Chosen over (a) the official libsdl-org/SDL tarball, which has no
     // build.zig and therefore cannot produce a Zig dependency artifact,
@@ -540,6 +559,45 @@ pub fn build(b: *std.Build) void {
     genroms_run.has_side_effects = true;
     const genroms_step = b.step("genroms", "Generate test ROMs into tests/roms/");
     genroms_step.dependOn(&genroms_run.step);
+
+    // ------------------------------------------------------------------
+    // Block 14 acceptance (task 14.7): the FDD-1 and AUR-1 readback test
+    // ROMs, run through the harness under the $600D protocol.
+    //
+    // test_storage.rom needs media, so fldisk formats a fresh volume into
+    // the build cache first. Fresh matters: the ROM WRITES to sector 1 to
+    // test the write path, which lands on the FLFS directory and leaves
+    // the volume unparseable — fine for a fixture that exists only to be
+    // written to, but it must never be reused or listed afterwards.
+    // (Both runs mutate or read source-tree artifacts, hence
+    // has_side_effects.)
+    // ------------------------------------------------------------------
+    const fixture_run = b.addRunArtifact(fldisk_exe);
+    fixture_run.addArg("create");
+    const disk_fixture = fixture_run.addOutputFileArg("test.fldisk");
+    fixture_run.addArgs(&.{ "--sectors", "64", "--label", "TESTDISK" });
+
+    const storage_rom_run = b.addRunArtifact(harness_exe);
+    storage_rom_run.addArg("--rom");
+    storage_rom_run.addArg(b.pathFromRoot("tests/roms/test_storage.rom"));
+    storage_rom_run.addArg("--disk");
+    storage_rom_run.addFileArg(disk_fixture);
+    storage_rom_run.addArgs(&.{ "--expect-pass", "--quiet" });
+    storage_rom_run.step.dependOn(&genroms_run.step);
+    storage_rom_run.has_side_effects = true;
+
+    // The readback ROM needs no disk — just enough cycles for a 2 ms
+    // attack (~29k) plus a 300 ms release sampled partway (~40k more).
+    const readback_rom_run = b.addRunArtifact(harness_exe);
+    readback_rom_run.addArg("--rom");
+    readback_rom_run.addArg(b.pathFromRoot("tests/roms/test_aur_readback.rom"));
+    readback_rom_run.addArgs(&.{ "--max-cycles", "400000", "--expect-pass", "--quiet" });
+    readback_rom_run.step.dependOn(&genroms_run.step);
+    readback_rom_run.has_side_effects = true;
+
+    const storage_step = b.step("storagetest", "Block 14 e2e: FDD-1 + AUR-1 readback test ROMs");
+    storage_step.dependOn(&storage_rom_run.step);
+    storage_step.dependOn(&readback_rom_run.step);
 
     // ------------------------------------------------------------------
     // Block 10 e2e acceptance: assemble the .asm rewrite of test_cpu_alu
@@ -787,6 +845,7 @@ pub fn build(b: *std.Build) void {
         asm_codegen_mod,
         asm_objfile_mod,
         asm_listing_mod,
+        fldisk_module,
         lnk_loader_mod,
         lnk_script_mod,
         lnk_resolver_mod,
@@ -805,4 +864,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&syscheck_run.step); // Block 12 syscalls/shell/autoboot
     test_step.dependOn(&bootgolden_run.step); // Block 12 golden boot frame
     test_step.dependOn(&bhello_run.step); // examples autoboot demo golden
+    test_step.dependOn(&storage_rom_run.step); // Block 14 FDD-1 test ROM
+    test_step.dependOn(&readback_rom_run.step); // Block 14 AUR-1 readback ROM
 }
