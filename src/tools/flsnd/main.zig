@@ -77,8 +77,18 @@ fn writeNoteTable(w: *std.Io.Writer) !void {
         while (n < 12) : (n += 1) {
             const i = octave * 12 + n;
             const r = noteReg(i);
-            try w.print("    DW ${X:0>4}    ; {s}{d}  {d:>7.2} Hz -> {d:>7.2} Hz  {d:+5.1} cents\n", .{
-                r, note_names[n], octave, noteHz(i), actualHz(r), centsError(i),
+            // Zig's format spec has no '+' sign flag — after ':' it wants
+            // [fill][alignment][width].[precision] — so the sign is written
+            // by hand rather than borrowed from printf.
+            const err = centsError(i);
+            try w.print("    DW ${X:0>4}    ; {s}{d}  {d:>7.2} Hz -> {d:>7.2} Hz  {s}{d:>4.1} cents\n", .{
+                r,
+                note_names[n],
+                octave,
+                noteHz(i),
+                actualHz(r),
+                if (err < 0) "-" else "+",
+                @abs(err),
             });
         }
     }
