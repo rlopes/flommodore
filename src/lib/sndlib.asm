@@ -1,5 +1,5 @@
 ; ============================================================================
-; sndlib.asm — the Flommodore AUR-1 runtime (Block 16, tasks 16.2-16.3).
+; sndlib.asm — the Flommodore AUR-1 runtime (Block 16, tasks 16.2-16.4).
 ;
 ; A relocatable library, not a program: assemble with flas, link into any
 ; .flapp alongside your own code. Every label here is a global symbol, so a
@@ -18,7 +18,7 @@
 ;   snd_note_on(R1 = voice, R2 = note)
 ;   snd_note_off(R1 = voice)
 ;   snd_stop_all()
-;   snd_tick()                      mod tables — task 16.4, next commit
+;   snd_tick()                      advance the mod tables, once a frame
 ;
 ; ----------------------------------------------------------------------------
 ; THE GLOBAL BLOCK IS 11 BYTES, NOT 16 — a correction to amendment v1.3.
@@ -40,7 +40,7 @@
 ; Only $8014D/$8014E are read-only enough to make a blind copy harmless.
 ; So: copy +$00..+$0A, and read the last five as patch metadata. The claim
 ; to fix in the amendment is the extent of the image, not the layout —
-; nothing moves, the sentence was just wrong past +$0A.
+; nothing moves, the sentence was just wrong past +$0A. (Fixed in rev. 5.)
 ;
 ; The voice blocks have the same shape for a different reason: +$0B/+$0C
 ; hold a wavetable SLOT, which has to be resolved to an address, and +$03's
@@ -73,8 +73,8 @@ ENDMACRO
 
 ; ----------------------------------------------------------------------------
 ; snd_init (R1 = .flsnd bank base) — validate the bank, remember where its
-; wavetable pool starts, and leave the chip silent. R1 <- 0, or $FFFF if the
-; bank is not a v1 .flsnd. Clobbers R1-R4, R12.
+; wavetable and mod-table pools start, and leave the chip silent. R1 <- 0,
+; or $FFFF if the bank is not a v1 .flsnd. Clobbers R1-R4, R12.
 ; ----------------------------------------------------------------------------
 snd_init:
     PUSH LR
@@ -108,6 +108,23 @@ snd_init:
     SHR  R1, R1, R12
     LOAD_ADDR R4, snd_wtdiv16
     SW   [R4], R1
+
+    ; Mod tables follow the wavetables: bank + 16 + patches*128 +
+    ; wavetables*256. Kept as a plain address — nothing divides it.
+    LB   R1, [R5 + 4]            ; patch count
+    LI   R12, 128
+    MUL  R1, R1, R12
+    ADDI R1, R1, 16
+    LB   R12, [R5 + 5]           ; wavetable count
+    LI   R2, 256
+    MUL  R12, R12, R2
+    ADD  R1, R1, R12
+    ADD  R1, R1, R5
+    LOAD_ADDR R4, snd_modbase
+    SW   [R4], R1
+    LI   R12, 16
+    SHR  R1, R1, R12
+    SW   [R4 + 2], R1
 
     CALLA snd_silence
     LI   R1, 0
@@ -254,6 +271,27 @@ ld_tickdiv:
     SW   [R4], R2
     SW   [R4 + 2], R0            ; restart the frame counter
 
+    ; A new patch restarts every mod table from step 0 with no
+    ; accumulated delta — otherwise the previous patch's sweep would
+    ; carry into this one.
+    LI   R1, 0
+lp_modclear:
+    LOAD_ADDR R4, snd_modstep
+    ADD  R4, R4, R1
+    ADD  R4, R4, R1
+    SW   [R4], R0
+    LOAD_ADDR R4, snd_modcnt
+    ADD  R4, R4, R1
+    ADD  R4, R4, R1
+    SW   [R4], R0
+    LOAD_ADDR R4, snd_modacc
+    ADD  R4, R4, R1
+    ADD  R4, R4, R1
+    SW   [R4], R0
+    ADDI R1, R1, 1
+    CMPI R1, 4
+    BNE  lp_modclear
+
     LI   R1, 0
     POP  R7
     POP  R6
@@ -284,6 +322,16 @@ note_in_range:
     ADD  R2, R2, R2              ; two bytes per entry
     ADD  R5, R5, R2
     LW   R5, [R5]                ; the phase increment
+
+    ; Remember the note the voice is sounding: arpeggio and vibrato are
+    ; offsets FROM it, and the chip only stores a phase increment.
+    LI   R12, 1
+    SHR  R2, R2, R12             ; back from byte index to note index
+    ANDI R12, R1, 3
+    LOAD_ADDR R3, snd_note
+    ADD  R3, R3, R12
+    ADD  R3, R3, R12
+    SW   [R3], R2
 
     VOICE_BASE R4, R1
     SB   [R4 + $00], R5          ; VFREQLO
@@ -334,6 +382,257 @@ snd_stop_all:
     RET
 
 ; ----------------------------------------------------------------------------
+; snd_tick — advance every armed mod table one frame. Call once per frame,
+; after SYS_VBLANK or your own frame edge. Clobbers R1-R4, R12; R5-R9 saved.
+;
+; This is the routine that makes a patch a PROGRAM. The AUR-1 has no LFO,
+; no pulse-width sweep and no envelope-to-filter routing, so every moving
+; parameter is a CPU write; a patch that sounds like anything is a
+; per-frame register script (v1.3 §5.2).
+;
+; Two dividers, deliberately. The patch-wide tick divider sets how often
+; anything moves at all — one knob to halve a whole sound's motion — and
+; each table's own speed then counts those steps, so an arpeggio can run
+; four times faster than a filter sweep inside the same patch.
+;
+; SIGNEDNESS, which the amendment leaves open: a table byte is always
+; signed in delta mode, since a sweep that cannot go down is not a sweep.
+; In absolute mode it is signed for arpeggio and pitch (offsets from the
+; sounding note, useless one-way) and unsigned for pulse width and cutoff
+; (register values, which have no negative). Recorded as SND-d.
+; ----------------------------------------------------------------------------
+snd_tick:
+    PUSH LR
+    PUSH R5
+    PUSH R6
+    PUSH R7
+    PUSH R8
+    PUSH R9
+
+    LOAD_ADDR R4, snd_tickdiv
+    LW   R1, [R4]
+    LW   R2, [R4 + 2]
+    ADDI R2, R2, 1
+    CMP  R2, R1
+    BCC  tick_wait               ; the patch-wide divider says not yet
+    SW   [R4 + 2], R0
+    JMPA tick_run
+tick_wait:
+    SW   [R4 + 2], R2
+    JMPA tick_exit
+
+tick_run:
+    LOAD_ADDR R4, snd_patch      ; R7 = the patch being played
+    LW   R7, [R4 + 2]
+    LI   R12, 16
+    SHL  R7, R7, R12
+    LW   R12, [R4]
+    OR   R7, R7, R12
+    CMPI R7, 0
+    BEQ  tick_exit               ; nothing loaded yet
+
+    LI   R5, 0                   ; table index
+tick_table:
+    LI   R12, 8
+    MUL  R6, R5, R12
+    ADD  R6, R6, R7
+    ADDI R6, R6, $60             ; R6 = this table's descriptor
+    LB   R1, [R6]                ; target
+    CMPI R1, 0
+    BEQ  tick_next               ; table off
+
+    LOAD_ADDR R4, snd_modcnt     ; its own speed counter
+    ADD  R4, R4, R5
+    ADD  R4, R4, R5
+    LW   R2, [R4]
+    ADDI R2, R2, 1
+    LB   R3, [R6 + 4]            ; speed
+    CMPI R3, 0
+    BNE  tick_speed
+    LI   R3, 1                   ; speed 0 reads as every step
+tick_speed:
+    CMP  R2, R3
+    BCC  tick_hold
+    SW   [R4], R0
+    JMPA tick_step
+tick_hold:
+    SW   [R4], R2
+    JMPA tick_next
+
+tick_step:
+    LOAD_ADDR R4, snd_modstep    ; R8 = the step to play
+    ADD  R4, R4, R5
+    ADD  R4, R4, R5
+    LW   R8, [R4]
+
+    LOAD_ADDR R12, snd_modbase   ; R9 = the byte at that step
+    LW   R9, [R12 + 2]
+    LI   R3, 16
+    SHL  R9, R9, R3
+    LW   R3, [R12]
+    OR   R9, R9, R3
+    LB   R3, [R6 + 1]            ; table slot
+    ANDI R3, R3, $0F
+    LI   R12, 32
+    MUL  R3, R3, R12
+    ADD  R9, R9, R3
+    ADD  R9, R9, R8
+    LB   R9, [R9]
+
+    LB   R3, [R6 + 5]            ; mode
+    CMPI R3, 0
+    BNE  tick_delta
+
+    ; Absolute: signed for arpeggio (1) and pitch (4), unsigned for the
+    ; register targets (SND-d).
+    LB   R3, [R6]
+    CMPI R3, 2
+    BEQ  tick_apply
+    CMPI R3, 3
+    BEQ  tick_apply
+    CMPI R9, $80
+    BCC  tick_apply
+    SUBI R9, R9, 256
+    JMPA tick_apply
+
+tick_delta:
+    CMPI R9, $80                 ; delta steps are always signed
+    BCC  tick_accum
+    SUBI R9, R9, 256
+tick_accum:
+    LOAD_ADDR R4, snd_modacc
+    ADD  R4, R4, R5
+    ADD  R4, R4, R5
+    LW   R3, [R4]
+    ADD  R3, R3, R9
+    ANDI R3, R3, $FFFF
+    SW   [R4], R3
+    MOV  R9, R3
+
+tick_apply:
+    LB   R3, [R6]
+    CMPI R3, 3
+    BEQ  tick_filter             ; the filter is shared, not per-voice
+
+    LI   R2, 0                   ; voice index
+tick_voice:
+    LI   R12, 16                 ; does this table drive this voice?
+    MUL  R3, R2, R12
+    ADD  R3, R3, R7
+    LB   R3, [R3 + $0C]          ; the voice's mod mask
+    LI   R12, 1
+    SHL  R12, R12, R5
+    AND  R3, R3, R12
+    CMPI R3, 0
+    BEQ  tick_voice_next
+
+    LI   R12, 16
+    MUL  R4, R2, R12
+    LI   R12, (AUR & $FFFF)
+    ADD  R4, R4, R12
+    LUI  R4, (AUR >> 16)         ; R4 = chip voice base
+
+    LB   R3, [R6]
+    CMPI R3, 2
+    BEQ  tick_pulse
+    CMPI R3, 4
+    BEQ  tick_pitch
+
+    ; Target 1 — arpeggio: retune to the sounding note plus R9 semitones.
+    LOAD_ADDR R12, snd_note
+    ADD  R12, R12, R2
+    ADD  R12, R12, R2
+    LW   R3, [R12]
+    ADD  R3, R3, R9
+    CMPI R3, NOTE_COUNT
+    BCS  tick_voice_next         ; off the end of the table: leave it be
+    LI   R12, (note_table & $FFFF)
+    LUI  R12, (note_table >> 16)
+    ADD  R3, R3, R3
+    ADD  R12, R12, R3
+    LW   R3, [R12]
+    SB   [R4 + $00], R3
+    LI   R12, 8
+    SHR  R3, R3, R12
+    SB   [R4 + $01], R3
+    JMPA tick_voice_next
+
+tick_pulse:
+    ; Target 2 — pulse width straight into VPULSE.
+    SB   [R4 + $06], R9
+    JMPA tick_voice_next
+
+tick_pitch:
+    ; Target 4 — vibrato: the sounding note's increment, plus R9. Fine
+    ; detune rather than semitones, so it moves smoothly.
+    LOAD_ADDR R12, snd_note
+    ADD  R12, R12, R2
+    ADD  R12, R12, R2
+    LW   R3, [R12]
+    LI   R12, (note_table & $FFFF)
+    LUI  R12, (note_table >> 16)
+    ADD  R3, R3, R3
+    ADD  R12, R12, R3
+    LW   R3, [R12]
+    ADD  R3, R3, R9
+    ANDI R3, R3, $FFFF
+    SB   [R4 + $00], R3
+    LI   R12, 8
+    SHR  R3, R3, R12
+    SB   [R4 + $01], R3
+
+tick_voice_next:
+    ADDI R2, R2, 1
+    CMPI R2, 4
+    BNE  tick_voice
+    JMPA tick_advance
+
+tick_filter:
+    ; Target 3 — cutoff. The table byte is the top 8 of the 12-bit
+    ; AFCUT, so value<<4 lands as AFCUTHI = value, AFCUTLO = 0. The mod
+    ; mask is ignored: there is one filter, and AMFILT already decides
+    ; which voices reach it (v1.1 §6.1).
+    LOAD_ADDR R4, AURG
+    SB   [R4 + $05], R0          ; AFCUTLO
+    SB   [R4 + $06], R9          ; AFCUTHI
+
+tick_advance:
+    LOAD_ADDR R4, snd_modstep
+    ADD  R4, R4, R5
+    ADD  R4, R4, R5
+    ADDI R8, R8, 1
+    LB   R3, [R6 + 2]            ; length
+    CMPI R3, 0
+    BNE  tick_len
+    LI   R3, 1
+tick_len:
+    CMP  R8, R3
+    BCC  tick_store
+    LB   R12, [R6 + 3]           ; loop point
+    CMPI R12, $FF
+    BNE  tick_loop
+    SUBI R8, R3, 1               ; one-shot: hold the last step
+    JMPA tick_store
+tick_loop:
+    MOV  R8, R12
+tick_store:
+    SW   [R4], R8
+
+tick_next:
+    ADDI R5, R5, 1
+    CMPI R5, 4
+    BNE  tick_table
+
+tick_exit:
+    POP  R9
+    POP  R8
+    POP  R7
+    POP  R6
+    POP  R5
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
 ; Library state. bss is NOLOAD, so this costs nothing in the .flapp image.
 ; 20-bit pointers live as two words, low half first — the DISPATCH-table
 ; convention from the BIOS.
@@ -346,3 +645,8 @@ snd_arch:      DS 2             ; 0 = 4x mono, 1 = FM 0+1 + mono, 2 = 2x FM
 snd_transpose: DS 2             ; signed semitones, applied by snd_note_on
 snd_tickdiv:   DS 2             ; frames per mod-table step
 snd_tickcnt:   DS 2             ; frames since the last step
+snd_modbase:   DS 4             ; mod-table pool base
+snd_note:      DS 8             ; 4 x the note each voice is sounding
+snd_modstep:   DS 8             ; 4 x current step index
+snd_modcnt:    DS 8             ; 4 x frames since this table stepped
+snd_modacc:    DS 8             ; 4 x accumulated value, delta mode
