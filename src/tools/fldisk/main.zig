@@ -23,6 +23,12 @@
 //!
 //! Layout (v1.3 §3): sector 0 volume header, sector 1 the 16-entry
 //! directory, sector 2 onward data.
+//!
+//! SILENT ON SUCCESS, like flas and fll. Not a style preference: a Zig
+//! build step that declares an output file captures the child's streams
+//! and fails on unexpected stderr, so a chatty `create` breaks the very
+//! build wiring that needs it. `list` prints, because printing is the
+//! whole point of it, and it never runs as a build step.
 
 const std = @import("std");
 
@@ -229,7 +235,6 @@ pub fn main(init: std.process.Init) !void {
         var file = try cwd.createFile(io, path, .{});
         defer file.close(io);
         try file.writeStreamingAll(io, bytes);
-        std.debug.print("fldisk: created {s} — {d} sectors ({d} bytes), label \"{s}\"\n", .{ path, sectors, bytes.len, label });
         return;
     }
 
@@ -266,16 +271,6 @@ pub fn main(init: std.process.Init) !void {
         var file = try cwd.createFile(io, path, .{});
         defer file.close(io);
         try file.writeStreamingAll(io, bytes);
-        const e = v.entry(index);
-        std.debug.print("fldisk: added {s} as \"{s}\" type {c}{c} — {d} bytes, {d} sector(s) at LBA {d}\n", .{
-            src,
-            e[0..name_len],
-            e[e_type],
-            e[e_type + 1],
-            data.len,
-            sectors,
-            std.mem.readInt(u16, e[e_start..][0..2], .little),
-        });
         return;
     }
 
