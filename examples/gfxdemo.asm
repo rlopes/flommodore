@@ -1,5 +1,6 @@
 ; ============================================================================
-; gfxdemo.asm — drive gfxlib and check the pixels (Block 17, 17.1-17.3).
+; gfxdemo.asm — drive gfxlib and fmtlib, and check the results
+; (Block 17, tasks 17.1-17.4).
 ;
 ;   flommodore --rom tests/roms/font.rom examples/gfxdemo.flapp
 ;
@@ -8,15 +9,15 @@
 ; a ROM for the font, a .flapp for the program, no firmware in between.
 ; "FLOMMODORE" uses only glyphs font.rom actually carries.
 ;
-; ASSERTS PIXELS, not just a hash. A frame golden catches a change but does
-; not say what changed, and it only means anything once the engine is known
-; good. So the demo reads framebuffer bytes back and compares them against
-; values derived from the font data and the geometry: 'F' row 0 is $FC, so
-; with pen fg/bg the first six pixels are foreground and the last two
-; background, at addresses fixed by $44000 + y*320 + x.
+; ASSERTS RESULTS, not a hash. A frame golden catches a change but does not
+; say what changed, and it only means anything once the engine is known
+; good. The drawing checks read framebuffer bytes back and compare against
+; values derived from the font data and the geometry; the formatter checks
+; read the ASCII the formatters produced, which needs no font at all — which
+; is just as well, since font.rom has no digit glyphs.
 ;
-; Failures report R11 = (check << 8) | observed, as in sndbank_demo, so a
-; wrong byte names itself.
+; Failures report R11 = (check << 8) | observed, so a wrong byte names
+; itself.
 ;
 ;   $01xx  'F' row 0 pixel 0        $FF   the glyph reached the framebuffer
 ;   $02xx  'F' row 0 pixel 6        $00   the expansion table's zero bits
@@ -31,6 +32,20 @@
 ;   $0Bxx  frame top-left           $30   gfx_frame drew its outline
 ;   $0Cxx  frame bottom-right       $30   ...on all four sides
 ;   $0Dxx  frame interior           $00   ...and left the middle alone
+;   $0Exx  fmt_hex16 count          4     fixed width
+;   $0Fxx  fmt_hex16 "01EA"[0]      '0'   hex KEEPS its leading zero
+;   $10xx  fmt_hex16 "01EA"[2]      'E'   the letter path
+;   $11xx  fmt_hex16 "01EA"[4]      $00   NUL-terminated
+;   $12xx  fmt_hex8 "2F"[1]         'F'
+;   $13xx  fmt_dec(0) count         1     a lone zero still prints
+;   $14xx  fmt_dec(0)[0]            '0'
+;   $15xx  fmt_dec(65535) count     5     full width
+;   $16xx  fmt_dec(65535)[4]        '5'
+;   $17xx  fmt_dec(10000)[1]        '0'   interior zeros survive
+;
+; $0Fxx and $13xx are the pair worth having: hex keeps a leading zero and
+; decimal drops one, so a single suppression rule applied to both would
+; fail exactly one of them.
 ; ============================================================================
 
     SECTION code
@@ -42,7 +57,7 @@ ENDMACRO
 
 start:
     LI   R1, $1100
-    MOV  SP, R1                  ; D12 boot stack; gfxlib pushes
+    MOV  SP, R1                  ; D12 boot stack; the libraries push
 
     CALLA gfx_init               ; bitmap 320x180 8bpp, grey palette
 
@@ -202,6 +217,105 @@ ck_frame_in:
     LI   R11, $0D00
     LB   R1, [R4]
     CMPI R1, $00
+    BEQ  ck_hex16
+    OR   R11, R11, R1
+    JMPA fail
+
+    ; ---- the formatters, checked as text not pixels -----------------
+    ; $01EA is E4's phase increment, which is why it is the value here:
+    ; it has a leading zero, a letter, and a digit above 9.
+ck_hex16:
+    LOAD_ADDR R1, fmt_buf
+    LI   R2, $01EA
+    CALLA fmt_hex16
+    LI   R11, $0E00
+    CMPI R1, 4
+    BEQ  ck_hex16_0
+    OR   R11, R11, R1
+    JMPA fail
+ck_hex16_0:
+    LOAD_ADDR R4, fmt_buf
+    LI   R11, $0F00
+    LB   R1, [R4]
+    CMPI R1, $30                 ; '0' — hex keeps its leading zero
+    BEQ  ck_hex16_2
+    OR   R11, R11, R1
+    JMPA fail
+ck_hex16_2:
+    LI   R11, $1000
+    LB   R1, [R4 + 2]
+    CMPI R1, $45                 ; 'E'
+    BEQ  ck_hex16_nul
+    OR   R11, R11, R1
+    JMPA fail
+ck_hex16_nul:
+    LI   R11, $1100
+    LB   R1, [R4 + 4]
+    CMPI R1, $00
+    BEQ  ck_hex8
+    OR   R11, R11, R1
+    JMPA fail
+
+ck_hex8:
+    LOAD_ADDR R1, fmt_buf
+    LI   R2, $2F
+    CALLA fmt_hex8
+    LOAD_ADDR R4, fmt_buf
+    LI   R11, $1200
+    LB   R1, [R4 + 1]
+    CMPI R1, $46                 ; 'F'
+    BEQ  ck_dec0
+    OR   R11, R11, R1
+    JMPA fail
+
+    ; Zero must print as "0", not as nothing. This is the case the
+    ; suppression rule gets wrong if it only looks at a flag.
+ck_dec0:
+    LOAD_ADDR R1, fmt_buf
+    LI   R2, 0
+    CALLA fmt_dec
+    LI   R11, $1300
+    CMPI R1, 1
+    BEQ  ck_dec0_0
+    OR   R11, R11, R1
+    JMPA fail
+ck_dec0_0:
+    LOAD_ADDR R4, fmt_buf
+    LI   R11, $1400
+    LB   R1, [R4]
+    CMPI R1, $30                 ; '0'
+    BEQ  ck_dec_max
+    OR   R11, R11, R1
+    JMPA fail
+
+ck_dec_max:
+    LOAD_ADDR R1, fmt_buf
+    LI   R2, 65535
+    CALLA fmt_dec
+    LI   R11, $1500
+    CMPI R1, 5
+    BEQ  ck_dec_max_last
+    OR   R11, R11, R1
+    JMPA fail
+ck_dec_max_last:
+    LOAD_ADDR R4, fmt_buf
+    LI   R11, $1600
+    LB   R1, [R4 + 4]
+    CMPI R1, $35                 ; '5'
+    BEQ  ck_dec_interior
+    OR   R11, R11, R1
+    JMPA fail
+
+    ; 10000: the leading digit is 1 and the rest are zeros, so this
+    ; separates "suppress leading zeros" from "suppress all zeros".
+ck_dec_interior:
+    LOAD_ADDR R1, fmt_buf
+    LI   R2, 10000
+    CALLA fmt_dec
+    LOAD_ADDR R4, fmt_buf
+    LI   R11, $1700
+    LB   R1, [R4 + 1]
+    CMPI R1, $30                 ; '0'
     BEQ  ck_done
     OR   R11, R11, R1
     JMPA fail
@@ -225,3 +339,8 @@ fail_parked:
 
 str_title:
     DB "FLOMMODORE", 0
+
+    SECTION bss
+
+fmt_buf:
+    DS 8                         ; five digits, four hex, and a NUL to spare
