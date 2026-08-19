@@ -889,6 +889,46 @@ pub fn build(b: *std.Build) void {
     const banktest_step = b.step("banktest", "Block 16 e2e: a .flsnd bank loaded off an FLFS volume");
     banktest_step.dependOn(&bankdemo_run.step);
 
+    // ------------------------------------------------------------------
+    // Block 17: gfxlib and its demo. Assembled like sndlib — a relocatable
+    // library any .flapp can link. The demo runs with the minimal font ROM
+    // rather than the BIOS, since gfxlib wants glyph data at $FE000 and
+    // nothing else.
+    // ------------------------------------------------------------------
+    const flas_gfxlib_run = b.addRunArtifact(flas_exe);
+    flas_gfxlib_run.addFileArg(b.path("src/lib/gfxlib.asm"));
+    flas_gfxlib_run.addArg("-o");
+    const gfxlib_flobj = flas_gfxlib_run.addOutputFileArg("gfxlib.flobj");
+    const gfxlib_step = b.step("gfxlib", "Assemble src/lib/gfxlib.asm");
+    gfxlib_step.dependOn(&flas_gfxlib_run.step);
+
+    const flas_gfxdemo_run = b.addRunArtifact(flas_exe);
+    flas_gfxdemo_run.addFileArg(b.path("examples/gfxdemo.asm"));
+    flas_gfxdemo_run.addArg("-o");
+    const gfxdemo_flobj = flas_gfxdemo_run.addOutputFileArg("gfxdemo.flobj");
+
+    const fll_gfxdemo_run = b.addRunArtifact(fll_exe);
+    fll_gfxdemo_run.addFileArg(gfxdemo_flobj);
+    fll_gfxdemo_run.addFileArg(gfxlib_flobj);
+    fll_gfxdemo_run.addArg("-s");
+    fll_gfxdemo_run.addFileArg(b.path("examples/gfxdemo.flld"));
+    fll_gfxdemo_run.addArg("-o");
+    const gfxdemo_flapp = fll_gfxdemo_run.addOutputFileArg("gfxdemo.flapp");
+
+    // No --golden yet: the demo asserts its own pixels, and a frame hash
+    // pinned before the engine is known-good would only enshrine whatever
+    // it happens to draw.
+    const gfxdemo_run = b.addRunArtifact(harness_exe);
+    gfxdemo_run.addArg("--rom");
+    gfxdemo_run.addArg(b.pathFromRoot("tests/roms/font.rom"));
+    gfxdemo_run.addArg("--flapp");
+    gfxdemo_run.addFileArg(gfxdemo_flapp);
+    gfxdemo_run.addArgs(&.{ "--frames", "2", "--expect-pass" });
+    gfxdemo_run.step.dependOn(&genroms_run.step); // font.rom must exist
+    gfxdemo_run.has_side_effects = true;
+    const gfxtest_step = b.step("gfxtest", "Block 17 e2e: gfxlib draws text into the framebuffer");
+    gfxtest_step.dependOn(&gfxdemo_run.step);
+
     const examples_update = b.addUpdateSourceFiles();
     examples_update.addCopyFileToSource(hello_flapp, "examples/hello.flapp");
     examples_update.addCopyFileToSource(bhello_flapp, "examples/bios_hello.flapp");
@@ -1027,4 +1067,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&readback_rom_run.step); // Block 14 AUR-1 readback ROM
     test_step.dependOn(&snddemo_run.step); // Block 16 sndlib links and sounds
     test_step.dependOn(&bankdemo_run.step); // Block 16 bank off a real disk
+    test_step.dependOn(&gfxdemo_run.step); // Block 17 gfxlib draws text
 }
