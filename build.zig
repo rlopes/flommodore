@@ -827,10 +827,15 @@ pub fn build(b: *std.Build) void {
     const bank_flobj = flas_bank_run.addOutputFileArg("demobank.flobj");
 
     const fll_bank_run = b.addRunArtifact(fll_exe);
-    // --base $01000, not $00000: fll's raw emitter reads load_addr 0 as
+    // --overlay, not --raw. Raw mode is the ROM-REPLACEMENT form and
+    // requires the image to cover the vector slots at $FFFC0 (§8.6); an
+    // overlay is a flat image at an arbitrary base, which is exactly what a
+    // data blob is — the same mode hello83_raw uses.
+    //
+    // --base $01000, not $00000: the emitter reads load_addr 0 as
     // "relocatable" and refuses. The bank is data, so its assembly address
     // is arbitrary — see the note in demobank.asm.
-    fll_bank_run.addArgs(&.{ "--raw", "--base", "$01000", "--size", "656" });
+    fll_bank_run.addArgs(&.{ "--overlay", "--base", "$01000", "--size", "656" });
     fll_bank_run.addFileArg(bank_flobj);
     fll_bank_run.addArg("-o");
     const bank_flsnd = fll_bank_run.addOutputFileArg("demobank.flsnd");
