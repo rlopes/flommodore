@@ -812,6 +812,69 @@ pub fn build(b: *std.Build) void {
     const snddemo_step = b.step("sndtest", "Block 16 e2e: sndlib_demo links, runs, and sounds");
     snddemo_step.dependOn(&snddemo_run.step);
 
+    // ------------------------------------------------------------------
+    // Block 16 task 16.7: the demo bank, on a real disk.
+    //
+    // demobank.asm is absolute and framed by `fll --raw`, so the linker
+    // output IS the .flsnd file. fldisk then formats a volume and adds it
+    // as DEMOBANK, and sndbank_demo reads it back through the BIOS storage
+    // syscalls — the one path where the storage stack and the sound stack
+    // meet.
+    // ------------------------------------------------------------------
+    const flas_bank_run = b.addRunArtifact(flas_exe);
+    flas_bank_run.addFileArg(b.path("examples/demobank.asm"));
+    flas_bank_run.addArg("-o");
+    const bank_flobj = flas_bank_run.addOutputFileArg("demobank.flobj");
+
+    const fll_bank_run = b.addRunArtifact(fll_exe);
+    // --base $01000, not $00000: fll's raw emitter reads load_addr 0 as
+    // "relocatable" and refuses. The bank is data, so its assembly address
+    // is arbitrary — see the note in demobank.asm.
+    fll_bank_run.addArgs(&.{ "--raw", "--base", "$01000", "--size", "656" });
+    fll_bank_run.addFileArg(bank_flobj);
+    fll_bank_run.addArg("-o");
+    const bank_flsnd = fll_bank_run.addOutputFileArg("demobank.flsnd");
+
+    const bankdisk_run = b.addRunArtifact(fldisk_exe);
+    bankdisk_run.addArg("create");
+    const bank_disk = bankdisk_run.addOutputFileArg("demobank.fldisk");
+    bankdisk_run.addArgs(&.{ "--sectors", "64", "--label", "SOUNDS" });
+
+    const bankadd_run = b.addRunArtifact(fldisk_exe);
+    bankadd_run.addArg("add");
+    bankadd_run.addFileArg(bank_disk);
+    bankadd_run.addFileArg(bank_flsnd);
+    bankadd_run.addArgs(&.{ "--name", "DEMOBANK", "--type", "SN" });
+    bankadd_run.step.dependOn(&bankdisk_run.step);
+    bankadd_run.has_side_effects = true; // writes the volume in place
+
+    const flas_bankdemo_run = b.addRunArtifact(flas_exe);
+    flas_bankdemo_run.addFileArg(b.path("examples/sndbank_demo.asm"));
+    flas_bankdemo_run.addArg("-o");
+    const bankdemo_flobj = flas_bankdemo_run.addOutputFileArg("sndbank_demo.flobj");
+
+    const fll_bankdemo_run = b.addRunArtifact(fll_exe);
+    fll_bankdemo_run.addFileArg(bankdemo_flobj);
+    fll_bankdemo_run.addFileArg(sndlib_flobj);
+    fll_bankdemo_run.addArg("-s");
+    fll_bankdemo_run.addFileArg(b.path("examples/sndbank_demo.flld"));
+    fll_bankdemo_run.addArg("-o");
+    const bankdemo_flapp = fll_bankdemo_run.addOutputFileArg("sndbank_demo.flapp");
+
+    // Needs the BIOS for the storage syscalls, and runs the cartridge way.
+    const bankdemo_run = b.addRunArtifact(harness_exe);
+    bankdemo_run.addArg("--rom");
+    bankdemo_run.addFileArg(bios_rom);
+    bankdemo_run.addArg("--autoboot");
+    bankdemo_run.addArg("--flapp");
+    bankdemo_run.addFileArg(bankdemo_flapp);
+    bankdemo_run.addArg("--disk");
+    bankdemo_run.addFileArg(bank_disk);
+    bankdemo_run.addArgs(&.{ "--frames", "12", "--expect-pass" });
+    bankdemo_run.step.dependOn(&bankadd_run.step);
+    const banktest_step = b.step("banktest", "Block 16 e2e: a .flsnd bank loaded off an FLFS volume");
+    banktest_step.dependOn(&bankdemo_run.step);
+
     const examples_update = b.addUpdateSourceFiles();
     examples_update.addCopyFileToSource(hello_flapp, "examples/hello.flapp");
     examples_update.addCopyFileToSource(bhello_flapp, "examples/bios_hello.flapp");
@@ -949,4 +1012,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&storage_rom_run.step); // Block 14 FDD-1 test ROM
     test_step.dependOn(&readback_rom_run.step); // Block 14 AUR-1 readback ROM
     test_step.dependOn(&snddemo_run.step); // Block 16 sndlib links and sounds
+    test_step.dependOn(&bankdemo_run.step); // Block 16 bank off a real disk
 }
