@@ -801,7 +801,14 @@ pub fn build(b: *std.Build) void {
     const snddemo_run = b.addRunArtifact(harness_exe);
     snddemo_run.addArg("--flapp");
     snddemo_run.addFileArg(snddemo_flapp);
-    snddemo_run.addArgs(&.{ "--frames", "20", "--expect-pass" });
+    snddemo_run.addArgs(&.{
+        "--frames",
+        "20",
+        "--expect-pass",
+        "--audio-golden",
+        "6097158f0870eabbb8d16acfcf162a5756e1795d39ed774e1c8713004157a7ce",
+        "--quiet",
+    });
     const snddemo_step = b.step("sndtest", "Block 16 e2e: sndlib_demo links, runs, and sounds");
     snddemo_step.dependOn(&snddemo_run.step);
 
