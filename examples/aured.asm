@@ -1,13 +1,20 @@
 ; ============================================================================
-; aured.asm — the Flommodore sound designer, skeleton (Block 17, 17.6-17.8).
+; aured.asm — the Flommodore sound designer, editing skeleton
+; (Block 17, tasks 17.6-17.8).
 ;
 ;   flommodore --rom rom/flommodore.rom examples/aured.flapp
 ;
 ; Needs the BIOS ROM for its full font: gfxlib reads glyphs from $FE000 and
 ; this page shows letters and digits, which tests/roms/font.rom does not
 ; carry. It does NOT need the BIOS to have booted — the .flapp loader sets
-; up the D12 environment, the jump table is in ROM either way, and the
-; syscalls this uses (POLLKEY, and later the storage ones) touch no BIOS RAM.
+; up the D12 environment, and nothing here touches BIOS RAM. The keyboard is
+; read straight off KSTAT/KDATA rather than through SYS_POLLKEY for the same
+; reason: KCTRL only gates the IRQ, so polling works on an unbooted machine.
+;
+; Voice 0's sixteen registers, one selected. Up and Down move the selection,
+; Right and Left adjust the selected register by one and write it to the
+; chip. Arrows rather than +/- so no modifier decoding is needed, and the
+; keys a value editor wants are the ones next to each other.
 ;
 ; ----------------------------------------------------------------------------
 ; NO DAMAGE LIST, which revises the Phase 9 plan's task 17.5.
@@ -16,21 +23,22 @@
 ; what changed. Costed against the real page, that optimises the wrong
 ; thing:
 ;
-;   full repaint of this page   ~28,000 cycles   12% of a frame
+;   full repaint of this page   ~30,000 cycles   13% of a frame
 ;   gfx_clear                   115,200 cycles   48% of a frame
 ;
-; (The 28,000 is measured after hoisting gfx_pen out of the repaint. With
-; the pen rebuilt per frame it was 54,300, which the budget check caught —
-; the estimate that preceded it said 14,000 and was wrong twice over.)
+; (The 30,000 is measured. With gfx_pen rebuilt per frame it was 54,300,
+; which the budget check below caught — the estimate that preceded it said
+; 14,000 and was wrong twice over: it forgot the pen and undercounted the
+; per-glyph loop by two and a half times.)
 ;
 ; Repainting everything every frame is affordable; CLEARING is what is not.
 ; And because glyphs paint their own background through the expansion table,
 ; a repaint overwrites cleanly — so the clear is a one-time startup cost and
 ; the damage list would buy nothing but invalidation bugs.
 ;
-; The measurement is not left as an argument in a comment: draw_page is
-; timed with CYC and the result asserted, so a change that makes a repaint
-; expensive fails the build rather than quietly dropping the frame rate.
+; THE SELECTION MARKER IS A CHARACTER, not an inverted pen, for the same
+; reason: a pen rebuild is 23,500 cycles, so highlighting a row by switching
+; pens would cost more than drawing the entire page.
 ;
 ; ----------------------------------------------------------------------------
 ; Checks, reported as R11 = (check << 8) | observed:
@@ -41,12 +49,25 @@
 ;   $03xx  frame top-left      $60       the panel outline exists
 ;   $04xx  just inside it      $00       and is an outline, not a fill
 ;   $05xx  frame bottom-left   $60       full height
+;   $06xx  cursor == 2                   two Down presses were decoded
+;   $07xx  VWAVE == 2                    two Right presses reached the chip
+;
+; $06xx and $07xx are the pair that matters: a cursor that moves but never
+; writes fails $07xx, and a write that ignores the cursor fails $06xx only
+; if it also mis-tracked — so the two together pin "the selected register is
+; the one that changed".
 ; ============================================================================
 
     SECTION code
 
     EQU AUR1, $80100             ; voice 0 register block
     EQU VIC,  $80200
+    EQU KBD,  $80020             ; +0 KSTAT, +1 KDATA (dequeues on read)
+
+    EQU KEY_UP,    $52           ; USB HID usage page $07
+    EQU KEY_DOWN,  $51
+    EQU KEY_LEFT,  $50
+    EQU KEY_RIGHT, $4F
 
     EQU PANEL_X, 4
     EQU PANEL_Y, 12
@@ -77,6 +98,9 @@ start:
     LI   R1, PEN_FG
     LI   R2, PEN_BG
     CALLA gfx_pen
+
+    LOAD_ADDR R4, aured_cursor
+    SW   [R4], R0                ; selection starts on FREQLO
 
     ; ---- time one repaint -------------------------------------------
     MFSR R9, CYC
@@ -127,20 +151,41 @@ ck_bottom:
     LI   R11, $0500
     LB   R1, [R4]
     CMPI R1, PEN_EDGE
+    BEQ  run_loop
+    OR   R11, R11, R1
+    JMPA fail
+
+    ; ---- the frame loop ---------------------------------------------
+    ; Six frames of the real thing: wait for the vertical blank, drain the
+    ; keyboard, repaint. No clear, no damage tracking.
+run_loop:
+    LI   R6, 6
+frame_loop:
+    CALLA wait_vblank
+    CALLA read_keys
+    CALLA draw_page
+    SUBI R6, R6, 1
+    BNE  frame_loop
+
+    ; ---- did the editing land? --------------------------------------
+    ; Two Downs then two Rights were injected at frame boundaries, so the
+    ; selection should be on register 2 and that register should hold 2.
+    LOAD_ADDR R4, aured_cursor
+    LI   R11, $0600
+    LW   R1, [R4]
+    CMPI R1, 2
+    BEQ  ck_edited
+    OR   R11, R11, R1
+    JMPA fail
+ck_edited:
+    LOAD_ADDR R4, AUR1
+    LI   R11, $0700
+    LB   R1, [R4 + 2]            ; VWAVE, reset to 0, incremented twice
+    CMPI R1, 2
     BEQ  ck_done
     OR   R11, R11, R1
     JMPA fail
 ck_done:
-
-    ; ---- the frame loop ---------------------------------------------
-    ; Four frames of the real thing: wait for the vertical blank, repaint
-    ; the page, repeat. No clear, no damage tracking.
-    LI   R6, 4
-frame_loop:
-    CALLA wait_vblank
-    CALLA draw_page
-    SUBI R6, R6, 1
-    BNE  frame_loop
 
     LI   R11, $600D
     SW   [R0 + $80], R11
@@ -157,9 +202,77 @@ fail_parked:
     JMPA fail_parked
 
 ; ----------------------------------------------------------------------------
+; read_keys — drain every queued event and act on the presses. Releases are
+; discarded: this is an editor, not a game, so a held key repeating is the
+; host's business and not something to emulate. Clobbers R1-R4, R12; R5
+; saved.
+; ----------------------------------------------------------------------------
+read_keys:
+    PUSH LR
+    PUSH R5
+    LOAD_ADDR R5, KBD
+rk_loop:
+    LW   R12, [R5]               ; KSTAT
+    ANDI R12, R12, 1
+    BEQ  rk_done                 ; queue empty
+    LW   R1, [R5 + 1]            ; KDATA — dequeues on read (§5.3)
+    LI   R12, $8000
+    AND  R12, R1, R12
+    BNE  rk_loop                 ; bit 15 set: a release, ignore it
+    ANDI R1, R1, $7F
+    CALLA do_key
+    JMPA rk_loop
+rk_done:
+    POP  R5
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
+; do_key (R1 = HID code) — one press. Up/Down wrap around the sixteen
+; registers; Right/Left adjust the selected one by a byte, wrapping too,
+; because a register editor that stops at the ends hides what the register
+; actually does. Clobbers R1-R4, R12.
+; ----------------------------------------------------------------------------
+do_key:
+    LOAD_ADDR R4, aured_cursor
+    LW   R2, [R4]
+    CMPI R1, KEY_DOWN
+    BNE  dk_up
+    ADDI R2, R2, 1
+    ANDI R2, R2, $0F
+    SW   [R4], R2
+    RET
+dk_up:
+    CMPI R1, KEY_UP
+    BNE  dk_right
+    SUBI R2, R2, 1
+    ANDI R2, R2, $0F             ; 0 - 1 wraps to 15
+    SW   [R4], R2
+    RET
+dk_right:
+    CMPI R1, KEY_RIGHT
+    BNE  dk_left
+    LI   R3, 1
+    JMPA dk_adjust
+dk_left:
+    CMPI R1, KEY_LEFT
+    BNE  dk_ignore
+    LI   R3, -1
+dk_adjust:
+    LOAD_ADDR R12, AUR1
+    ADD  R12, R12, R2            ; the SELECTED register, not a fixed one
+    LB   R1, [R12]
+    ADD  R1, R1, R3
+    ANDI R1, R1, $FF
+    SB   [R12], R1
+dk_ignore:
+    RET
+
+; ----------------------------------------------------------------------------
 ; draw_page — the whole visible page, every time. Title, panel outline, and
 ; voice 0's sixteen registers in two columns of eight, each as NAME $XX read
-; live off the chip. Clobbers R1-R5, R12; R6-R8 saved.
+; live off the chip, with '>' against the selected one.
+; Clobbers R1-R5, R12; R6-R8 saved.
 ; ----------------------------------------------------------------------------
 draw_page:
     PUSH LR
@@ -191,6 +304,21 @@ dp_reg:
     LI   R12, 8
     MUL  R8, R8, R12
     ADDI R8, R8, 16              ; y = 16 .. 72
+
+    ; the selection marker, in the margin left of the name
+    LOAD_ADDR R12, aured_cursor
+    LW   R12, [R12]
+    CMP  R12, R6
+    BNE  dp_unselected
+    LOAD_ADDR R3, str_mark
+    JMPA dp_marker
+dp_unselected:
+    LOAD_ADDR R3, str_blank
+dp_marker:
+    MOV  R1, R7
+    SUBI R1, R1, 8               ; x = 0 or 152, still even
+    MOV  R2, R8
+    CALLA gfx_text
 
     ; the register's name, from the 8-byte-per-entry table
     LI   R12, 8
@@ -249,6 +377,10 @@ vb_wait:
 
 str_title:
     DB "AURED  VOICE 0", 0
+str_mark:
+    DB ">", 0
+str_blank:
+    DB " ", 0
 
 ; Eight bytes per entry so the index is a shift, not a search. Names are
 ; six characters or fewer, which is what puts the value column at x+56.
@@ -272,5 +404,7 @@ reg_names:
 
     SECTION bss
 
+aured_cursor:
+    DS 2                         ; which register is selected, 0-15
 val_buf:
     DS 4                         ; '$', two digits, NUL
