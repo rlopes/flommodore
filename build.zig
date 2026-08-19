@@ -902,6 +902,11 @@ pub fn build(b: *std.Build) void {
     const gfxlib_step = b.step("gfxlib", "Assemble src/lib/gfxlib.asm");
     gfxlib_step.dependOn(&flas_gfxlib_run.step);
 
+    const flas_fmtlib_run = b.addRunArtifact(flas_exe);
+    flas_fmtlib_run.addFileArg(b.path("src/lib/fmtlib.asm"));
+    flas_fmtlib_run.addArg("-o");
+    const fmtlib_flobj = flas_fmtlib_run.addOutputFileArg("fmtlib.flobj");
+
     const flas_gfxdemo_run = b.addRunArtifact(flas_exe);
     flas_gfxdemo_run.addFileArg(b.path("examples/gfxdemo.asm"));
     flas_gfxdemo_run.addArg("-o");
@@ -910,6 +915,7 @@ pub fn build(b: *std.Build) void {
     const fll_gfxdemo_run = b.addRunArtifact(fll_exe);
     fll_gfxdemo_run.addFileArg(gfxdemo_flobj);
     fll_gfxdemo_run.addFileArg(gfxlib_flobj);
+    fll_gfxdemo_run.addFileArg(fmtlib_flobj);
     fll_gfxdemo_run.addArg("-s");
     fll_gfxdemo_run.addFileArg(b.path("examples/gfxdemo.flld"));
     fll_gfxdemo_run.addArg("-o");
@@ -923,7 +929,14 @@ pub fn build(b: *std.Build) void {
     gfxdemo_run.addArg(b.pathFromRoot("tests/roms/font.rom"));
     gfxdemo_run.addArg("--flapp");
     gfxdemo_run.addFileArg(gfxdemo_flapp);
-    gfxdemo_run.addArgs(&.{ "--frames", "2", "--expect-pass" });
+    gfxdemo_run.addArgs(&.{
+        "--frames",
+        "2",
+        "--expect-pass",
+        "--golden",
+        "9fa05d01581f401280c860038e96a1311437aa6caa26d02eebe39ad0a2100b28",
+        "--quiet",
+    });
     gfxdemo_run.step.dependOn(&genroms_run.step); // font.rom must exist
     gfxdemo_run.has_side_effects = true;
     const gfxtest_step = b.step("gfxtest", "Block 17 e2e: gfxlib draws text into the framebuffer");
