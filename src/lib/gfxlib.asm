@@ -37,14 +37,25 @@
 ;
 ; So each pen (a foreground/background pair) gets a 256x8 lookup: entry b is
 ; the eight ready-made pixel bytes for font row byte b. A glyph row becomes
-; one LB and four SW, a glyph is ~64 instructions, and a full repaint is 23%
-; of a frame.
+; one LB, four LW/SW pairs and its loop, which MEASURES at ~150 cycles per
+; glyph — not the ~64 an earlier version of this comment claimed by counting
+; the stores and forgetting the address arithmetic and the loop.
 ;
-; ONE PEN, REBUILT ON DEMAND. The Phase 9 plan called for 6-8 cached pens at
-; 2 KB each. Measured, a rebuild is ~16k instructions — under 7% of a frame —
-; so caching eight would spend 16 KB of RAM and a cache-invalidation problem
-; to save something already cheap. AURED changes pen a handful of times per
-; repaint, not per glyph.
+; At 150 cycles a glyph, a full 40x22 repaint is ~132,000 cycles, or 55% of
+; a frame. That is affordable for a panel of a few hundred characters and
+; NOT affordable for a full screen of text every frame; an app that wants
+; the latter needs the VIC's own text mode, not this.
+;
+; ONE PEN, REBUILT ON DEMAND — AND NEVER PER FRAME. The Phase 9 plan called
+; for 6-8 cached pens at 2 KB each. A rebuild measures ~23,500 cycles, so
+; caching eight would spend 16 KB of RAM and a cache-invalidation problem to
+; save something that is cheap IF it happens rarely.
+;
+; The trap is that 23,500 cycles is 10% of a frame, so a gfx_pen call inside
+; a repaint loop costs more than everything it draws. AURED hit exactly that
+; and its repaint budget check caught it. Call gfx_pen when the colours
+; change, at startup or on a page switch — not once per frame, and never
+; once per glyph.
 ;
 ; X MUST BE EVEN for gfx_glyph and gfx_text. A glyph row is written as four
 ; 16-bit stores, so an odd x would misalign every one of them. The character
@@ -193,19 +204,25 @@ gfx_glyph:
     PUSH R5
     PUSH R6
     PUSH R7
+    PUSH R8
+    PUSH R9
     GFX_ADDR R5, R1, R2          ; R5 = &framebuffer[y][x]
     ANDI R3, R3, $FF             ; R6 = &font[char]
     LI   R12, 8
     MUL  R6, R3, R12
     LOAD_ADDR R12, FONT
     ADD  R6, R6, R12
+    ; Both of these are the same for all eight rows, so they are computed
+    ; once. Recomputing them inside the loop cost ~12 cycles a glyph, which
+    ; is invisible on one glyph and 2,000 cycles on a page.
+    LOAD_ADDR R8, gfx_pentab
+    LI   R9, FBW
     LI   R7, 0
 gl_row:
     LB   R3, [R6]                ; this row's bit pattern…
     LI   R12, 8
     MUL  R3, R3, R12
-    LOAD_ADDR R12, gfx_pentab
-    ADD  R3, R3, R12             ; …becomes eight ready-made pixel bytes
+    ADD  R3, R3, R8              ; …becomes eight ready-made pixel bytes
     LW   R12, [R3]
     SW   [R5], R12
     LW   R12, [R3 + 2]
@@ -215,11 +232,12 @@ gl_row:
     LW   R12, [R3 + 6]
     SW   [R5 + 6], R12
     ADDI R6, R6, 1
-    LI   R12, FBW
-    ADD  R5, R5, R12             ; next scanline
+    ADD  R5, R5, R9              ; next scanline
     ADDI R7, R7, 1
     CMPI R7, 8
     BNE  gl_row
+    POP  R9
+    POP  R8
     POP  R7
     POP  R6
     POP  R5

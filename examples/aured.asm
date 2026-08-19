@@ -16,8 +16,12 @@
 ; what changed. Costed against the real page, that optimises the wrong
 ; thing:
 ;
-;   full repaint of this page   ~14,000 cycles    6% of a frame
+;   full repaint of this page   ~28,000 cycles   12% of a frame
 ;   gfx_clear                   115,200 cycles   48% of a frame
+;
+; (The 28,000 is measured after hoisting gfx_pen out of the repaint. With
+; the pen rebuilt per frame it was 54,300, which the budget check caught —
+; the estimate that preceded it said 14,000 and was wrong twice over.)
 ;
 ; Repainting everything every frame is affordable; CLEARING is what is not.
 ; And because glyphs paint their own background through the expansion table,
@@ -65,6 +69,14 @@ start:
     CALLA gfx_init
     LI   R1, PEN_BG
     CALLA gfx_clear              ; once, at startup — never per frame
+
+    ; The pen is startup work too, and for the same reason: a rebuild is
+    ; ~23,500 cycles, so calling it inside draw_page cost more than every
+    ; glyph the page draws. The first version of this file did exactly that
+    ; and the repaint budget check below reported 54,300 cycles.
+    LI   R1, PEN_FG
+    LI   R2, PEN_BG
+    CALLA gfx_pen
 
     ; ---- time one repaint -------------------------------------------
     MFSR R9, CYC
@@ -155,9 +167,6 @@ draw_page:
     PUSH R7
     PUSH R8
 
-    LI   R1, PEN_FG
-    LI   R2, PEN_BG
-    CALLA gfx_pen
     LI   R1, 8
     LI   R2, 0
     LOAD_ADDR R3, str_title
