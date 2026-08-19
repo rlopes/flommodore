@@ -1,10 +1,21 @@
 ; ============================================================================
 ; demobank.asm — the starter .flsnd bank (Block 16, task 16.7).
 ;
-; Assembled absolute at $00000 and framed by `fll --raw`, so the output is
-; the bank file itself, byte for byte — no header, no relocation. fldisk
-; then puts it on a volume as DEMOBANK, and examples/sndbank_demo.asm reads
-; it back through the BIOS storage syscalls.
+; Assembled absolute and framed by `fll --raw`, so the output is the bank
+; file itself, byte for byte — no header, no relocation. fldisk then puts
+; it on a volume as DEMOBANK, and examples/sndbank_demo.asm reads it back
+; through the BIOS storage syscalls.
+;
+; WHY ORG $01000 AND NOT $00000. The bank is pure data; the address it is
+; assembled at is arbitrary and never appears in the output. It cannot be
+; zero, though: fll's raw emitter treats `load_addr == 0` as the marker for
+; "relocatable section" (loader.zig's Section comment says so outright), so
+; an honest ORG $00000 is indistinguishable from an unplaced one and gets
+; rejected. Address 0 is a legal ORG target — it is the vector page — so
+; that sentinel is a real limitation rather than a rule. Fixing it needs a
+; mode field in .flobj, and the v1.1 header has no spare byte, which is a
+; disproportionate change for something no real program wants. Recorded
+; here because this file is where the next person will meet it.
 ;
 ; Written as assembly rather than emitted by a tool so the bank stays
 ; reviewable and diffable in the repository: a patch is 128 bytes of
@@ -27,7 +38,7 @@
 ; more in DB lines now would be five more to re-author later.
 ; ============================================================================
 
-    ORG $00000
+    ORG $01000
 
 ; ---------------------------------------------------------------------------
 ; Bank header (v1.3 §5.3)
