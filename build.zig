@@ -942,6 +942,41 @@ pub fn build(b: *std.Build) void {
     const gfxtest_step = b.step("gfxtest", "Block 17 e2e: gfxlib draws text into the framebuffer");
     gfxtest_step.dependOn(&gfxdemo_run.step);
 
+    // ------------------------------------------------------------------
+    // Block 17: AURED. Three objects — the app plus gfxlib and fmtlib — so
+    // this is the first program here to link two libraries at once.
+    //
+    // Runs against the BIOS ROM for its full font (gfxlib reads $FE000 and
+    // the page shows digits, which font.rom has no glyphs for), but does
+    // NOT autoboot: the .flapp loader gives it the D12 environment, and
+    // nothing it calls needs the BIOS to have initialised its RAM.
+    // ------------------------------------------------------------------
+    const flas_aured_run = b.addRunArtifact(flas_exe);
+    flas_aured_run.addFileArg(b.path("examples/aured.asm"));
+    flas_aured_run.addArg("-o");
+    const aured_flobj = flas_aured_run.addOutputFileArg("aured.flobj");
+
+    const fll_aured_run = b.addRunArtifact(fll_exe);
+    fll_aured_run.addFileArg(aured_flobj);
+    fll_aured_run.addFileArg(gfxlib_flobj);
+    fll_aured_run.addFileArg(fmtlib_flobj);
+    fll_aured_run.addArg("-s");
+    fll_aured_run.addFileArg(b.path("examples/aured.flld"));
+    fll_aured_run.addArg("-o");
+    const aured_flapp = fll_aured_run.addOutputFileArg("aured.flapp");
+
+    // No --golden: the app asserts its own repaint cost and outline pixels,
+    // and a frame hash over BIOS-font glyphs would pin bitmaps this project
+    // has never derived expected values for.
+    const aured_run = b.addRunArtifact(harness_exe);
+    aured_run.addArg("--rom");
+    aured_run.addFileArg(bios_rom);
+    aured_run.addArg("--flapp");
+    aured_run.addFileArg(aured_flapp);
+    aured_run.addArgs(&.{ "--frames", "8", "--expect-pass" });
+    const aured_step = b.step("auredtest", "Block 17 e2e: AURED repaints a page within budget");
+    aured_step.dependOn(&aured_run.step);
+
     const examples_update = b.addUpdateSourceFiles();
     examples_update.addCopyFileToSource(hello_flapp, "examples/hello.flapp");
     examples_update.addCopyFileToSource(bhello_flapp, "examples/bios_hello.flapp");
@@ -1081,4 +1116,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&snddemo_run.step); // Block 16 sndlib links and sounds
     test_step.dependOn(&bankdemo_run.step); // Block 16 bank off a real disk
     test_step.dependOn(&gfxdemo_run.step); // Block 17 gfxlib draws text
+    test_step.dependOn(&aured_run.step); // Block 17 AURED repaint budget
 }
