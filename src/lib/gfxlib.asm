@@ -1,5 +1,5 @@
 ; ============================================================================
-; gfxlib.asm — bitmap drawing for the Flommodore (Block 17, tasks 17.1-17.2).
+; gfxlib.asm — bitmap drawing for the Flommodore (Block 17, tasks 17.1-17.3).
 ;
 ; 320x180 at 8bpp, one byte per pixel, framebuffer at $44000. A relocatable
 ; library like sndlib: assemble with flas, link into any .flapp.
@@ -10,11 +10,22 @@
 ; different purpose would be worse than saying so here. R6-R11, R13, LR and
 ; SP are preserved as usual.
 ;
-;   gfx_init()                   bitmap mode, grey palette, framebuffer live
-;   gfx_pen(fg, bg)              build the glyph expansion table
-;   gfx_clear(colour)            fill the framebuffer
-;   gfx_glyph(x, y, char)        one 8x8 character
-;   gfx_text(x, y, str)          NUL-terminated, advancing 8 px per glyph
+;   gfx_init()                       bitmap mode, grey palette, framebuffer
+;   gfx_pen(fg, bg)                  build the glyph expansion table
+;   gfx_clear(colour)                fill the framebuffer
+;   gfx_glyph(x, y, char)            one 8x8 character
+;   gfx_text(x, y, str)              NUL-terminated, 8 px per glyph
+;   gfx_plot(x, y, colour)           one pixel
+;   gfx_hline(x, y, w, colour)       horizontal run
+;   gfx_vline(x, y, h, colour)       vertical run
+;   gfx_rect(x, y, w, h, colour)     filled
+;   gfx_frame(x, y, w, h, colour)    outline only
+;
+; NO CLIPPING, anywhere. Callers keep x in 0..319 and y in 0..179, and a run
+; that leaves the right edge wraps onto the next scanline rather than
+; erroring. AURED lays out fixed panels at compile time, so clipping would
+; be code that never runs; a program that computes its coordinates should
+; clamp them before calling.
 ;
 ; ----------------------------------------------------------------------------
 ; THE EXPANSION TABLE, which is the whole reason this is fast enough.
@@ -35,10 +46,11 @@
 ; to save something already cheap. AURED changes pen a handful of times per
 ; repaint, not per glyph.
 ;
-; X MUST BE EVEN. A glyph row is written as four 16-bit stores, so an odd x
-; would misalign every one of them. The character grid is 8 px anyway, so
-; this costs nothing in practice; it is a real constraint on gfx_glyph's
-; caller, not an implementation detail.
+; X MUST BE EVEN for gfx_glyph and gfx_text. A glyph row is written as four
+; 16-bit stores, so an odd x would misalign every one of them. The character
+; grid is 8 px anyway, so this costs nothing in practice; it is a real
+; constraint on the caller, not an implementation detail. The pixel and line
+; routines have no such rule — they store bytes.
 ;
 ; NEVER SHIFT BY 16 — a shift count masks to four bits, so SHL/SHR 16 is a
 ; shift by zero (see the same note in sndlib.asm and bios.asm). Nothing here
@@ -62,6 +74,14 @@
 MACRO LOAD_ADDR reg, addr
     LI   \reg, (\addr & $FFFF)
     LUI  \reg, (\addr >> 16)
+ENDMACRO
+
+MACRO GFX_ADDR reg, xr, yr       ; reg <- &framebuffer[yr][xr]; clobbers R12
+    LI   R12, FBW
+    MUL  \reg, \yr, R12
+    ADD  \reg, \reg, \xr
+    LOAD_ADDR R12, FB
+    ADD  \reg, \reg, R12
 ENDMACRO
 
 ; ----------------------------------------------------------------------------
@@ -166,18 +186,14 @@ clr_loop:
 
 ; ----------------------------------------------------------------------------
 ; gfx_glyph (R1 = x, R2 = y, R3 = character) — blit one 8x8 glyph in the
-; current pen. x MUST BE EVEN (see the header). No clipping: the caller
-; keeps x in 0..312 and y in 0..172. Clobbers R1-R3, R12; R5-R7 saved.
+; current pen. x MUST BE EVEN (see the header). Clobbers R1-R3, R12;
+; R5-R7 saved.
 ; ----------------------------------------------------------------------------
 gfx_glyph:
     PUSH R5
     PUSH R6
     PUSH R7
-    LI   R12, FBW                ; R5 = &framebuffer[y][x]
-    MUL  R5, R2, R12
-    ADD  R5, R5, R1
-    LOAD_ADDR R12, FB
-    ADD  R5, R5, R12
+    GFX_ADDR R5, R1, R2          ; R5 = &framebuffer[y][x]
     ANDI R3, R3, $FF             ; R6 = &font[char]
     LI   R12, 8
     MUL  R6, R3, R12
@@ -211,10 +227,7 @@ gl_row:
 
 ; ----------------------------------------------------------------------------
 ; gfx_text (R1 = x, R2 = y, R3 = NUL-terminated string) — draw a run of
-; glyphs, advancing 8 px each. Does not wrap: a caller that runs off the
-; right edge will scribble into the next scanline, which is the caller's
-; problem in the same way gfx_glyph's evenness is. Clobbers R1-R4, R12;
-; R5-R7 saved.
+; glyphs, advancing 8 px each. Clobbers R1-R4, R12; R5-R7 saved.
 ; ----------------------------------------------------------------------------
 gfx_text:
     PUSH LR
@@ -238,6 +251,133 @@ tx_done:
     POP  R7
     POP  R6
     POP  R5
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
+; gfx_plot (R1 = x, R2 = y, R3 = colour) — one pixel. Clobbers R4, R12.
+; ----------------------------------------------------------------------------
+gfx_plot:
+    GFX_ADDR R4, R1, R2
+    SB   [R4], R3
+    RET
+
+; ----------------------------------------------------------------------------
+; gfx_hline (R1 = x, R2 = y, R3 = width, R4 = colour) — a run of `width`
+; pixels rightward. Byte stores, so x and width may be odd. A width of 0
+; draws nothing. Clobbers R1, R3, R4, R12; R5 saved.
+; ----------------------------------------------------------------------------
+gfx_hline:
+    PUSH R5
+    MOV  R5, R4                  ; colour, before GFX_ADDR takes R4
+    GFX_ADDR R4, R1, R2
+hl_loop:
+    CMPI R3, 0
+    BEQ  hl_done
+    SB   [R4], R5
+    ADDI R4, R4, 1
+    SUBI R3, R3, 1
+    JMPA hl_loop
+hl_done:
+    POP  R5
+    RET
+
+; ----------------------------------------------------------------------------
+; gfx_vline (R1 = x, R2 = y, R3 = height, R4 = colour) — a run of `height`
+; pixels downward. Clobbers R1, R3, R4, R12; R5 saved.
+; ----------------------------------------------------------------------------
+gfx_vline:
+    PUSH R5
+    MOV  R5, R4
+    GFX_ADDR R4, R1, R2
+vl_loop:
+    CMPI R3, 0
+    BEQ  vl_done
+    SB   [R4], R5
+    LI   R12, FBW
+    ADD  R4, R4, R12
+    SUBI R3, R3, 1
+    JMPA vl_loop
+vl_done:
+    POP  R5
+    RET
+
+; ----------------------------------------------------------------------------
+; gfx_rect (R1 = x, R2 = y, R3 = w, R4 = h, R5 = colour) — filled, built
+; from h horizontal runs. Clobbers R1-R4, R12; R5-R8 saved.
+; ----------------------------------------------------------------------------
+gfx_rect:
+    PUSH LR
+    PUSH R6
+    PUSH R7
+    PUSH R8
+    MOV  R6, R1                  ; x, reloaded each row
+    MOV  R7, R3                  ; width
+    MOV  R8, R4                  ; rows remaining
+rc_loop:
+    CMPI R8, 0
+    BEQ  rc_done
+    MOV  R1, R6
+    MOV  R3, R7
+    MOV  R4, R5
+    CALLA gfx_hline              ; leaves R2 and R5 alone
+    ADDI R2, R2, 1
+    SUBI R8, R8, 1
+    JMPA rc_loop
+rc_done:
+    POP  R8
+    POP  R7
+    POP  R6
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
+; gfx_frame (R1 = x, R2 = y, R3 = w, R4 = h, R5 = colour) — the outline of
+; the same rectangle gfx_rect would fill, one pixel thick, interior
+; untouched. Two horizontal runs and two vertical ones; the corners get
+; written twice, which is cheaper than avoiding it.
+; Clobbers R1-R4, R12; R5-R9 saved.
+; ----------------------------------------------------------------------------
+gfx_frame:
+    PUSH LR
+    PUSH R6
+    PUSH R7
+    PUSH R8
+    PUSH R9
+    MOV  R6, R1                  ; x
+    MOV  R7, R2                  ; y
+    MOV  R8, R3                  ; w
+    MOV  R9, R4                  ; h
+
+    MOV  R4, R5                  ; top edge — R1/R2/R3 are already right
+    CALLA gfx_hline
+
+    MOV  R1, R6                  ; bottom edge
+    MOV  R2, R7
+    ADD  R2, R2, R9
+    SUBI R2, R2, 1
+    MOV  R3, R8
+    MOV  R4, R5
+    CALLA gfx_hline
+
+    MOV  R1, R6                  ; left edge
+    MOV  R2, R7
+    MOV  R3, R9
+    MOV  R4, R5
+    CALLA gfx_vline
+
+    MOV  R1, R6                  ; right edge
+    ADD  R1, R1, R8
+    SUBI R1, R1, 1
+    MOV  R2, R7
+    MOV  R3, R9
+    MOV  R4, R5
+    CALLA gfx_vline
+
+    POP  R9
+    POP  R8
+    POP  R7
+    POP  R6
     POP  LR
     RET
 
