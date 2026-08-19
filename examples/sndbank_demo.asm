@@ -88,35 +88,78 @@ read_done:
     BNE  fail
 
     ; ---- the wavetable path, which nothing else reaches -------------
+    ;
+    ; These checks REPORT THE BYTE THEY SAW. A bare "check 1 failed" says
+    ; only that something is wrong; the value says which thing. Each one
+    ; fails with R11 = (check << 8) | observed, so the harness prints
+    ; check #$01xx and the low byte is the register's actual content.
+    ; Checks 10-14 stay plain small numbers, so the two are never confused.
     LOAD_ADDR R4, AUR1
-    LI   R11, 1
+    LI   R11, $0100
     LB   R1, [R4 + $02]          ; VWAVE — waveform 6, from the disk
     CMPI R1, $06
-    BNE  fail
-    LI   R11, 2
+    BEQ  ck_vwtblo
+    OR   R11, R11, R1
+    JMPA fail
+ck_vwtblo:
+    LI   R11, $0200
     LB   R1, [R4 + $0B]          ; VWTBLO — slot 0 -> $11190 / 16
     CMPI R1, $19
-    BNE  fail
-    LI   R11, 3
+    BEQ  ck_vwtbhi
+    OR   R11, R11, R1
+    JMPA fail
+ck_vwtbhi:
+    LI   R11, $0300
     LB   R1, [R4 + $0C]          ; VWTBHI
     CMPI R1, $11
-    BNE  fail
+    BEQ  ck_wt0
+    OR   R11, R11, R1
+    JMPA fail
 
     ; …and the table really is there. Three points of the triangle:
     ; the start, the peak's midpoint, and the turn.
+ck_wt0:
     LOAD_ADDR R4, WTPOOL
-    LI   R11, 4
+    LI   R11, $0400
     LB   R1, [R4]
     CMPI R1, $00
-    BNE  fail
-    LI   R11, 5
+    BEQ  ck_wt64
+    OR   R11, R11, R1
+    JMPA fail
+ck_wt64:
+    LI   R11, $0500
     LB   R1, [R4 + 64]
     CMPI R1, $80
-    BNE  fail
-    LI   R11, 6
+    BEQ  ck_wt128
+    OR   R11, R11, R1
+    JMPA fail
+ck_wt128:
+    LI   R11, $0600
     LB   R1, [R4 + 128]
     CMPI R1, $FE
-    BNE  fail
+    BEQ  ck_done
+    OR   R11, R11, R1
+    JMPA fail
+
+    ; Two more, to separate "the copy is wrong" from "the bank is not
+    ; where snd_init thinks". Read the patch bytes straight out of RAM:
+    ; if these are right but VWAVE was not, the fault is in the copy.
+ck_done:
+    LOAD_ADDR R4, BANK
+    LI   R11, $0700
+    LB   R1, [R4 + 146]          ; patch 1 VWAVE, as it sits in RAM
+    CMPI R1, $06
+    BEQ  ck_ram2
+    OR   R11, R11, R1
+    JMPA fail
+ck_ram2:
+    LI   R11, $0800
+    LB   R1, [R4 + 4]            ; bank header patch count
+    CMPI R1, $03
+    BEQ  ck_ram_ok
+    OR   R11, R11, R1
+    JMPA fail
+ck_ram_ok:
 
     ; ---- sound it ---------------------------------------------------
     LI   R11, 14
