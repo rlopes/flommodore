@@ -2,7 +2,7 @@
 //!
 //! Usage:
 //!   fldisk create <image> [--sectors N] [--label TEXT]
-//!   fldisk add    <image> <file> --name NAME [--type AP|DT|SN|TX]
+//!   fldisk add    <image> <file> --name NAME [--type AP|DT|SN|TX] [-o out]
 //!   fldisk list   <image>
 //!
 //! Formats and populates the FLFS v1 volumes of amendment v1.3 §3, so a
@@ -23,6 +23,14 @@
 //!
 //! Layout (v1.3 §3): sector 0 volume header, sector 1 the 16-entry
 //! directory, sector 2 onward data.
+//!
+//! `add` writes back in place by default, which is what a person at a
+//! prompt wants — and exactly what a build graph cannot express. A build
+//! step's inputs are immutable and its outputs are cached, so a `create`
+//! that does not re-run followed by an `add` that does means adding the
+//! same file twice: DuplicateName, every build after the first. Passing
+//! `-o` makes `add` a pure function of its inputs, so the populated volume
+//! is a real build artifact rather than a mutation of one.
 //!
 //! SILENT ON SUCCESS, like flas and fll. Not a style preference: a Zig
 //! build step that declares an output file captures the child's streams
@@ -242,6 +250,7 @@ pub fn main(init: std.process.Init) !void {
         if (args.len < 4) return error.BadUsage;
         const src = args[3];
         var name: ?[]const u8 = null;
+        var out: ?[]const u8 = null;
         var kind: [2]u8 = .{ 'D', 'T' };
         var i: usize = 4;
         while (i < args.len) : (i += 1) {
@@ -249,6 +258,8 @@ pub fn main(init: std.process.Init) !void {
                 name = t;
             } else if (flagValue(args, &i, "--type")) |t| {
                 kind = try parseType(t);
+            } else if (flagValue(args, &i, "-o")) |t| {
+                out = t;
             } else {
                 std.debug.print("fldisk: unknown option {s}\n", .{args[i]});
                 return error.BadUsage;
@@ -268,7 +279,9 @@ pub fn main(init: std.process.Init) !void {
         if (data.len >= 2 and data[0] == 'F' and data[1] == 'B') kind = .{ 'A', 'P' };
         const index = try v.allocate(wanted, sectors, kind);
         v.writeData(index, data);
-        var file = try cwd.createFile(io, path, .{});
+        // -o writes a new volume and leaves the input untouched; without
+        // it the volume is updated in place.
+        var file = try cwd.createFile(io, out orelse path, .{});
         defer file.close(io);
         try file.writeStreamingAll(io, bytes);
         return;

@@ -845,13 +845,16 @@ pub fn build(b: *std.Build) void {
     const bank_disk = bankdisk_run.addOutputFileArg("demobank.fldisk");
     bankdisk_run.addArgs(&.{ "--sectors", "64", "--label", "SOUNDS" });
 
+    // -o, so `add` is a pure function of its inputs. Without it the step
+    // would mutate bankdisk_run's cached output, and since `create` does
+    // not re-run while `add` does, every build after the first would try
+    // to add DEMOBANK to a volume that already has it.
     const bankadd_run = b.addRunArtifact(fldisk_exe);
     bankadd_run.addArg("add");
     bankadd_run.addFileArg(bank_disk);
     bankadd_run.addFileArg(bank_flsnd);
-    bankadd_run.addArgs(&.{ "--name", "DEMOBANK", "--type", "SN" });
-    bankadd_run.step.dependOn(&bankdisk_run.step);
-    bankadd_run.has_side_effects = true; // writes the volume in place
+    bankadd_run.addArgs(&.{ "--name", "DEMOBANK", "--type", "SN", "-o" });
+    const bank_volume = bankadd_run.addOutputFileArg("sounds.fldisk");
 
     const flas_bankdemo_run = b.addRunArtifact(flas_exe);
     flas_bankdemo_run.addFileArg(b.path("examples/sndbank_demo.asm"));
@@ -874,9 +877,8 @@ pub fn build(b: *std.Build) void {
     bankdemo_run.addArg("--flapp");
     bankdemo_run.addFileArg(bankdemo_flapp);
     bankdemo_run.addArg("--disk");
-    bankdemo_run.addFileArg(bank_disk);
+    bankdemo_run.addFileArg(bank_volume);
     bankdemo_run.addArgs(&.{ "--frames", "12", "--expect-pass" });
-    bankdemo_run.step.dependOn(&bankadd_run.step);
     const banktest_step = b.step("banktest", "Block 16 e2e: a .flsnd bank loaded off an FLFS volume");
     banktest_step.dependOn(&bankdemo_run.step);
 
