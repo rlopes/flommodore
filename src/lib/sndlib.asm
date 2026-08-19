@@ -45,6 +45,21 @@
 ; The voice blocks have the same shape for a different reason: +$0B/+$0C
 ; hold a wavetable SLOT, which has to be resolved to an address, and +$03's
 ; gate bit must not arrive set or loading a patch would sound it.
+;
+; ----------------------------------------------------------------------------
+; NEVER SHIFT BY 16. The Gab-16 masks a shift count to FOUR BITS
+; (cpu.zig's shiftAmount truncates rb to u4), so SHL/SHR by 16 is a shift by
+; ZERO — silently, with no trap. Registers are 20 bits wide, so splitting a
+; pointer into halves is exactly the operation that wants a 16-shift, and
+; exactly the one that cannot have it. Every high half here is done as TWO
+; shifts of 8, the idiom tests/genroms.zig spells out as "shift down 8+8".
+;
+; This cost a full debugging cycle: snd_init stored $11000 unshifted, kept
+; its low half, and snd_load_patch then read patches from $01090 instead of
+; $11090 — zeroed RAM, so every register came back 0 with no error anywhere.
+; A pointer below $10000 hides it completely, which is why the earlier
+; embedded-bank demos passed.
+; ----------------------------------------------------------------------------
 ; ============================================================================
 
 ; The note table and its EQUs come first so the code section can use them:
@@ -92,8 +107,9 @@ snd_init:
 
     LOAD_ADDR R4, snd_bank       ; a 20-bit pointer in two words
     SW   [R4], R5
-    LI   R1, 16
-    SHR  R1, R5, R1
+    LI   R12, 8                  ; TWO shifts of 8, never one of 16 — see
+    SHR  R1, R5, R12             ; the note at the top of this file
+    SHR  R1, R1, R12
     SW   [R4 + 2], R1
 
     ; Wavetable pool sits after the header and the patches. VWTB counts
@@ -122,7 +138,8 @@ snd_init:
     ADD  R1, R1, R5
     LOAD_ADDR R4, snd_modbase
     SW   [R4], R1
-    LI   R12, 16
+    LI   R12, 8
+    SHR  R1, R1, R12
     SHR  R1, R1, R12
     SW   [R4 + 2], R1
 
@@ -177,7 +194,8 @@ snd_load_patch:
     ADDI R5, R5, 16              ; past the bank header
     LOAD_ADDR R4, snd_bank
     LW   R6, [R4 + 2]
-    LI   R12, 16
+    LI   R12, 8
+    SHL  R6, R6, R12
     SHL  R6, R6, R12
     LW   R12, [R4]
     OR   R6, R6, R12
@@ -185,8 +203,9 @@ snd_load_patch:
 
     LOAD_ADDR R4, snd_patch      ; snd_tick needs it later
     SW   [R4], R5
-    LI   R12, 16
-    SHR  R12, R5, R12
+    LI   R2, 8
+    SHR  R12, R5, R2
+    SHR  R12, R12, R2
     SW   [R4 + 2], R12
 
     LI   R6, 0                   ; voice index
@@ -424,7 +443,8 @@ tick_wait:
 tick_run:
     LOAD_ADDR R4, snd_patch      ; R7 = the patch being played
     LW   R7, [R4 + 2]
-    LI   R12, 16
+    LI   R12, 8
+    SHL  R7, R7, R12
     SHL  R7, R7, R12
     LW   R12, [R4]
     OR   R7, R7, R12
@@ -467,7 +487,8 @@ tick_step:
 
     LOAD_ADDR R12, snd_modbase   ; R9 = the byte at that step
     LW   R9, [R12 + 2]
-    LI   R3, 16
+    LI   R3, 8
+    SHL  R9, R9, R3
     SHL  R9, R9, R3
     LW   R3, [R12]
     OR   R9, R9, R3
