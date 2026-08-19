@@ -878,7 +878,14 @@ pub fn build(b: *std.Build) void {
     bankdemo_run.addFileArg(bankdemo_flapp);
     bankdemo_run.addArg("--disk");
     bankdemo_run.addFileArg(bank_volume);
-    bankdemo_run.addArgs(&.{ "--frames", "12", "--expect-pass" });
+    bankdemo_run.addArgs(&.{
+        "--frames",
+        "12",
+        "--expect-pass",
+        "--audio-golden",
+        "8450d53e07cbb22da56e5e002e1e2d35abd68962f002d8175d64e81d0c47f404",
+        "--quiet",
+    });
     const banktest_step = b.step("banktest", "Block 16 e2e: a .flsnd bank loaded off an FLFS volume");
     banktest_step.dependOn(&bankdemo_run.step);
 

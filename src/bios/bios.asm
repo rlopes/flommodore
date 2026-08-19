@@ -29,6 +29,15 @@
 ; v1 — "not populated". Nothing verifies it, and the assembler cannot hash
 ; its own output; a nonzero value would be a lie.
 ;
+; SHIFT COUNTS MASK TO FOUR BITS. cpu.zig's shiftAmount truncates rb to u4,
+; so SHL/SHR by 16 is a shift by ZERO — silently, with no trap. A 20-bit
+; register therefore cannot have its halves split by any single instruction,
+; and every high nibble in this file is taken as TWO shifts of 8, the idiom
+; genroms.zig spells out as "shift down 8+8". Three places here had it
+; wrong — autoboot's load address, SYS_IRQSET's stored handler, and
+; irq_entry's reassembly — and all three were latent, because every address
+; the tests use sits below $10000 where a zero high nibble hides the fault.
+;
 ; Console semantics (decision bl — the spec names the calls but not the
 ; edge behaviour): SYS_PUTCHAR renders every byte as its font glyph except
 ; $0A (LF: column 0, row advance), $0D (CR: column 0), and $08 (BS:
@@ -350,7 +359,8 @@ boot:
     BCS  autoboot_bad        ; more than the machine has
     LW   R2, [R5 + 8]        ; load address, 32-bit LE masked to 20
     LW   R3, [R5 + 10]
-    LI   R12, 16
+    LI   R12, 8              ; TWO shifts of 8: a shift count masks to four
+    SHL  R3, R3, R12         ; bits, so SHL 16 is a shift by ZERO (D-shift)
     SHL  R3, R3, R12
     OR   R2, R2, R3
     ADD  R1, R1, R2
@@ -1320,8 +1330,9 @@ sys_irqset:
     LI   R12, DISPATCH
     ADD  R4, R4, R12
     SW   [R4], R2            ; bits 15:0
-    LI   R12, 16
-    SHR  R12, R2, R12
+    LI   R1, 8               ; two shifts of 8 — see the note below
+    SHR  R12, R2, R1
+    SHR  R12, R12, R1
     SW   [R4 + 2], R12       ; bits 19:16
     RET
 
@@ -1458,7 +1469,8 @@ irq_scan:
     ADD  R3, R3, R12
     LW   R4, [R3 + 2]        ; handler bits 19:16
     LW   R3, [R3]            ; handler bits 15:0
-    LI   R12, 16
+    LI   R12, 8              ; two shifts of 8 — see the note below
+    SHL  R4, R4, R12
     SHL  R4, R4, R12
     OR   R3, R3, R4
     CMPI R3, 0
