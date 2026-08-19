@@ -277,7 +277,22 @@ pub fn main(init: std.process.Init) !void {
         var frame: u64 = 0;
         var audio_hash = std.crypto.hash.sha2.Sha256.init(.{});
         var wav_samples: std.ArrayList(i16) = .empty;
+        var key_idx: usize = 0;
         while (frame < opts.frames and !io_dev.power_off) : (frame += 1) {
+            // Host-input injection, at FRAME boundaries. Cycle mode places
+            // events to the cycle because it is testing the device; frame
+            // mode is testing an application, and an application reads the
+            // keyboard once a frame — so anything finer than a frame is
+            // finer than the guest can observe. An event whose cycle has
+            // passed is delivered at the start of the next frame.
+            //
+            // Without this, no interactive program could be tested at all:
+            // --key-at existed only in cycle mode, and a UI needs frame
+            // mode for its VBLANK waits and its frame hash.
+            const frame_cycle = @as(u64, frame) * util.cycles_per_frame;
+            while (key_idx < opts.key_count and frame_cycle >= opts.key_at[key_idx].cycle) : (key_idx += 1) {
+                io_dev.keyEvent(opts.key_at[key_idx].code);
+            }
             m.runFrame();
             // Audio: hash every frame's samples (task 7.22) and optionally
             // accumulate for the WAV dump; then drain.
