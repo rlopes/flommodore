@@ -167,6 +167,61 @@ delta_frames:
 
     LI   R1, 0
     CALLA snd_note_off
+
+    ; ---- store the patch back, and check what survived --------------
+    ; snd_store_patch is the inverse of load for the bytes the chip holds
+    ; and a no-op for the nine it does not. Patch 2's mod mask and its
+    ; metadata are what make this worth testing: a save that snapshotted
+    ; the registers would overwrite the mask with VWTBHI and lose the
+    ; architecture, transpose and tick divider entirely.
+    LI   R11, 20
+    LI   R1, 2
+    CALLA snd_store_patch
+    CMPI R1, 0
+    BNE  fail
+
+    ; patch 2 lives at bank + 16 + 2*128 = bank + 272
+    LOAD_ADDR R4, bank
+    LI   R12, 272
+    ADD  R4, R4, R12
+
+    LI   R11, $1800
+    LB   R1, [R4 + $03]          ; VCTRL: gate must NOT be saved set
+    ANDI R1, R1, $80
+    CMPI R1, $00
+    BEQ  ck_store_mask
+    OR   R11, R11, R1
+    JMPA fail
+ck_store_mask:
+    LI   R11, $1900
+    LB   R1, [R4 + $0C]          ; mod mask, preserved not clobbered
+    CMPI R1, $03
+    BEQ  ck_store_slot
+    OR   R11, R11, R1
+    JMPA fail
+ck_store_slot:
+    LI   R11, $1A00
+    LB   R1, [R4 + $0B]          ; VWTB derived back to slot 0
+    CMPI R1, $00
+    BEQ  ck_store_meta
+    OR   R11, R11, R1
+    JMPA fail
+ck_store_meta:
+    LI   R11, $1B00
+    LB   R1, [R4 + $4D]          ; tick divider, metadata: still 1
+    CMPI R1, $01
+    BEQ  ck_store_wave
+    OR   R11, R11, R1
+    JMPA fail
+ck_store_wave:
+    LI   R11, $1C00
+    LB   R1, [R4 + $02]          ; VWAVE really did come from the chip
+    CMPI R1, $03                 ; patch 2 is a sawtooth
+    BEQ  ck_store_done
+    OR   R11, R11, R1
+    JMPA fail
+ck_store_done:
+
     CALLA wait_vblank            ; let the release start before we halt
 
     LI   R11, $600D

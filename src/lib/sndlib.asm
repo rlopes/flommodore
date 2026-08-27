@@ -18,6 +18,7 @@
 ;   snd_note_on(R1 = voice, R2 = note)
 ;   snd_note_off(R1 = voice)
 ;   snd_stop_all()
+;   snd_store_patch(R1 = index)     chip -> patch, the inverse of load
 ;   snd_tick()                      advance the mod tables, once a frame
 ;
 ; ----------------------------------------------------------------------------
@@ -45,6 +46,28 @@
 ; The voice blocks have the same shape for a different reason: +$0B/+$0C
 ; hold a wavetable SLOT, which has to be resolved to an address, and +$03's
 ; gate bit must not arrive set or loading a patch would sound it.
+;
+; ----------------------------------------------------------------------------
+; A PATCH IS NOT RECOVERABLE FROM THE CHIP, which is why snd_store_patch
+; UPDATES a record rather than building one.
+;
+; Nine bytes of every patch never reach the AUR-1 at all:
+;
+;   voice +$0C   mod mask     the chip uses that offset for VWTBHI
+;   global +$0B  architecture   ) all five sit on ASTAT, AOSCSEL, AOSC and
+;   global +$0C  transpose      ) AENV, which a loader must not write —
+;   global +$0D  tick divider   ) see the correction note above
+;   global +$0E  flags          )
+;   global +$0F  reserved       )
+;
+; A tenth, the wavetable slot at voice +$0B, survives only because it can be
+; derived back out of VWTB: slot = (VWTB - pool) / 16.
+;
+; So a save that snapshotted the registers would silently drop a patch's
+; architecture, transpose, tick rate and every mod-table routing — the parts
+; that make it a program rather than a chord. snd_store_patch writes back
+; only what the chip actually holds and leaves the rest of the record alone.
+; ----------------------------------------------------------------------------
 ;
 ; ----------------------------------------------------------------------------
 ; NEVER SHIFT BY 16. The Gab-16 masks a shift count to FOUR BITS
@@ -318,6 +341,106 @@ lp_modclear:
     ADDI R1, R1, 1
     CMPI R1, 4
     BNE  lp_modclear
+
+    LI   R1, 0
+    POP  R7
+    POP  R6
+    POP  R5
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
+; snd_store_patch (R1 = patch index) — write the chip's live state back into
+; patch `index` of the loaded bank, in place. R1 <- 0. Clobbers R1-R4, R12;
+; R5-R7 saved.
+;
+; The exact inverse of snd_load_patch for the bytes the chip holds, and a
+; deliberate no-op for the nine it does not (see the header). The gate is
+; masked off on the way out for the same reason it is masked on the way in:
+; a saved patch that sounds the moment it is loaded is a broken patch.
+;
+; The bank must be writable. An embedded bank in a program's data section is;
+; one still sitting in a disk buffer is too, but a caller that wants the
+; result persisted has to write the sectors itself afterwards.
+; ----------------------------------------------------------------------------
+snd_store_patch:
+    PUSH LR
+    PUSH R5
+    PUSH R6
+    PUSH R7
+    ANDI R1, R1, $1F
+    LI   R12, 128
+    MUL  R5, R1, R12
+    ADDI R5, R5, 16
+    LOAD_ADDR R4, snd_bank
+    LW   R6, [R4 + 2]
+    LI   R12, 8
+    SHL  R6, R6, R12             ; two shifts of 8, never one of 16
+    SHL  R6, R6, R12
+    LW   R12, [R4]
+    OR   R6, R6, R12
+    ADD  R5, R5, R6              ; R5 = patch base
+
+    LI   R6, 0                   ; voice index
+sp_voice:
+    MOV  R1, R6
+    VOICE_BASE R7, R1            ; R7 = chip voice base
+    LI   R12, 16
+    MUL  R4, R6, R12
+    ADD  R4, R4, R5              ; R4 = patch voice block
+
+    LI   R1, 0
+sp_byte:
+    CMPI R1, $03                 ; gate is masked, below
+    BEQ  sp_skip
+    CMPI R1, $0B                 ; slot is derived, below
+    BEQ  sp_skip
+    CMPI R1, $0C                 ; mod mask: the chip has VWTBHI here, so
+    BEQ  sp_skip                 ; copying it would destroy the routing
+    ADD  R12, R7, R1
+    LB   R2, [R12]
+    ADD  R12, R4, R1
+    SB   [R12], R2
+sp_skip:
+    ADDI R1, R1, 1
+    CMPI R1, $0F
+    BNE  sp_byte
+
+    LB   R2, [R7 + $03]          ; ring and sync keep; the gate does not
+    ANDI R2, R2, $60
+    SB   [R4 + $03], R2
+
+    ; VWTB back to a slot number. Both are in 16-byte units, and a table is
+    ; 256 bytes, so the difference divides by 16 exactly.
+    LB   R2, [R7 + $0B]
+    LB   R12, [R7 + $0C]
+    LI   R1, 8
+    SHL  R12, R12, R1
+    OR   R2, R2, R12
+    LOAD_ADDR R12, snd_wtdiv16
+    LW   R12, [R12]
+    SUB  R2, R2, R12
+    LI   R1, 4
+    SHR  R2, R2, R1
+    ANDI R2, R2, $0F
+    SB   [R4 + $0B], R2
+
+    ADDI R6, R6, 1
+    CMPI R6, 4
+    BNE  sp_voice
+
+    ; Globals +$00..+$0A only. +$0B..+$0F are the patch's own metadata and
+    ; the chip has never held them.
+    LOAD_ADDR R7, AURG
+    LI   R1, 0
+sp_glob:
+    ADD  R12, R7, R1
+    LB   R2, [R12]
+    ADD  R12, R5, R1
+    SB   [R12 + $40], R2
+    ADDI R1, R1, 1
+    CMPI R1, $0B
+    BNE  sp_glob
 
     LI   R1, 0
     POP  R7
