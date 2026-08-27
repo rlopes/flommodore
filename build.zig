@@ -999,12 +999,15 @@ pub fn build(b: *std.Build) void {
     // Two Downs then two Rights, one per frame boundary. Frame-mode
     // injection lands the event at the start of the next frame, which is
     // the granularity a UI reads at anyway.
+    // Down, Down, Right, Right — then SPACE, and two frames for the 16 ms
+    // attack to get the envelope off zero before the checks read it.
     aured_run.addArgs(&.{
-        "--frames",     "8",
+        "--frames",     "14",
         "--key-at",     "240000:0051", // Down
         "--key-at",     "480000:0051", // Down
         "--key-at",     "720000:004F", // Right
         "--key-at",     "960000:004F", // Right
+        "--key-at",     "1200000:002C", // SPACE — play the patch
         "--expect-pass",
     });
     const aured_step = b.step("auredtest", "Block 17 e2e: AURED repaints a page within budget");

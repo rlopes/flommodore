@@ -13,8 +13,15 @@
 ;
 ; Voice 0's sixteen registers, one selected. Up and Down move the selection,
 ; Right and Left adjust the selected register by one and write it to the
-; chip. Arrows rather than +/- so no modifier decoding is needed, and the
-; keys a value editor wants are the ones next to each other.
+; chip, and SPACE plays the patch so you can hear what you just changed.
+; Arrows rather than +/- so no modifier decoding is needed, and the keys a
+; value editor wants are the ones next to each other.
+;
+; It starts from a real patch rather than a chip full of zeros. An embedded
+; one-patch bank is loaded through sndlib at startup, which is what makes
+; the panel and the envelope readout show something worth editing — and what
+; makes SPACE audible, since a voice with VVOL 0 and nothing routed into the
+; mixer would play silence however correct the rest of it was.
 ;
 ; ----------------------------------------------------------------------------
 ; NO DAMAGE LIST, which revises the Phase 9 plan's task 17.5.
@@ -75,6 +82,8 @@
     EQU KEY_DOWN,  $51
     EQU KEY_LEFT,  $50
     EQU KEY_RIGHT, $4F
+    EQU KEY_SPACE, $2C           ; play the patch
+    EQU KEY_ESC,   $29           ; release every voice
 
     EQU PANEL_X, 4
     EQU PANEL_Y, 12
@@ -108,6 +117,22 @@ start:
 
     LOAD_ADDR R4, aured_cursor
     SW   [R4], R0                ; selection starts on FREQLO
+
+    ; The starting patch. snd_init also gives sndlib its bank pointer and
+    ; pool addresses, which snd_note_on and snd_load_patch both need — and
+    ; without it snd_transpose would be whatever bss happened to contain,
+    ; since bss is NOLOAD and the boot RAM clear stops below $04100.
+    LI   R11, 20
+    LI   R1, (bank & $FFFF)
+    LUI  R1, (bank >> 16)
+    CALLA snd_init
+    CMPI R1, 0
+    BNE  fail
+    LI   R11, 21
+    LI   R1, 0
+    CALLA snd_load_patch
+    CMPI R1, 0
+    BNE  fail
 
     ; ---- time one repaint -------------------------------------------
     MFSR R9, CYC
@@ -173,7 +198,8 @@ ck_bottom:
     ; Six frames of the real thing: wait for the vertical blank, drain the
     ; keyboard, repaint. No clear, no damage tracking.
 run_loop:
-    LI   R6, 6
+    LI   R6, 10                  ; long enough for the injected keys plus
+                                 ; two frames of envelope after the note
 frame_loop:
     CALLA wait_vblank
     CALLA read_keys
@@ -194,8 +220,8 @@ frame_loop:
 ck_edited:
     LOAD_ADDR R4, AUR1
     LI   R11, $0700
-    LB   R1, [R4 + 2]            ; VWAVE, reset to 0, incremented twice
-    CMPI R1, 2
+    LB   R1, [R4 + 2]            ; VWAVE: the patch's 1, incremented twice
+    CMPI R1, 3
     BEQ  ck_tables
     OR   R11, R11, R1
     JMPA fail
@@ -231,17 +257,37 @@ ck_cutoff:
     OR   R11, R11, R1
     JMPA fail
 ck_readback:
-    ; Nothing is gated, so the envelope must read exactly silent. That also
-    ; proves AENV is reachable from a guest at all — until now only a test
-    ; ROM had ever read it.
+    ; SPACE was injected four frames before the loop ended, and the patch's
+    ; attack is 16 ms — about one frame — so by now the envelope must be
+    ; RUNNING. Zero here would mean the keypress never reached snd_note_on,
+    ; or that it did and the voice was never gated.
+    ;
+    ; This is the check the whole app is for: it passes only if a keystroke
+    ; became a sound, through the editor, sndlib, the chip's envelope
+    ; generator and the v1.3 readback that lets a guest see it happen.
     LOAD_ADDR R4, AURG
     LI   R11, $0B00
-    LB   R1, [R4 + $0E]
+    LB   R1, [R4 + $0E]          ; AENV
     CMPI R1, $00
+    BNE  ck_gate
+    OR   R11, R11, R1
+    JMPA fail
+ck_gate:
+    LOAD_ADDR R4, AUR1
+    LI   R11, $0D00
+    LB   R1, [R4 + $03]          ; VCTRL — the gate bit sndlib set
+    ANDI R1, R1, $80
+    CMPI R1, $80
     BEQ  ck_oscsel
     OR   R11, R11, R1
     JMPA fail
 ck_oscsel:
+    ; Reload the base. Inheriting R4 from the previous check is what broke
+    ; this once already: ck_gate was inserted between here and the block
+    ; that set R4 = AURG, so this read $8010C — voice 0's VWTBHI, whose
+    ; value is the wavetable pool base and looked plausible enough to be
+    ; confusing. Every check block sets up its own pointer.
+    LOAD_ADDR R4, AURG
     LI   R11, $0C00
     LB   R1, [R4 + $0C]          ; AOSCSEL, written 0 by draw_meters
     CMPI R1, $00
@@ -316,11 +362,33 @@ dk_right:
     CMPI R1, KEY_RIGHT
     BNE  dk_left
     LI   R3, 1
-    JMPA dk_adjust
+    JMPA dk_adjust               ; dk_adjust is no longer adjacent: dk_play
+                                 ; and dk_stop sit between, so NEITHER arm
+                                 ; can reach it by falling through
 dk_left:
     CMPI R1, KEY_LEFT
-    BNE  dk_ignore
+    BNE  dk_play
     LI   R3, -1
+    JMPA dk_adjust
+dk_play:
+    ; SPACE gates the voice through sndlib rather than by poking VCTRL, so
+    ; the note picks up whatever pitch the note table says for A4 and
+    ; whatever ring/sync the patch set — the same path a real program uses.
+    CMPI R1, KEY_SPACE
+    BNE  dk_stop
+    PUSH LR                      ; snd_note_on is a call; LR is live here
+    LI   R1, 0                   ; voice 0
+    LI   R2, 57                  ; A4
+    CALLA snd_note_on
+    POP  LR
+    RET
+dk_stop:
+    CMPI R1, KEY_ESC
+    BNE  dk_ignore
+    PUSH LR
+    CALLA snd_stop_all
+    POP  LR
+    RET
 dk_adjust:
     LOAD_ADDR R12, AUR1
     ADD  R12, R12, R2            ; the SELECTED register, not a fixed one
@@ -678,6 +746,43 @@ reg_names:
     DB "VOLR", 0, 0, 0, 0
     DB "VOLL", 0, 0, 0, 0
     DB "RSVD", 0, 0, 0, 0
+
+; ============================================================================
+; The starting patch: one voice, a square wave with an envelope you can hear
+; the shape of. Layout per amendment v1.3 §5.3 and §5.2.
+; ============================================================================
+bank:
+    DB $46, $53                  ; magic 'F','S'
+    DB $01, $00                  ; version 1
+    DB 1                         ; patch count
+    DB 0                         ; wavetable count
+    DB 0                         ; mod-table count
+    DB 0, 0, 0, 0, 0, 0, 0, 0, 0 ; reserved
+
+    DB $00, $00                  ; VFREQ  — snd_note_on sets the pitch
+    DB $01                       ; VWAVE  square
+    DB $00                       ; VCTRL  gate cleared on load
+    DB $24                       ; VADSR0 attack idx 2 (16 ms), decay 4 (114)
+    DB $C6                       ; VADSR1 sustain 12, release idx 6 (204 ms)
+    DB $00                       ; VPULSE
+    DB $FF                       ; VVOL
+    DB $00, $00                  ; VMOD
+    DB $00                       ; VFBK
+    DB $00                       ; wavetable slot
+    DB $00                       ; mod mask
+    DB $0F, $0F                  ; VVOLR, VVOLL — centre
+    DB $00                       ; reserved
+    DS 48                        ; voices 1-3 silent
+
+    DB $FF, $0F, $0F             ; AMVOL, AMVOLL, AMVOLR
+    DB $01                       ; AMVOICE — voice 0 into the mix
+    DB $00                       ; AMFILT  — dry
+    DB $00, $00, $00, $00        ; AFCUTLO/HI, AFRESON, AFMODE
+    DB $00                       ; ASRATE  44.1 kHz, the note table's rate
+    DB $00                       ; AIRQEN  — chip image ends here (§5.2)
+    DB $00, $00, $01, $00, $00   ; arch, transpose, tickdiv, flags, reserved
+    DB "INIT PATCH      "
+    DS 32                        ; no mod tables
 
     SECTION bss
 
