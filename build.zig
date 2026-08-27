@@ -366,10 +366,16 @@ pub fn build(b: *std.Build) void {
     // sndlib.asm includes, the same way `zig build bios` refreshes
     // rom/flommodore.rom.
     // ------------------------------------------------------------------
+    // flsnd imports aur1 so `flsnd adsr` can emit the emulator's OWN ADSR
+    // arrays rather than a transcription of them: the envelope generator and
+    // the editor's display of it are then the same numbers by construction.
     const flsnd_module = b.createModule(.{
         .root_source_file = b.path("src/tools/flsnd/main.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "aur1", .module = aur_mod },
+        },
     });
     const flsnd_exe = b.addExecutable(.{
         .name = "flsnd",
@@ -386,6 +392,21 @@ pub fn build(b: *std.Build) void {
     notes_update.addCopyFileToSource(notes_inc, "src/lib/notes.inc");
     const notes_step = b.step("notes", "Generate src/lib/notes.inc (the C0-B7 note table)");
     notes_step.dependOn(&notes_update.step);
+
+    // The filter's cutoff curve needs c^2, and 4095^2 needs 24 bits against a
+    // 20-bit register, so a guest cannot compute hertz at all — it needs this
+    // table. The ADSR one exists to avoid transcribing aur1.zig.
+    const cutoff_run = b.addRunArtifact(flsnd_exe);
+    cutoff_run.addArg("cutoff");
+    const cutoff_inc = cutoff_run.addOutputFileArg("cutoff.inc");
+    const adsr_run = b.addRunArtifact(flsnd_exe);
+    adsr_run.addArg("adsr");
+    const adsr_inc = adsr_run.addOutputFileArg("adsr.inc");
+    const tables_update = b.addUpdateSourceFiles();
+    tables_update.addCopyFileToSource(cutoff_inc, "src/lib/cutoff.inc");
+    tables_update.addCopyFileToSource(adsr_inc, "src/lib/adsr.inc");
+    const tables_step = b.step("tables", "Generate src/lib/cutoff.inc and src/lib/adsr.inc");
+    tables_step.dependOn(&tables_update.step);
 
     // ------------------------------------------------------------------
     // sndlib (Block 16) — the AUR-1 runtime, assembled once and linked

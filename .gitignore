@@ -25,3 +25,9 @@ examples/*.flsym
 # increment, so this is derived from one formula in flsnd — checking it in
 # would invite someone to edit the copy instead of the generator.
 src/lib/notes.inc
+
+# Likewise (rebuilt by `zig build tables`): cutoff.inc is derived from §4.5's
+# curve, which a 20-bit register cannot evaluate, and adsr.inc is emitted from
+# aur1.zig's own arrays.
+src/lib/cutoff.inc
+src/lib/adsr.inc
