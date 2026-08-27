@@ -1,6 +1,6 @@
 ; ============================================================================
-; aured.asm — the Flommodore sound designer, editing skeleton
-; (Block 17, tasks 17.6-17.8).
+; aured.asm — the Flommodore sound designer
+; (Block 17 tasks 17.6-17.8; Block 18: envelope times and level meters).
 ;
 ;   flommodore --rom rom/flommodore.rom examples/aured.flapp
 ;
@@ -23,13 +23,14 @@
 ; what changed. Costed against the real page, that optimises the wrong
 ; thing:
 ;
-;   full repaint of this page   ~30,000 cycles   13% of a frame
+;   full repaint of this page   ~45,000 cycles   19% of a frame
 ;   gfx_clear                   115,200 cycles   48% of a frame
 ;
-; (The 30,000 is measured. With gfx_pen rebuilt per frame it was 54,300,
-; which the budget check below caught — the estimate that preceded it said
-; 14,000 and was wrong twice over: it forgot the pen and undercounted the
-; per-glyph loop by two and a half times.)
+; (Measured, and grown: the register panel alone was 30,700, the envelope
+; readout and the meters took it to about 45,000. With gfx_pen rebuilt per
+; frame it was 54,300, which the budget check below caught — the estimate
+; that preceded it said 14,000 and was wrong twice over, forgetting the pen
+; and undercounting the per-glyph loop by two and a half times.)
 ;
 ; Repainting everything every frame is affordable; CLEARING is what is not.
 ; And because glyphs paint their own background through the expansion table,
@@ -43,24 +44,30 @@
 ; ----------------------------------------------------------------------------
 ; Checks, reported as R11 = (check << 8) | observed:
 ;
-;   $01xx  repaint under 40,000 cycles   xx = measured/256, so it reports
+;   $01xx  repaint under 60,000 cycles   xx = measured/256, so it reports
 ;                                        the actual cost when it fails
-;   $02xx  repaint over 2,000 cycles     something was really drawn
+;   $02xx  repaint over 30,000 cycles     the whole page is still drawn
 ;   $03xx  frame top-left      $60       the panel outline exists
 ;   $04xx  just inside it      $00       and is an outline, not a fill
 ;   $05xx  frame bottom-left   $60       full height
 ;   $06xx  cursor == 2                   two Down presses were decoded
 ;   $07xx  VWAVE == 2                    two Right presses reached the chip
+;   $08xx  attack[0]  == 2 ms            the generated ADSR table arrived…
+;   $09xx  decay[4]   == 114 ms          …and is indexed with the right stride
+;   $0Axx  cutoff[128] == 3024 Hz        so did the generated filter table
+;   $0Bxx  AENV == 0                     the v1.3 readback is reachable
+;   $0Cxx  AOSCSEL == 0                  …and writable, from a guest
 ;
-; $06xx and $07xx are the pair that matters: a cursor that moves but never
-; writes fails $07xx, and a write that ignores the cursor fails $06xx only
-; if it also mis-tracked — so the two together pin "the selected register is
-; the one that changed".
+; $06xx and $07xx are the pair that matters most: a cursor that moves but
+; never writes fails $07xx, and a write that ignores the cursor fails $06xx
+; only if it also mis-tracked — so the two together pin "the selected
+; register is the one that changed".
 ; ============================================================================
 
     SECTION code
 
     EQU AUR1, $80100             ; voice 0 register block
+    EQU AURG, $80140             ; globals; +$0C AOSCSEL, +$0D AOSC, +$0E AENV
     EQU VIC,  $80200
     EQU KBD,  $80020             ; +0 KSTAT, +1 KDATA (dequeues on read)
 
@@ -109,8 +116,15 @@ start:
     SUB  R1, R1, R9              ; cycles the repaint took
     MOV  R10, R1                 ; keep it for both bounds
 
+    ; A BAND, not a ceiling. The page has grown from 30,700 cycles to about
+    ; 45,000 as the envelope readout and the meters went in, and it will grow
+    ; again; a bound that only caught catastrophes would stop being
+    ; informative. Pinning the cost between 30,000 and 60,000 makes any real
+    ; change fail AND report its measurement, so each growth is a deliberate
+    ; decision recorded in a commit rather than a drift into missing 60 Hz.
+    ; The frame is 240,000 cycles; 60,000 is a quarter of it.
     LI   R11, $0100              ; must be affordable…
-    LI   R2, 40000
+    LI   R2, 60000
     CMP  R10, R2
     BCC  ck_floor
     LI   R12, 8
@@ -119,8 +133,8 @@ start:
     OR   R11, R11, R1
     JMPA fail
 ck_floor:
-    LI   R11, $0200              ; …and must have drawn something
-    LI   R2, 2000
+    LI   R11, $0200              ; …and must still be drawing the whole page
+    LI   R2, 30000
     CMP  R10, R2
     BCS  ck_edge
     LI   R12, 8
@@ -212,8 +226,26 @@ ck_cutoff:
     LW   R1, [R4 + 256]          ; index 128, AFCUT $800 -> 3024 Hz
     LI   R2, 3024
     CMP  R1, R2
-    BEQ  ck_done
+    BEQ  ck_readback
     ANDI R1, R1, $FF
+    OR   R11, R11, R1
+    JMPA fail
+ck_readback:
+    ; Nothing is gated, so the envelope must read exactly silent. That also
+    ; proves AENV is reachable from a guest at all — until now only a test
+    ; ROM had ever read it.
+    LOAD_ADDR R4, AURG
+    LI   R11, $0B00
+    LB   R1, [R4 + $0E]
+    CMPI R1, $00
+    BEQ  ck_oscsel
+    OR   R11, R11, R1
+    JMPA fail
+ck_oscsel:
+    LI   R11, $0C00
+    LB   R1, [R4 + $0C]          ; AOSCSEL, written 0 by draw_meters
+    CMPI R1, $00
+    BEQ  ck_done
     OR   R11, R11, R1
     JMPA fail
 ck_done:
@@ -382,6 +414,7 @@ dp_marker:
     BNE  dp_reg
 
     CALLA draw_env
+    CALLA draw_meters
 
     POP  R8
     POP  R7
@@ -505,6 +538,88 @@ draw_env:
     RET
 
 ; ----------------------------------------------------------------------------
+; draw_bar (R1 = y, R2 = level 0-255) — a 128 px trough with the level
+; filled in. The trough is redrawn every frame because a shrinking bar would
+; otherwise leave its own tail behind: nothing clears the screen.
+; Clobbers R1-R5, R12; R6, R7 saved.
+; ----------------------------------------------------------------------------
+draw_bar:
+    PUSH LR
+    PUSH R6
+    PUSH R7
+    MOV  R6, R1                  ; y
+    MOV  R7, R2                  ; level
+    LI   R1, 40
+    MOV  R2, R6
+    LI   R3, 128
+    LI   R4, 4
+    LI   R5, $18                 ; trough
+    CALLA gfx_rect
+    LI   R12, 1
+    SHR  R3, R7, R12             ; 255 -> 127, so the bar fits the trough
+    CMPI R3, 0
+    BEQ  bar_done                ; a zero-width rect draws nothing anyway
+    LI   R1, 40
+    MOV  R2, R6
+    LI   R4, 4
+    LI   R5, $C0                 ; level
+    CALLA gfx_rect
+bar_done:
+    POP  R7
+    POP  R6
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
+; draw_meters — the envelope level and the oscillator's current sample, read
+; off the chip through the v1.3 §1.2 readback registers.
+;
+; This is the first thing outside a test ROM to use them, and the reason
+; amendment v1.3 added them: before AOSC and AENV the chip could be written
+; but not observed, so an editor could show what it had asked for and never
+; what the chip was doing. AENV is the envelope's live level; AOSC is the
+; oscillator's latest sample, biased so $80 is the zero crossing.
+;
+; A single sample per frame is a LEVEL METER, not an oscilloscope. AOSC holds
+; one value for a whole 326-cycle sample period, so reading it in a loop
+; returns the same byte many times over; a real trace needs the timer-IRQ
+; ring buffer §1.5 describes, sampling at 11.25 kHz. That is a later piece of
+; work, and calling this a scope would be a lie about what it shows.
+;
+; Clobbers R1-R5, R12; R6, R7 saved.
+; ----------------------------------------------------------------------------
+draw_meters:
+    PUSH LR
+    PUSH R6
+    PUSH R7
+    LOAD_ADDR R6, AURG
+    SB   [R6 + $0C], R0          ; AOSCSEL: voice 0, oscillator source
+
+    LI   R1, 8
+    LI   R2, 120
+    LOAD_ADDR R3, str_env
+    CALLA gfx_text
+    LB   R7, [R6 + $0E]          ; AENV
+    LI   R1, 120
+    MOV  R2, R7
+    CALLA draw_bar
+
+    LOAD_ADDR R6, AURG           ; draw_bar reached gfx_rect, which took R6
+    LI   R1, 8
+    LI   R2, 132
+    LOAD_ADDR R3, str_osc
+    CALLA gfx_text
+    LB   R7, [R6 + $0D]          ; AOSC
+    LI   R1, 132
+    MOV  R2, R7
+    CALLA draw_bar
+
+    POP  R7
+    POP  R6
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
 ; wait_vblank — block until the next 0->1 edge of VSTAT bit 0. Open-coded
 ; rather than SYS_VBLANK so the app does not require a booted BIOS.
 ; Clobbers R4, R12.
@@ -539,6 +654,10 @@ str_rel:
     DB "REL", 0
 str_ms:
     DB "MS", 0
+str_env:
+    DB "ENV", 0
+str_osc:
+    DB "OSC", 0
 
 ; Eight bytes per entry so the index is a shift, not a search. Names are
 ; six characters or fewer, which is what puts the value column at x+56.
