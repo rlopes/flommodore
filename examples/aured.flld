@@ -1,6 +1,8 @@
 ; aured.flld — Flommodore Linker Description (Phase 8 §8.5)
 ;
-; Three objects: the app, gfxlib, and fmtlib. bss carries gfxlib's 2 KB
+; Four objects: the app, gfxlib, fmtlib and sndlib — the last for the
+; generated AUR tables (note, cutoff, ADSR), which live in src/lib/ because
+; that is where flas can INCLUDE them from. bss carries gfxlib's 2 KB
 ; expansion table and the app's small value buffer, both NOLOAD.
 
 ENTRY start              ; entry point symbol name

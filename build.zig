@@ -422,6 +422,7 @@ pub fn build(b: *std.Build) void {
     flas_sndlib_run.addArg("-o");
     const sndlib_flobj = flas_sndlib_run.addOutputFileArg("sndlib.flobj");
     flas_sndlib_run.step.dependOn(&notes_update.step);
+    flas_sndlib_run.step.dependOn(&tables_update.step); // cutoff.inc, adsr.inc
     flas_sndlib_run.has_side_effects = true;
     const sndlib_step = b.step("sndlib", "Assemble src/lib/sndlib.asm");
     sndlib_step.dependOn(&flas_sndlib_run.step);
@@ -981,6 +982,7 @@ pub fn build(b: *std.Build) void {
     fll_aured_run.addFileArg(aured_flobj);
     fll_aured_run.addFileArg(gfxlib_flobj);
     fll_aured_run.addFileArg(fmtlib_flobj);
+    fll_aured_run.addFileArg(sndlib_flobj); // for the generated AUR tables
     fll_aured_run.addArg("-s");
     fll_aured_run.addFileArg(b.path("examples/aured.flld"));
     fll_aured_run.addArg("-o");

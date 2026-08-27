@@ -62,10 +62,18 @@
 ; ----------------------------------------------------------------------------
 ; ============================================================================
 
-; The note table and its EQUs come first so the code section can use them:
+; The generated tables come first so the code section can use their EQUs:
 ; labels resolve across sections, but an EQU wants to exist before its use.
+;
+; All three are emitted by flsnd (`zig build notes` and `zig build tables`)
+; and all three are here rather than in the app because flas resolves an
+; INCLUDE relative to the including file — src/lib/ is where they land, so
+; src/lib/ is what can include them. Any program that links sndlib gets
+; note_table, cutoff_table, adsr_attack_ms and adsr_decay_ms as globals.
     SECTION data
     INCLUDE "notes.inc"
+    INCLUDE "cutoff.inc"
+    INCLUDE "adsr.inc"
 
     SECTION code
 

@@ -182,7 +182,38 @@ ck_edited:
     LI   R11, $0700
     LB   R1, [R4 + 2]            ; VWAVE, reset to 0, incremented twice
     CMPI R1, 2
+    BEQ  ck_tables
+    OR   R11, R11, R1
+    JMPA fail
+ck_tables:
+    ; The generated tables, indexed from the guest. These are the values
+    ; §4.4 and §4.5 give, so a wrong table or a wrong stride shows here
+    ; rather than as a plausible-looking number on screen.
+    LOAD_ADDR R4, adsr_attack_ms
+    LI   R11, $0800
+    LW   R1, [R4]                ; attack index 0 = 2 ms
+    CMPI R1, 2
+    BEQ  ck_decay
+    ANDI R1, R1, $FF
+    OR   R11, R11, R1
+    JMPA fail
+ck_decay:
+    LOAD_ADDR R4, adsr_decay_ms
+    LI   R11, $0900
+    LW   R1, [R4 + 8]            ; decay index 4 = 114 ms
+    CMPI R1, 114
+    BEQ  ck_cutoff
+    ANDI R1, R1, $FF
+    OR   R11, R11, R1
+    JMPA fail
+ck_cutoff:
+    LOAD_ADDR R4, cutoff_table
+    LI   R11, $0A00
+    LW   R1, [R4 + 256]          ; index 128, AFCUT $800 -> 3024 Hz
+    LI   R2, 3024
+    CMP  R1, R2
     BEQ  ck_done
+    ANDI R1, R1, $FF
     OR   R11, R11, R1
     JMPA fail
 ck_done:
@@ -350,7 +381,124 @@ dp_marker:
     CMPI R6, 16
     BNE  dp_reg
 
+    CALLA draw_env
+
     POP  R8
+    POP  R7
+    POP  R6
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
+; draw_num (R1 = x, R2 = y, R3 = value) — an unsigned decimal at x. The
+; column is five characters wide because 24000 ms is the longest thing the
+; ADSR tables can produce. Clobbers R1-R4, R12; R5, R6 saved.
+; ----------------------------------------------------------------------------
+draw_num:
+    PUSH LR
+    PUSH R5
+    PUSH R6
+    MOV  R5, R1
+    MOV  R6, R2
+    LOAD_ADDR R1, val_buf
+    MOV  R2, R3
+    CALLA fmt_dec
+    MOV  R1, R5
+    MOV  R2, R6
+    LOAD_ADDR R3, val_buf
+    CALLA gfx_text
+    POP  R6
+    POP  R5
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
+; draw_env — the envelope as TIMES, not as register bytes. This is the point
+; of the whole exercise: $F4 in ADSR1 means "sustain 15, release 114 ms", and
+; the second reading is the one a person designing a sound can act on.
+;
+; The millisecond values come from adsr_attack_ms and adsr_decay_ms, which
+; sndlib carries and flsnd generated from aur1.zig's own arrays — so the
+; number displayed and the time the envelope actually takes cannot drift
+; apart. Decay and release share one table, which is why REL indexes
+; adsr_decay_ms and not a table of its own.
+;
+; Clobbers R1-R5, R12; R6, R7 saved.
+; ----------------------------------------------------------------------------
+draw_env:
+    PUSH LR
+    PUSH R6
+    PUSH R7
+    LOAD_ADDR R6, AUR1
+    LB   R7, [R6 + 4]            ; ADSR0: attack 7:4, decay 3:0
+
+    LI   R1, 8
+    LI   R2, 96
+    LOAD_ADDR R3, str_atk
+    CALLA gfx_text
+    LI   R12, 4
+    SHR  R1, R7, R12
+    ANDI R1, R1, $0F
+    ADD  R1, R1, R1              ; two bytes per entry
+    LOAD_ADDR R12, adsr_attack_ms
+    ADD  R12, R12, R1
+    LW   R3, [R12]
+    LI   R1, 40
+    LI   R2, 96
+    CALLA draw_num
+    LI   R1, 88
+    LI   R2, 96
+    LOAD_ADDR R3, str_ms
+    CALLA gfx_text
+
+    LI   R1, 120
+    LI   R2, 96
+    LOAD_ADDR R3, str_dec
+    CALLA gfx_text
+    ANDI R1, R7, $0F
+    ADD  R1, R1, R1
+    LOAD_ADDR R12, adsr_decay_ms
+    ADD  R12, R12, R1
+    LW   R3, [R12]
+    LI   R1, 152
+    LI   R2, 96
+    CALLA draw_num
+    LI   R1, 200
+    LI   R2, 96
+    LOAD_ADDR R3, str_ms
+    CALLA gfx_text
+
+    LOAD_ADDR R6, AUR1
+    LB   R7, [R6 + 5]            ; ADSR1: sustain 7:4, release 3:0
+
+    LI   R1, 8
+    LI   R2, 104
+    LOAD_ADDR R3, str_sus
+    CALLA gfx_text
+    LI   R12, 4
+    SHR  R3, R7, R12
+    ANDI R3, R3, $0F             ; sustain is a level, not a time
+    LI   R1, 40
+    LI   R2, 104
+    CALLA draw_num
+
+    LI   R1, 120
+    LI   R2, 104
+    LOAD_ADDR R3, str_rel
+    CALLA gfx_text
+    ANDI R1, R7, $0F
+    ADD  R1, R1, R1
+    LOAD_ADDR R12, adsr_decay_ms ; release shares the decay table (§4.4)
+    ADD  R12, R12, R1
+    LW   R3, [R12]
+    LI   R1, 152
+    LI   R2, 104
+    CALLA draw_num
+    LI   R1, 200
+    LI   R2, 104
+    LOAD_ADDR R3, str_ms
+    CALLA gfx_text
+
     POP  R7
     POP  R6
     POP  LR
@@ -381,6 +529,16 @@ str_mark:
     DB ">", 0
 str_blank:
     DB " ", 0
+str_atk:
+    DB "ATK", 0
+str_dec:
+    DB "DEC", 0
+str_sus:
+    DB "SUS", 0
+str_rel:
+    DB "REL", 0
+str_ms:
+    DB "MS", 0
 
 ; Eight bytes per entry so the index is a shift, not a search. Names are
 ; six characters or fewer, which is what puts the value column at x+56.
@@ -407,4 +565,4 @@ reg_names:
 aured_cursor:
     DS 2                         ; which register is selected, 0-15
 val_buf:
-    DS 4                         ; '$', two digits, NUL
+    DS 8                         ; '$' + two hex, or five decimal digits + NUL
