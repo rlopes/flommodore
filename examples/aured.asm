@@ -11,9 +11,20 @@
 ; read straight off KSTAT/KDATA rather than through SYS_POLLKEY for the same
 ; reason: KCTRL only gates the IRQ, so polling works on an unbooted machine.
 ;
+; Runs until the machine is switched off. The self-check below fires once,
+; on frame 14, so the headless harness can assert the whole editing and
+; save/load path — but the loop carries on afterwards, because an editor
+; that stops after a quarter of a second is not an editor.
+;
 ; Voice 0's sixteen registers, one selected. Up and Down move the selection,
 ; Right and Left adjust the selected register by one and write it to the
-; chip, and SPACE plays the patch so you can hear what you just changed.
+; chip, SPACE plays the patch so you can hear what you just changed, and X
+; releases every voice.
+;
+; Not ESC: the host reserves Escape to quit the emulator and never forwards
+; it to the guest (input.zig decision j), so a guest binding on it is dead
+; code — which is why Escape closed the window instead of silencing the
+; patch.
 ; Arrows rather than +/- so no modifier decoding is needed, and the keys a
 ; value editor wants are the ones next to each other.
 ;
@@ -88,7 +99,8 @@
     EQU KEY_LEFT,  $50
     EQU KEY_RIGHT, $4F
     EQU KEY_SPACE, $2C           ; play the patch
-    EQU KEY_ESC,   $29           ; release every voice
+    EQU KEY_X,     $1B           ; release every voice
+    EQU KEY_F1,    $3A           ; run the self-check (see below)
     EQU KEY_S,     $16           ; save the bank to disk
     EQU KEY_L,     $0F           ; load it back
 
@@ -279,16 +291,42 @@ ck_bottom:
     ; ---- the frame loop ---------------------------------------------
     ; Six frames of the real thing: wait for the vertical blank, drain the
     ; keyboard, repaint. No clear, no damage tracking.
+    ; ---- the frame loop, which does NOT end ------------------------
+    ; It used to run a fixed 14 frames and then halt, which suited the
+    ; harness and made the program useless to a person: the page appeared
+    ; and the machine parked before anyone could press a key. An editor
+    ; loops until the machine is switched off.
+    ;
+    ; THE SELF-CHECK IS TRIGGERED BY A KEY, NOT BY A FRAME COUNT.
+    ;
+    ; It used to fire on frame 14, which made the program unusable outside
+    ; the harness: its first assertion is "the cursor is on register 2",
+    ; true only because the test injected two Down presses. Run by a person
+    ; it reached frame 14, failed, wrote $0BAD and halted — a rendered page
+    ; frozen a quarter of a second in, with the VIC still faithfully drawing
+    ; a stopped machine.
+    ;
+    ; F1 runs it instead. The harness presses F1 after its key sequence; a
+    ; person has no reason to. --expect-pass reads $00080 at the end of the
+    ; run and only demands a halt when --frames is absent, so a program that
+    ; keeps running satisfies it exactly as well as one that stops.
+    ;
+    ; The acceptance test would be better off in a separate program that
+    ; links this one. That it lives here is a compromise; a key trigger is
+    ; what makes the compromise safe.
 run_loop:
-    LI   R6, 14                  ; the injected keys, the envelope, and the
-                                 ; save/load round trip
 frame_loop:
     CALLA wait_vblank
     CALLA read_keys
     CALLA draw_page
-    SUBI R6, R6, 1
-    BNE  frame_loop
+    JMPA frame_loop
 
+; ----------------------------------------------------------------------------
+; self_check — the harness protocol, run once. Writes $600D and returns on
+; success; a failure writes $0BAD with its check number and parks, because a
+; program whose invariants are broken should stop, not carry on drawing.
+; ----------------------------------------------------------------------------
+self_check:
     ; ---- did the editing land? --------------------------------------
     ; Two Downs then two Rights were injected at frame boundaries, so the
     ; selection should be on register 2 and that register should hold 2.
@@ -448,9 +486,7 @@ ck_done:
 
     LI   R11, $600D
     SW   [R0 + $80], R11
-parked:
-    HLT
-    JMPA parked
+    RET                          ; back to the frame loop, which never ends
 
 fail:
     SW   [R0 + $84], R11
@@ -533,7 +569,7 @@ dk_play:
     POP  LR
     RET
 dk_stop:
-    CMPI R1, KEY_ESC
+    CMPI R1, KEY_X
     BNE  dk_save
     PUSH LR
     CALLA snd_stop_all
@@ -548,9 +584,16 @@ dk_save:
     RET
 dk_loadkey:
     CMPI R1, KEY_L
-    BNE  dk_ignore
+    BNE  dk_selftest
     PUSH LR
     CALLA do_load
+    POP  LR
+    RET
+dk_selftest:
+    CMPI R1, KEY_F1
+    BNE  dk_ignore
+    PUSH LR
+    CALLA self_check             ; writes $600D, or $0BAD and parks
     POP  LR
     RET
 dk_adjust:

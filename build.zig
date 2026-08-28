@@ -1024,6 +1024,7 @@ pub fn build(b: *std.Build) void {
         "--key-at",     "1200000:002C", // SPACE — play the patch
         "--key-at",     "1440000:0016", // S — save to the volume
         "--key-at",     "1680000:000F", // L — load it back
+        "--key-at",     "2160000:003A", // F1 — run the self-check
         "--expect-pass",
     });
     const aured_step = b.step("auredtest", "Block 17 e2e: AURED repaints a page within budget");
