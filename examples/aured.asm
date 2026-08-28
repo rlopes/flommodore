@@ -66,6 +66,8 @@
 ;   $0Cxx  AOSCSEL == 0                  …and writable, from a guest
 ;   $0Dxx  VCTRL gate set                 SPACE gated the voice
 ;   $0Exx  cutoff[AFCUTHI] == 1714 Hz     the filter display indexes right
+;   $0Fxx  status == 2                    the load reported success
+;   $10xx  VWAVE == 3 after the trip      edit -> record -> disk -> chip
 ;
 ; $06xx and $07xx are the pair that matters most: a cursor that moves but
 ; never writes fails $07xx, and a write that ignores the cursor fails $06xx
@@ -86,6 +88,23 @@
     EQU KEY_RIGHT, $4F
     EQU KEY_SPACE, $2C           ; play the patch
     EQU KEY_ESC,   $29           ; release every voice
+    EQU KEY_S,     $16           ; save the bank to disk
+    EQU KEY_L,     $0F           ; load it back
+
+    EQU SYS_DSKREAD,  $FC178     ; $FC100 + 4*30
+    EQU SYS_DSKWRITE, $FC17C     ; + 4*31
+    EQU SYS_DSKFIND,  $FC180     ; + 4*32
+    EQU SYS_DSKCREAT, $FC184     ; + 4*33
+
+    ; The bank is edited in place and written straight to disk, so it must
+    ; sit at a 16-byte-aligned address: STBUF counts 16-byte units, and a
+    ; misaligned buffer is not merely slow, it cannot be expressed at all.
+    ; ALIGN would only align within the data section, whose own placement the
+    ; linker script decides, so the working copy goes at a fixed address
+    ; instead. The embedded bank becomes what it should have been: a factory
+    ; default, copied once at startup.
+    EQU WORKBANK, $10000         ; 512 B, aligned, past the program
+    EQU DIRBUF,   $10800         ; the FLFS directory scratch
 
     EQU PANEL_X, 4
     EQU PANEL_Y, 12
@@ -124,9 +143,21 @@ start:
     ; pool addresses, which snd_note_on and snd_load_patch both need — and
     ; without it snd_transpose would be whatever bss happened to contain,
     ; since bss is NOLOAD and the boot RAM clear stops below $04100.
-    LI   R11, 20
+    ; The factory bank -> the aligned working copy.
     LI   R1, (bank & $FFFF)
     LUI  R1, (bank >> 16)
+    LOAD_ADDR R2, WORKBANK
+    LI   R3, 144                 ; header plus one patch
+cp_bank:
+    LB   R12, [R1]
+    SB   [R2], R12
+    ADDI R1, R1, 1
+    ADDI R2, R2, 1
+    SUBI R3, R3, 1
+    BNE  cp_bank
+
+    LI   R11, 20
+    LOAD_ADDR R1, WORKBANK
     CALLA snd_init
     CMPI R1, 0
     BNE  fail
@@ -200,8 +231,8 @@ ck_bottom:
     ; Six frames of the real thing: wait for the vertical blank, drain the
     ; keyboard, repaint. No clear, no damage tracking.
 run_loop:
-    LI   R6, 10                  ; long enough for the injected keys plus
-                                 ; two frames of envelope after the note
+    LI   R6, 14                  ; the injected keys, the envelope, and the
+                                 ; save/load round trip
 frame_loop:
     CALLA wait_vblank
     CALLA read_keys
@@ -275,11 +306,20 @@ ck_readback:
     OR   R11, R11, R1
     JMPA fail
 ck_gate:
+    ; The gate must be CLEAR here, and that is the interesting assertion.
+    ; SPACE gated the voice, then L loaded a patch — and snd_load_patch
+    ; clears every gate by contract, because a patch that sounds the moment
+    ; it is loaded is a broken patch. So this checks that contract survives
+    ; a round trip through the disk.
+    ;
+    ; It does not weaken the "SPACE worked" claim: $0Bxx requires AENV to be
+    ; non-zero, and only a gated note ever starts an envelope. What it reads
+    ; now is that note's release, still decaying.
     LOAD_ADDR R4, AUR1
     LI   R11, $0D00
-    LB   R1, [R4 + $03]          ; VCTRL — the gate bit sndlib set
+    LB   R1, [R4 + $03]          ; VCTRL — gate released by the load
     ANDI R1, R1, $80
-    CMPI R1, $80
+    CMPI R1, $00
     BEQ  ck_oscsel
     OR   R11, R11, R1
     JMPA fail
@@ -293,9 +333,31 @@ ck_oscsel:
     LI   R11, $0C00
     LB   R1, [R4 + $0C]          ; AOSCSEL, written 0 by draw_meters
     CMPI R1, $00
+    BEQ  ck_saveload
+    OR   R11, R11, R1
+    JMPA fail
+ck_saveload:
+    ; S then L were injected after the edits, so the chip has been through
+    ; record -> disk -> RAM -> record -> chip. VWAVE surviving as 3 is that
+    ; whole path; a save that quietly did nothing leaves the factory 1 here,
+    ; and the check reports it.
+    LOAD_ADDR R4, aured_status
+    LI   R11, $0F00
+    LW   R1, [R4]
+    CMPI R1, 2                   ; the last operation was a successful load
+    BEQ  ck_saved_value
+    ANDI R1, R1, $FF
+    OR   R11, R11, R1
+    JMPA fail
+ck_saved_value:
+    LOAD_ADDR R4, AUR1
+    LI   R11, $1000
+    LB   R1, [R4 + $02]          ; VWAVE, edited to 3 before the save
+    CMPI R1, 3
     BEQ  ck_filter
     OR   R11, R11, R1
     JMPA fail
+
 ck_filter:
     ; The patch sets AFCUT $600, so the display must resolve to 1714 Hz.
     ; Check $0Axx already proved the table's contents; this proves the
@@ -403,9 +465,23 @@ dk_play:
     RET
 dk_stop:
     CMPI R1, KEY_ESC
-    BNE  dk_ignore
+    BNE  dk_save
     PUSH LR
     CALLA snd_stop_all
+    POP  LR
+    RET
+dk_save:
+    CMPI R1, KEY_S
+    BNE  dk_loadkey
+    PUSH LR
+    CALLA do_save
+    POP  LR
+    RET
+dk_loadkey:
+    CMPI R1, KEY_L
+    BNE  dk_ignore
+    PUSH LR
+    CALLA do_load
     POP  LR
     RET
 dk_adjust:
@@ -626,6 +702,107 @@ draw_env:
     RET
 
 ; ----------------------------------------------------------------------------
+; do_save — the chip's live state, through the patch record, onto a disk.
+;
+; Three steps that each already existed: snd_store_patch folds the registers
+; back into the record (leaving the nine bytes the chip never held), the FLFS
+; directory is searched or extended, and one sector carries the whole bank —
+; 144 bytes of header and patch fits with room to spare.
+;
+; Creating on first save rather than demanding a prepared file means the
+; first thing anyone does can be "make a sound and keep it". R1 <- 0 on
+; success, $FFFF otherwise. Clobbers R1-R4, R12; R5 saved.
+; ----------------------------------------------------------------------------
+do_save:
+    PUSH LR
+    PUSH R5
+    LI   R1, 0
+    CALLA snd_store_patch        ; chip -> the record in the working bank
+
+    LOAD_ADDR R1, str_fname
+    LOAD_ADDR R2, DIRBUF
+    CALLA SYS_DSKFIND
+    CMPI R1, $FFFF
+    BNE  sv_have_entry
+    LOAD_ADDR R1, str_fname      ; not there yet: make it
+    LOAD_ADDR R2, DIRBUF
+    LI   R3, 1                   ; one sector holds the bank
+    CALLA SYS_DSKCREAT
+    CMPI R1, $FFFF
+    BEQ  sv_fail
+sv_have_entry:
+    LOAD_ADDR R5, DIRBUF
+    ADD  R5, R5, R1              ; the directory entry, read in place
+    LW   R1, [R5 + $0E]          ; start LBA
+    LOAD_ADDR R2, WORKBANK
+    CALLA SYS_DSKWRITE
+    CMPI R1, 0
+    BNE  sv_fail
+    LOAD_ADDR R4, aured_status
+    LI   R12, 1                  ; 1 = saved
+    SW   [R4], R12
+    LI   R1, 0
+    POP  R5
+    POP  LR
+    RET
+sv_fail:
+    LOAD_ADDR R4, aured_status
+    LI   R12, $FF
+    SW   [R4], R12
+    LI   R1, $FFFF
+    POP  R5
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
+; do_load — the reverse. Reads the bank back over the working copy and hands
+; it to sndlib again, so the chip ends up holding whatever was saved.
+;
+; snd_init runs again rather than just snd_load_patch: the bank pointer is
+; unchanged, but re-running it re-derives the wavetable and mod-table pool
+; addresses, which a bank with a different patch count would need.
+; R1 <- 0 on success, $FFFF otherwise. Clobbers R1-R4, R12; R5 saved.
+; ----------------------------------------------------------------------------
+do_load:
+    PUSH LR
+    PUSH R5
+    LOAD_ADDR R1, str_fname
+    LOAD_ADDR R2, DIRBUF
+    CALLA SYS_DSKFIND
+    CMPI R1, $FFFF
+    BEQ  ld_fail
+    LOAD_ADDR R5, DIRBUF
+    ADD  R5, R5, R1
+    LW   R1, [R5 + $0E]
+    LOAD_ADDR R2, WORKBANK
+    CALLA SYS_DSKREAD
+    CMPI R1, 0
+    BNE  ld_fail
+    LOAD_ADDR R1, WORKBANK
+    CALLA snd_init
+    CMPI R1, 0
+    BNE  ld_fail
+    LI   R1, 0
+    CALLA snd_load_patch
+    CMPI R1, 0
+    BNE  ld_fail
+    LOAD_ADDR R4, aured_status
+    LI   R12, 2                  ; 2 = loaded
+    SW   [R4], R12
+    LI   R1, 0
+    POP  R5
+    POP  LR
+    RET
+ld_fail:
+    LOAD_ADDR R4, aured_status
+    LI   R12, $FF
+    SW   [R4], R12
+    LI   R1, $FFFF
+    POP  R5
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
 ; draw_filter — the filter as a frequency, not as a register pair.
 ;
 ; AFCUT is 12-bit, split as (AFCUTHI << 4) | AFCUTLO, and cutoff_table is
@@ -817,6 +994,8 @@ str_hz:
     DB "HZ", 0
 str_res:
     DB "RES", 0
+str_fname:
+    DB "AUREDPAT", 0
 
 ; Eight bytes an entry so AFMODE indexes by a shift. §4.5 modes in order.
 str_modes:
@@ -888,5 +1067,7 @@ bank:
 
 aured_cursor:
     DS 2                         ; which register is selected, 0-15
+aured_status:
+    DS 2                         ; 0 none, 1 saved, 2 loaded, $FF failed
 val_buf:
     DS 8                         ; '$' + two hex, or five decimal digits + NUL

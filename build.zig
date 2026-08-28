@@ -1001,13 +1001,24 @@ pub fn build(b: *std.Build) void {
     // the granularity a UI reads at anyway.
     // Down, Down, Right, Right — then SPACE, and two frames for the 16 ms
     // attack to get the envelope off zero before the checks read it.
+    // A volume for AURED to save onto. Created fresh each build, so the
+    // save path exercises SYS_DSKCREAT rather than only overwriting.
+    const aureddisk_run = b.addRunArtifact(fldisk_exe);
+    aureddisk_run.addArg("create");
+    const aured_disk = aureddisk_run.addOutputFileArg("aured.fldisk");
+    aureddisk_run.addArgs(&.{ "--sectors", "32", "--label", "PATCHES" });
+
+    aured_run.addArg("--disk");
+    aured_run.addFileArg(aured_disk);
     aured_run.addArgs(&.{
-        "--frames",     "14",
+        "--frames",     "20",
         "--key-at",     "240000:0051", // Down
         "--key-at",     "480000:0051", // Down
         "--key-at",     "720000:004F", // Right
         "--key-at",     "960000:004F", // Right
         "--key-at",     "1200000:002C", // SPACE — play the patch
+        "--key-at",     "1440000:0016", // S — save to the volume
+        "--key-at",     "1680000:000F", // L — load it back
         "--expect-pass",
     });
     const aured_step = b.step("auredtest", "Block 17 e2e: AURED repaints a page within budget");
