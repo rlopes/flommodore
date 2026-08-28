@@ -64,6 +64,8 @@
 ;   $0Axx  cutoff[128] == 3024 Hz        so did the generated filter table
 ;   $0Bxx  AENV == 0                     the v1.3 readback is reachable
 ;   $0Cxx  AOSCSEL == 0                  …and writable, from a guest
+;   $0Dxx  VCTRL gate set                 SPACE gated the voice
+;   $0Exx  cutoff[AFCUTHI] == 1714 Hz     the filter display indexes right
 ;
 ; $06xx and $07xx are the pair that matters most: a cursor that moves but
 ; never writes fails $07xx, and a write that ignores the cursor fails $06xx
@@ -291,7 +293,24 @@ ck_oscsel:
     LI   R11, $0C00
     LB   R1, [R4 + $0C]          ; AOSCSEL, written 0 by draw_meters
     CMPI R1, $00
+    BEQ  ck_filter
+    OR   R11, R11, R1
+    JMPA fail
+ck_filter:
+    ; The patch sets AFCUT $600, so the display must resolve to 1714 Hz.
+    ; Check $0Axx already proved the table's contents; this proves the
+    ; INDEXING — that AFCUTHI reaches the right entry.
+    LOAD_ADDR R4, AURG
+    LB   R1, [R4 + $06]
+    ADD  R1, R1, R1
+    LOAD_ADDR R12, cutoff_table
+    ADD  R12, R12, R1
+    LW   R1, [R12]
+    LI   R11, $0E00
+    LI   R2, 1714
+    CMP  R1, R2
     BEQ  ck_done
+    ANDI R1, R1, $FF
     OR   R11, R11, R1
     JMPA fail
 ck_done:
@@ -482,6 +501,7 @@ dp_marker:
     BNE  dp_reg
 
     CALLA draw_env
+    CALLA draw_filter
     CALLA draw_meters
 
     POP  R8
@@ -598,6 +618,71 @@ draw_env:
     LI   R1, 200
     LI   R2, 104
     LOAD_ADDR R3, str_ms
+    CALLA gfx_text
+
+    POP  R7
+    POP  R6
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
+; draw_filter — the filter as a frequency, not as a register pair.
+;
+; AFCUT is 12-bit, split as (AFCUTHI << 4) | AFCUTLO, and cutoff_table is
+; indexed by AFCUT >> 4 — so the index IS AFCUTHI, with no arithmetic at
+; all. That is a happy accident of the table's stride matching the register
+; split, not something to rely on if either ever changes.
+;
+; The table exists because §4.5's curve cannot be evaluated here: it needs
+; AFCUT squared, and 4095^2 is 24 bits against a 20-bit register. flsnd
+; generates it from the one authoritative formula.
+;
+; Clobbers R1-R4, R12; R6, R7 saved.
+; ----------------------------------------------------------------------------
+draw_filter:
+    PUSH LR
+    PUSH R6
+    PUSH R7
+
+    LI   R1, 8
+    LI   R2, 144
+    LOAD_ADDR R3, str_cut
+    CALLA gfx_text
+
+    LOAD_ADDR R6, AURG
+    LB   R7, [R6 + $06]          ; AFCUTHI, which is the table index
+    ADD  R7, R7, R7              ; two bytes an entry
+    LOAD_ADDR R12, cutoff_table
+    ADD  R12, R12, R7
+    LW   R3, [R12]
+    LI   R1, 40
+    LI   R2, 144
+    CALLA draw_num
+    LI   R1, 88
+    LI   R2, 144
+    LOAD_ADDR R3, str_hz
+    CALLA gfx_text
+
+    LOAD_ADDR R6, AURG
+    LI   R1, 120
+    LI   R2, 144
+    LOAD_ADDR R3, str_res
+    CALLA gfx_text
+    LOAD_ADDR R6, AURG
+    LB   R3, [R6 + $07]          ; AFRESON
+    LI   R1, 152
+    LI   R2, 144
+    CALLA draw_num
+
+    LOAD_ADDR R6, AURG
+    LB   R7, [R6 + $08]          ; AFMODE
+    ANDI R7, R7, 3
+    LI   R12, 8
+    MUL  R7, R7, R12
+    LOAD_ADDR R3, str_modes
+    ADD  R3, R3, R7
+    LI   R1, 200
+    LI   R2, 144
     CALLA gfx_text
 
     POP  R7
@@ -726,6 +811,19 @@ str_env:
     DB "ENV", 0
 str_osc:
     DB "OSC", 0
+str_cut:
+    DB "CUT", 0
+str_hz:
+    DB "HZ", 0
+str_res:
+    DB "RES", 0
+
+; Eight bytes an entry so AFMODE indexes by a shift. §4.5 modes in order.
+str_modes:
+    DB "LP", 0, 0, 0, 0, 0, 0
+    DB "HP", 0, 0, 0, 0, 0, 0
+    DB "BP", 0, 0, 0, 0, 0, 0
+    DB "NOTCH", 0, 0, 0
 
 ; Eight bytes per entry so the index is a shift, not a search. Names are
 ; six characters or fewer, which is what puts the value column at x+56.
@@ -776,8 +874,10 @@ bank:
 
     DB $FF, $0F, $0F             ; AMVOL, AMVOLL, AMVOLR
     DB $01                       ; AMVOICE — voice 0 into the mix
-    DB $00                       ; AMFILT  — dry
-    DB $00, $00, $00, $00        ; AFCUTLO/HI, AFRESON, AFMODE
+    DB $01                       ; AMFILT  — voice 0 through the filter
+    DB $00, $60                  ; AFCUTLO/HI — AFCUT $600, about 1.7 kHz
+    DB $08                       ; AFRESON
+    DB $00                       ; AFMODE  low-pass
     DB $00                       ; ASRATE  44.1 kHz, the note table's rate
     DB $00                       ; AIRQEN  — chip image ends here (§5.2)
     DB $00, $00, $01, $00, $00   ; arch, transpose, tickdiv, flags, reserved
