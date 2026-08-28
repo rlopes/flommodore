@@ -1,8 +1,12 @@
 # Flommodore — Phase 9 Specification Amendments (v1.3)
 
-**Status: PROPOSED (rev. 5 — corrections folded back from the reference implementation,
+**Status: LOCKED (rev. 5 — corrections folded back from the reference implementation,
 marked ⟲; D57 reversed on the strength of the task-13.4 measurement) — supersedes the
-listed sections of the v1.1 document set upon acceptance. Amendments v1.1 (Block 0) and v1.2 (Block 3) remain LOCKED and in force
+listed sections of the v1.1 document set.
+
+Locked after Blocks 14–18 implemented it in full: the FDD-1 and FLFS, the AUR-1 readback,
+the `.flsnd` format, `sndlib` and AURED. The five ⟲ corrections are the record of what that
+implementation found; amendment v1.4 carries the decisions §7.1 left open. Amendments v1.1 (Block 0) and v1.2 (Block 3) remain LOCKED and in force
 except where explicitly amended here.**
 
 This document is the output of Block 13, the specification pass required before the

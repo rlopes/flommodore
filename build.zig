@@ -1033,6 +1033,18 @@ pub fn build(b: *std.Build) void {
     examples_update.addCopyFileToSource(hello_flapp, "examples/hello.flapp");
     examples_update.addCopyFileToSource(bhello_flapp, "examples/bios_hello.flapp");
     examples_update.addCopyFileToSource(snddemo_flapp, "examples/sndlib_demo.flapp");
+    examples_update.addCopyFileToSource(bankdemo_flapp, "examples/sndbank_demo.flapp");
+    examples_update.addCopyFileToSource(gfxdemo_flapp, "examples/gfxdemo.flapp");
+    examples_update.addCopyFileToSource(aured_flapp, "examples/aured.flapp");
+    // Everything needed to RUN AURED, not just to test it: the .flapp beside
+    // its source, the firmware it autoboots from, the emulator itself, and
+    // fldisk to make a volume for S and L to write to.
+    const aured_build_step = b.step("aured", "Build examples/aured.flapp and the tools to run it");
+    aured_build_step.dependOn(&examples_update.step);
+    aured_build_step.dependOn(&bios_update.step);
+    aured_build_step.dependOn(&b.addInstallArtifact(fldisk_exe, .{}).step);
+    aured_build_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+
     const examples_step = b.step("examples", "Build examples/*.flapp (run bios_hello with --rom + --autoboot)");
     examples_step.dependOn(&examples_update.step);
     examples_step.dependOn(&bios_update.step); // bios_hello needs the firmware too

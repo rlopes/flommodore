@@ -1,7 +1,6 @@
 # Flommodore — Blocks 14–18 Specification Amendments (v1.4)
 
-**Status: PROPOSED — supersedes the listed sections of the v1.1–v1.3 document set upon
-acceptance. Amendments v1.1 (Block 0), v1.2 (Block 3) and v1.3 (Block 13) remain in force
+**Status: LOCKED — supersedes the listed sections of the v1.1–v1.3 document set. Amendments v1.1 (Block 0), v1.2 (Block 3) and v1.3 (Block 13) remain in force
 except where explicitly amended here.**
 
 This document is the output of building what v1.3 specified: the FDD-1 and its filesystem,
