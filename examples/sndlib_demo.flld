@@ -1,0 +1,12 @@
+; sndlib_demo.flld — Flommodore Linker Description (Phase 8 §8.5)
+;
+; Same shape as hello.flld: code at the canonical $04100, data and bss
+; after it. The difference is that fll is fed TWO objects here — the
+; demo's own and sndlib.flobj — so each section is the concatenation of
+; both, and snd_init resolves across the boundary.
+
+ENTRY start              ; entry point symbol name
+
+SECTION code AT $04100   ; place code at the start of free RAM
+SECTION data AFTER code  ; the embedded bank and sndlib's note table
+SECTION bss  AFTER data  ; sndlib's library state — NOLOAD, costs no image

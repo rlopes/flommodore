@@ -1,0 +1,11 @@
+; gfxdemo.flld — Flommodore Linker Description (Phase 8 §8.5)
+;
+; Two objects, the demo and gfxlib.flobj, placed like the sndlib demos.
+; gfxlib's bss holds the 2 KB expansion table, which is NOLOAD and so costs
+; nothing in the image — it is built at run time by gfx_pen.
+
+ENTRY start              ; entry point symbol name
+
+SECTION code AT $04100   ; the canonical program load address (D10)
+SECTION data AFTER code  ; the title string
+SECTION bss  AFTER data  ; gfxlib's expansion table — NOLOAD

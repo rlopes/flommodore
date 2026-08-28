@@ -57,7 +57,10 @@ const sys_getid: u32 = 24;
 const sys_irqset: u32 = 26;
 const sys_rand: u32 = 27;
 const sys_seed: u32 = 28;
-const sys_reserved_29: u32 = 29; // first reserved slot (decision bj)
+const sys_dskstat: u32 = 29;
+const sys_dskread: u32 = 30;
+const sys_dskfind: u32 = 32;
+const sys_reserved_34: u32 = 34; // first slot with no planned owner (bj)
 
 // --- Decision bi/bd BIOS RAM -------------------------------------------------
 const cur_col: u32 = 0x01100;
@@ -542,14 +545,42 @@ pub fn main(init: std.process.Init) !void {
     // ------------------------------------------------------------------
     // Conventions: preserved registers and SP round-trip; a reserved slot
     // still answers $FFFF (decision bj held after the table gained real
-    // entries).
+    // entries). The probe sits at id 34, not 29: Block 15 gave 29-32 real
+    // implementations and 33 is spoken for by SYS_DSKCREAT, so 34 is the
+    // first id with no planned owner.
     // ------------------------------------------------------------------
     reg = 5;
     while (reg <= 11) : (reg += 1)
         checkEq(m.cpu.getReg(reg), 0x1000 + @as(u32, reg), "R5-R11 preserved");
     checkEq(m.cpu.getReg(13), 0x100D, "R13 (FP) preserved");
     checkEq(m.cpu.getReg(cpu_mod.Gab16.sp), sp_before, "SP balanced");
-    checkEq(syscall(m, sys_reserved_29, 0, 0, 0), 0xFFFF, "reserved slot answers $FFFF");
+    checkEq(syscall(m, sys_reserved_34, 0, 0, 0), 0xFFFF, "reserved slot answers $FFFF");
+
+    // ------------------------------------------------------------------
+    // Storage syscalls (Block 15, amendment v1.3 §4.1). No disk is
+    // attached here, which is the interesting case: the whole point of
+    // §2.5 is that a medialess machine reports rather than hangs.
+    // ------------------------------------------------------------------
+    const sterr_addr: u32 = 0x80055;
+    checkEq(syscall(m, sys_dskstat, 0, 0, 0), 0x0000, "DSKSTAT: no media, STSTAT $0000");
+    checkEq(m.cpu.getReg(2), 0x0000, "DSKSTAT: STERR clear in R2");
+
+    // A misaligned buffer is refused by the kernel before the device is
+    // touched at all — STERR stays untouched, which is exactly why v1.3
+    // §4.1's original "reports STERR 4" claim was wrong (STERR is
+    // read-only; only the device can set it).
+    checkEq(syscall(m, sys_dskread, 1, 0x02101, 0), 0xFFFF, "DSKREAD: misaligned buffer refused");
+    checkEq(m.io.peek16(sterr_addr), 0x0000, "DSKREAD: refusal left STERR alone");
+
+    // Aligned buffer, no media: the command IS issued, completes after
+    // its 2,000-cycle window, and reports STERR 1. If stor_wait could
+    // hang this check would time out instead of failing.
+    checkEq(syscall(m, sys_dskread, 1, 0x02100, 0), 0xFFFF, "DSKREAD: no media reports failure");
+    checkEq(m.io.peek16(sterr_addr), 0x0001, "DSKREAD: STERR 1 = no media");
+
+    // DSKFIND reads the directory first, so it fails the same way rather
+    // than scanning uninitialised scratch.
+    checkEq(syscall(m, sys_dskfind, 0x05000, 0x02100, 0), 0xFFFF, "DSKFIND: no media reports failure");
 
     // ------------------------------------------------------------------
     // FINALE (tasks 12.15–12.16) — these re-boot the machine, so they
@@ -627,7 +658,7 @@ pub fn main(init: std.process.Init) !void {
         return error.SysCheckFailed;
     }
     std.debug.print(
-        "syscheck: {s} all 29 syscalls + shell + autoboot hold — Block 12 verified through the ${X:0>5} ABI\n",
+        "syscheck: {s} all 33 syscalls + shell + autoboot hold — Block 12 verified through the ${X:0>5} ABI\n",
         .{ args[1], jump_table },
     );
 }

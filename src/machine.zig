@@ -20,6 +20,7 @@ const bus_mod = @import("bus");
 const cpu_mod = @import("cpu");
 const vic_mod = @import("vic256");
 const aur_mod = @import("aur1");
+const storage_mod = @import("storage");
 
 pub const Machine = struct {
     ram: *ram_mod.Ram,
@@ -27,6 +28,7 @@ pub const Machine = struct {
     io: *io_mod.Io,
     vic: *vic_mod.Vic,
     aur: *aur_mod.Aur,
+    storage: *storage_mod.Storage,
     bus: bus_mod.Bus,
     cpu: cpu_mod.Gab16,
 
@@ -42,18 +44,23 @@ pub const Machine = struct {
         m.vic = try gpa.create(vic_mod.Vic);
         errdefer gpa.destroy(m.vic);
         m.aur = try gpa.create(aur_mod.Aur);
+        errdefer gpa.destroy(m.aur);
+        m.storage = try gpa.create(storage_mod.Storage);
         m.ram.init();
         m.rom.init();
         m.io.* = io_mod.Io.init();
         m.vic.init();
         m.aur.* = aur_mod.Aur.init();
+        m.storage.* = storage_mod.Storage.init();
         m.io.vic = m.vic; // $80200–$802FF dispatch (Block 6)
         m.io.aur = m.aur; // $80100–$801FF dispatch (Block 7)
+        m.io.storage = m.storage; // $80050–$8005F dispatch (Block 14)
         m.bus = bus_mod.Bus.init(m.ram, m.rom, m.io);
         return m;
     }
 
     pub fn destroy(m: *Machine, gpa: std.mem.Allocator) void {
+        gpa.destroy(m.storage);
         gpa.destroy(m.aur);
         gpa.destroy(m.vic);
         gpa.destroy(m.io);
@@ -71,6 +78,9 @@ pub const Machine = struct {
         const event = m.cpu.step(&m.bus);
         m.io.tick();
         if (m.aur.tick(m.ram)) m.io.raise(io_mod.irq_audio);
+        // FDD-1 ticks here rather than in io.tick: the transfer needs RAM
+        // access, and that is where it lives (v1.3 §7.4).
+        if (m.storage.tick(m.ram)) m.io.raise(io_mod.irq_storage);
         return event;
     }
 
@@ -170,5 +180,5 @@ test "machine: a frame is exactly 240,000 cycles; VBLANK IRQ reaches the CPU" {
     try testing.expectEqual(@as(u32, 1), m.cpu.getReg(10)); // one VBLANK per frame
     m.runFrame();
     try testing.expectEqual(@as(u32, 480_000), m.cpu.cyc);
-    try testing.expectEqual(@as(u32, 2), m.cpu.getReg(10));
+    try testing.expectEqual(@as(u32, 2), m.cpu.getReg(10)); // …and one more
 }

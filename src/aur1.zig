@@ -57,6 +57,22 @@
 //!          volume but before pan; the filter output feeds both channels
 //!          equally (per-voice pan applies to dry voices only).
 //!   AUR-j  ASRATE value 3 is reserved and behaves as 0 (44.1 kHz).
+//!   AUR-k  Readback (v1.3 §1.2): AOSC's voice source is the raw
+//!          waveform value — post-wavetable, post-hard-sync (which acts
+//!          on the phase), and *pre*-envelope, pre-VVOL, pre-ring.
+//!          v1.3 §1.3's "after ring modulation" is unreachable: AUR-d
+//!          applies ring mod post-envelope, so no pre-envelope tap can
+//!          include it. Pre-envelope is also exactly what the SID's OSC3
+//!          exposed, and AENV supplies the amplitude separately — the
+//!          product of the two is what the mixer heard, so nothing is
+//!          hidden.
+//!   AUR-l  AOSC's master source is the mean of the two saturated output
+//!          channels, so a scope trace does not swing with VVOLL/VVOLR
+//!          panning.
+//!   AUR-m  AOSC/AENV latch at the end of each internal sample (the
+//!          ASRATE rate, not the host rate). A write to AOSCSEL takes
+//!          effect from the next sample onward; latched bytes are never
+//!          retroactively re-derived.
 
 const std = @import("std");
 const util = @import("util");
@@ -82,6 +98,9 @@ const g_afmode: u32 = 0x8;
 const g_asrate: u32 = 0x9;
 const g_airqen: u32 = 0xA;
 const g_astat: u32 = 0xB;
+const g_aoscsel: u32 = 0xC; // output readback (v1.3 §1.2)
+const g_aosc: u32 = 0xD; //   read-only
+const g_aenv: u32 = 0xE; //   read-only
 
 /// ADSR rate tables (v1.1 §6.2, SID-derived): 4-bit index → full-scale
 /// traversal time in ms.
@@ -170,6 +189,7 @@ const Voice = struct {
     env_phase: EnvPhase = .idle,
     output: i32 = 0, // post-envelope, post-VVOL, pre-pan
     prev_output: i32 = 0, // last sample's output (FM feedback, AUR-d/e)
+    wave_out: i32 = 0, //   raw waveform this sample — the AOSC tap (AUR-k)
 
     fn gate(v: *const Voice) bool {
         return v.ctrl & 0x80 != 0;
@@ -280,6 +300,10 @@ pub const Aur = struct {
     asrate: u8 = 0, // 0/1/2; 3 reserved → 0 (AUR-j)
     airqen: u8 = 0, // bit 0
     astat: u8 = 0, // bits 3:0 envelope-complete, w1c
+    // Output readback (v1.3 §1.2); AOSC/AENV are latched and read-only.
+    aoscsel: u8 = 0, // bits 1:0 voice | bit 2 source (0 = voice, 1 = mix)
+    aosc: u8 = 0x80, // $80 = zero crossing (v1.3 §1.4 reset state)
+    aenv: u8 = 0,
 
     // Filter state (integer SVF, AUR-h).
     svf_low: i32 = 0,
@@ -370,7 +394,8 @@ pub const Aur = struct {
 
             // Post-envelope, post-VVOL output (AUR-g).
             const env16: i32 = @intCast(v.env_level >> 16);
-            var out: i32 = (v.waveform(ram) * env16) >> 16;
+            v.wave_out = v.waveform(ram); // the AOSC tap (AUR-k)
+            var out: i32 = (v.wave_out * env16) >> 16;
             out = (out * v.vol) >> 8;
             // Ring mod (task 7.14, AUR-d): × previous voice's output.
             if (v.ctrl & 0x40 != 0) {
@@ -407,8 +432,25 @@ pub const Aur = struct {
         // Master volume then saturate (task 7.13: no wraparound).
         left = (((left * a.amvol) >> 8) * a.amvoll) >> 4;
         right = (((right * a.amvol) >> 8) * a.amvolr) >> 4;
-        a.pushSample(saturate16(left), saturate16(right));
+        const l16 = saturate16(left);
+        const r16 = saturate16(right);
+        a.pushSample(l16, r16);
+        a.latchReadback(l16, r16); // task 14.1
         return env_completed;
+    }
+
+    /// Latch AOSC/AENV for this internal sample (v1.3 §1.3; AUR-k/l/m).
+    /// Two bytes of device state — the values are already computed by the
+    /// pipeline above, so this adds no term to the synthesis path and no
+    /// golden-audio hash moves.
+    fn latchReadback(a: *Aur, l: i16, r: i16) void {
+        const n: usize = a.aoscsel & 0x03;
+        const src: i32 = if (a.aoscsel & 0x04 != 0)
+            (@as(i32, l) + @as(i32, r)) >> 1 // master mix (AUR-l)
+        else
+            a.voices[n].wave_out; // pre-envelope oscillator (AUR-k)
+        a.aosc = @intCast(std.math.clamp((src >> 8) + 128, 0, 255));
+        a.aenv = @truncate(a.voices[n].env_level >> 24); // 16-bit level >> 8
     }
 
     /// Chamberlin SVF in Q14 fixed point (task 7.18, AUR-h).
@@ -469,7 +511,10 @@ pub const Aur = struct {
             g_asrate => a.asrate,
             g_airqen => a.airqen,
             g_astat => a.astat,
-            else => 0x0000, // $8014C–$801FF reserved
+            g_aoscsel => a.aoscsel,
+            g_aosc => a.aosc, //  read-only latch (v1.3 §1.2)
+            g_aenv => a.aenv, //  read-only latch
+            else => 0x0000, // $8014F–$801FF reserved
         };
     }
 
@@ -511,6 +556,8 @@ pub const Aur = struct {
             g_asrate => a.asrate = v8 & 0x03,
             g_airqen => a.airqen = v8 & 0x01,
             g_astat => a.astat &= ~(v8 & 0x0F), // w1c per voice (task 7.20)
+            g_aoscsel => a.aoscsel = v8 & 0x07,
+            // AOSC/AENV are read-only (v1.3 §1.2) and fall through below.
             else => {},
         }
     }
@@ -606,7 +653,7 @@ test "7.1 registers: voice + global round-trips, masks, AFCUT split, reserved" {
     try expectEqual(@as(u16, 0x80), a.read(global_base + g_afcuthi));
     // Reserved space reads zero.
     try expectEqual(@as(u16, 0), a.read(base_addr + 0xF));
-    try expectEqual(@as(u16, 0), a.read(0x8014C));
+    try expectEqual(@as(u16, 0), a.read(0x8014F));
     try expectEqual(@as(u16, 0), a.read(0x801FF));
 }
 
@@ -940,4 +987,66 @@ test "7.19/7.21 rates: exactly 735 host samples per frame at 44.1 kHz; repeats a
     // Reserved ASRATE 3 behaves as 0 (AUR-j).
     a.write(global_base + g_asrate, 3);
     try expectEqual(@as(u2, 0), a.effectiveRate());
+}
+
+test "14.1/14.2 readback: AOSC and AENV latch per sample; voice or master source" {
+    var f = try Fixture.setup();
+    defer f.teardown();
+    const a = f.aur;
+    // Reset state (v1.3 §1.4): mid-scale oscillator, silent envelope.
+    try expectEqual(@as(u16, 0x00), a.read(global_base + g_aoscsel));
+    try expectEqual(@as(u16, 0x80), a.read(global_base + g_aosc));
+    try expectEqual(@as(u16, 0x00), a.read(global_base + g_aenv));
+    // AOSCSEL keeps three bits; AOSC and AENV ignore writes entirely.
+    a.write(global_base + g_aoscsel, 0xFF);
+    try expectEqual(@as(u16, 0x07), a.read(global_base + g_aoscsel));
+    a.write(global_base + g_aoscsel, 0x00);
+    a.write(global_base + g_aosc, 0x00);
+    a.write(global_base + g_aenv, 0xFF);
+    try expectEqual(@as(u16, 0x80), a.read(global_base + g_aosc));
+    try expectEqual(@as(u16, 0x00), a.read(global_base + g_aenv));
+
+    // Voice 0: a parked full-scale square, envelope driven to full.
+    f.openVoice(0);
+    a.write(base_addr + 0x2, 1); // square
+    a.write(base_addr + 0x0, 0x00); // freq 0 — the phase parks where we put it
+    a.write(base_addr + 0x4, 0x00); // instant attack, fastest decay
+    a.write(base_addr + 0x3, 0x80); // gate on
+    _ = f.generate(400);
+    try expectEqual(@as(u16, 0xFF), a.read(global_base + g_aosc));
+    try expectEqual(@as(u16, 0xFF), a.read(global_base + g_aenv));
+    // The tap follows the oscillator's sign, not the mixer's (AUR-k).
+    a.voices[0].phase = 0x9000;
+    _ = f.generate(1);
+    try expectEqual(@as(u16, 0x00), a.read(global_base + g_aosc));
+    try expectEqual(@as(u16, 0xFF), a.read(global_base + g_aenv));
+
+    // Envelope and oscillator are independent readings: release drains
+    // AENV while AOSC keeps reporting the same parked square.
+    a.write(base_addr + 0x5, 0xF8); // sustain 15, release idx 8 = 300 ms
+    a.write(base_addr + 0x3, 0x00); // gate off → release
+    _ = f.generate(2000); // ~45 ms of a 300 ms fall
+    const releasing = a.read(global_base + g_aenv);
+    try testing.expect(releasing > 0 and releasing < 0xFF);
+    try expectEqual(@as(u16, 0x00), a.read(global_base + g_aosc));
+
+    // Voice select: voice 1 was never gated — sine at phase 0, no envelope.
+    a.write(global_base + g_aoscsel, 1);
+    _ = f.generate(1);
+    try expectEqual(@as(u16, 0x80), a.read(global_base + g_aosc));
+    try expectEqual(@as(u16, 0x00), a.read(global_base + g_aenv));
+
+    // Master source (AOSCSEL bit 2, AUR-l): silence reads mid-scale…
+    a.write(global_base + g_aoscsel, 0x04);
+    a.write(global_base + g_amvol, 0);
+    _ = f.generate(1);
+    try expectEqual(@as(u16, 0x80), a.read(global_base + g_aosc));
+    // …and a loud mix reads near full scale, with AENV still reporting
+    // the voice named in bits 1:0 (voice 0) regardless of the source bit.
+    a.write(global_base + g_amvol, 255);
+    a.write(base_addr + 0x3, 0x80); // gate voice 0 back on
+    a.voices[0].phase = 0x0000;
+    _ = f.generate(400);
+    try testing.expect(a.read(global_base + g_aosc) > 0xE0);
+    try expectEqual(@as(u16, 0xFF), a.read(global_base + g_aenv));
 }

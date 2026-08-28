@@ -1,0 +1,12 @@
+; sndbank_demo.flld — Flommodore Linker Description (Phase 8 §8.5)
+;
+; Two objects again — the demo and sndlib.flobj — placed the same way as
+; sndlib_demo. The difference is at run time, not link time: this one is
+; autobooted by the BIOS rather than started directly, so $04100 is where
+; the §6.9 scan expects to find its FB header.
+
+ENTRY start              ; entry point symbol name
+
+SECTION code AT $04100   ; the canonical program load address (D10)
+SECTION data AFTER code  ; the file name string, and sndlib's note table
+SECTION bss  AFTER data  ; sndlib's library state — NOLOAD

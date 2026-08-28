@@ -57,6 +57,11 @@ const reg_vtmapbase_lo: u32 = 0x8020F;
 const reg_vsprena: u32 = 0x80213;
 const reg_virqen: u32 = 0x80216;
 
+// --- Amendment v1.3 §2.2 FDD-1 registers -----------------------------------
+const reg_ststat: u32 = 0x80051;
+const reg_stctrl: u32 = 0x80054;
+const reg_sterr: u32 = 0x80055;
+
 // --- Phase 5 I/O registers --------------------------------------------------
 const reg_tactrl: u32 = 0x80014;
 const reg_tbctrl: u32 = 0x8001C;
@@ -149,6 +154,14 @@ pub fn main(init: std.process.Init) !void {
     checkEq(m.io.peek16(reg_irqmask), 0x15, "IRQMASK: timer A + keyboard + VBLANK (Stage 6)");
     checkEq(m.io.peek16(reg_kctrl), 0x0001, "KCTRL key IRQ enabled, flush clear");
     checkEq(m.io.peek16(reg_jctrl), 0, "JCTRL passive");
+    // FDD-1 (v1.3 §2.8). Worth being honest about what this proves: STCTRL
+    // also resets to 0 in hardware, so these cannot distinguish "boot wrote
+    // it" from "the device came up that way". They guard the direction that
+    // matters — boot must never leave the completion IRQ armed or an error
+    // latched — and they will catch a future reset state that differs.
+    checkEq(m.io.peek16(reg_stctrl), 0, "STCTRL completion IRQ off");
+    checkEq(m.io.peek16(reg_sterr), 0, "STERR clear");
+    checkEq(m.io.peek16(reg_ststat) & 0x01, 0, "FDD-1 idle, not busy");
     checkEq(m.io.peek16(reg_amvol), 0, "AUR master volume muted");
     checkEq(m.io.peek16(reg_virqen), 0, "VIRQEN off");
     checkEq(m.io.peek16(reg_vsprena), 0, "VSPRENA off");

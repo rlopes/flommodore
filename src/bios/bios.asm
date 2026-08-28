@@ -29,6 +29,15 @@
 ; v1 — "not populated". Nothing verifies it, and the assembler cannot hash
 ; its own output; a nonzero value would be a lie.
 ;
+; SHIFT COUNTS MASK TO FOUR BITS. cpu.zig's shiftAmount truncates rb to u4,
+; so SHL/SHR by 16 is a shift by ZERO — silently, with no trap. A 20-bit
+; register therefore cannot have its halves split by any single instruction,
+; and every high nibble in this file is taken as TWO shifts of 8, the idiom
+; genroms.zig spells out as "shift down 8+8". Three places here had it
+; wrong — autoboot's load address, SYS_IRQSET's stored handler, and
+; irq_entry's reassembly — and all three were latent, because every address
+; the tests use sits below $10000 where a zero high nibble hides the fault.
+;
 ; Console semantics (decision bl — the spec names the calls but not the
 ; edge behaviour): SYS_PUTCHAR renders every byte as its font glyph except
 ; $0A (LF: column 0, row advance), $0D (CR: column 0), and $08 (BS:
@@ -104,10 +113,11 @@
 ; autoboot transfer control with CALL, so a program that ends in RET drops
 ; back to the READY prompt (HLT works as published too — §8.3). MEM dumps
 ; 16×16 bytes with live bus reads — peeking KDATA dequeues, as on the
-; machines this imitates. LOAD prints its reserved-for-storage
-; diagnostic. Autoboot validates magic, entry offset ≥ 12, and min-RAM ≤
-; 512; a present-but-invalid header earns the diagnostic, a silent
-; absence goes straight to the shell (§6.9).
+; machines this imitates. LOAD and SAVE reach the FDD-1 through the §4.1
+; syscalls in storage.inc: SAVE needs a 16-byte-aligned source, and LOAD
+; only accepts images whose header loads at $04100. Autoboot validates
+; magic, entry offset ≥ 12, and min-RAM ≤ 512; a present-but-invalid header
+; earns the diagnostic, a silent absence goes straight to the shell (§6.9).
 ; ============================================================================
 
 ; ----------------------------------------------------------------------------
@@ -124,6 +134,14 @@
     EQU KBD,      $80020     ; +0 KSTAT +1 KDATA +2 KMOD +3 KCTRL
     EQU JOYP,     $80030     ; +0 JOY1 +1 JOY2 +2 JCTRL
     EQU IRQC,     $80040     ; +0 IRQSTAT +1 IRQMASK +2 IRQACK
+    EQU STOR,     $80050     ; +0 STCMD +1 STSTAT +2 STLBA +3 STBUF +4 STCTRL +5 STERR
+
+    ; FLFS v1 (amendment v1.3 §3): sector 0 volume header, sector 1 the
+    ; directory, sector 2 onward data. Entries are 32 B; name byte $00 ends
+    ; the directory, $E5 marks a deleted slot.
+    EQU FLFS_DIRLBA,  1
+    EQU FLFS_ENTRIES, 16
+    EQU FLFS_ENTSZ,   32
 
     EQU AUR,      $80100     ; voice n at n*$10; master block at +$40
     EQU VIC,      $80200     ; register offsets per Phase 3 §3.8
@@ -219,11 +237,11 @@ ENDMACRO
     JMPA sys_irqset          ; 26 SYS_IRQSET
     JMPA sys_rand            ; 27 SYS_RAND
     JMPA sys_seed            ; 28 SYS_SEED
-    JMPA sys_unimpl          ; 29 — reserved
-    JMPA sys_unimpl          ; 30
-    JMPA sys_unimpl          ; 31
-    JMPA sys_unimpl          ; 32
-    JMPA sys_unimpl          ; 33
+    JMPA sys_dskstat         ; 29 SYS_DSKSTAT
+    JMPA sys_dskread         ; 30 SYS_DSKREAD
+    JMPA sys_dskwrite        ; 31 SYS_DSKWRITE
+    JMPA sys_dskfind         ; 32 SYS_DSKFIND
+    JMPA sys_dskcreat        ; 33 SYS_DSKCREAT
     JMPA sys_unimpl          ; 34
     JMPA sys_unimpl          ; 35
     JMPA sys_unimpl          ; 36
@@ -341,7 +359,8 @@ boot:
     BCS  autoboot_bad        ; more than the machine has
     LW   R2, [R5 + 8]        ; load address, 32-bit LE masked to 20
     LW   R3, [R5 + 10]
-    LI   R12, 16
+    LI   R12, 8              ; TWO shifts of 8: a shift count masks to four
+    SHL  R3, R3, R12         ; bits, so SHL 16 is a shift by ZERO (D-shift)
     SHL  R3, R3, R12
     OR   R2, R2, R3
     ADD  R1, R1, R2
@@ -386,7 +405,11 @@ shell_loop:
     LOAD_ADDR R6, str_cmd_load
     CALLA match_cmd
     CMPI R1, 1
-    BEQ  do_load
+    BEQ  stor_load
+    LOAD_ADDR R6, str_cmd_save
+    CALLA match_cmd
+    CMPI R1, 1
+    BEQ  stor_save
     LOAD_ADDR R6, str_cmd_reset
     CALLA match_cmd
     CMPI R1, 1
@@ -462,11 +485,6 @@ do_run:
     CMPI R2, 0
     BEQ  shell_syntax
     CALL R1
-    JMPA shell_loop
-
-do_load:
-    LOAD_ADDR R1, str_noload
-    CALLA sys_putstr
     JMPA shell_loop
 
 do_ver:
@@ -625,12 +643,10 @@ str_syntax:
     DB "?SYNTAX ERROR", $0A, 0
 str_badboot:
     DB "?BAD BOOT HEADER", $0A, 0
-str_noload:
-    DB "?LOAD NOT SUPPORTED", $0A, 0
 str_ver:
     DB "FLOMMODORE BIOS V1.0  ROM 16K  GAB-16", $0A, 0
 str_help:
-    DB "MEM POKE PEEK RUN LOAD RESET VER HELP", $0A, 0
+    DB "MEM POKE PEEK RUN LOAD SAVE RESET VER HELP", $0A, 0
 str_cmd_mem:
     DB "MEM", 0
 str_cmd_poke:
@@ -641,6 +657,8 @@ str_cmd_run:
     DB "RUN", 0
 str_cmd_load:
     DB "LOAD", 0
+str_cmd_save:
+    DB "SAVE", 0
 str_cmd_reset:
     DB "RESET", 0
 str_cmd_ver:
@@ -689,6 +707,16 @@ dev_init:
     ; Joystick: reads enabled (passive), transition IRQ off.
     LOAD_ADDR R4, JOYP
     SW   [R4 + 2], R0        ; JCTRL = 0
+
+    ; FDD-1: completion IRQ off (v1.3 §2.8). STLBA/STBUF/STCMD reset to 0 in
+    ; hardware and STSTAT/STERR are read-only, so STCTRL is the only storage
+    ; register boot has an opinion to state — and it must be off, or a
+    ; program that never touches the disk could still be interrupted by
+    ; source 7 after some earlier program armed it. SYS_RESET re-runs boot
+    ; WITHOUT a hardware reset, so this is not merely restating the reset
+    ; state: on that path STCTRL can genuinely arrive here set.
+    LOAD_ADDR R4, STOR
+    SW   [R4 + 4], R0        ; STCTRL = 0
 
     ; AUR-1: one silent-default routine for boot and SYS_SNDINIT alike
     ; (decision bp) — SNDINIT is the implementation, dev_init a caller.
@@ -1302,8 +1330,9 @@ sys_irqset:
     LI   R12, DISPATCH
     ADD  R4, R4, R12
     SW   [R4], R2            ; bits 15:0
-    LI   R12, 16
-    SHR  R12, R2, R12
+    LI   R1, 8               ; two shifts of 8 — see the note below
+    SHR  R12, R2, R1
+    SHR  R12, R12, R1
     SW   [R4 + 2], R12       ; bits 19:16
     RET
 
@@ -1388,6 +1417,14 @@ memcmp_gt:
     LI   R1, 1
     RET
 
+; ----------------------------------------------------------------------------
+; Storage syscalls — amendment v1.3 §4.1 (Block 15). Split into its own
+; include the way the font and palette are: bios.asm is 1,650 lines and the
+; storage half of Block 15 is still growing (SYS_DSKCREAT, LOAD, SAVE), so
+; the code that changes lives in a file small enough to reread.
+; ----------------------------------------------------------------------------
+    INCLUDE "storage.inc"
+
 ; Unimplemented / reserved syscall: return with R1 = $FFFF (decision bj —
 ; a caller probing a reserved slot gets a recognisable "no" instead of an
 ; unchanged register).
@@ -1432,7 +1469,8 @@ irq_scan:
     ADD  R3, R3, R12
     LW   R4, [R3 + 2]        ; handler bits 19:16
     LW   R3, [R3]            ; handler bits 15:0
-    LI   R12, 16
+    LI   R12, 8              ; two shifts of 8 — see the note below
+    SHL  R4, R4, R12
     SHL  R4, R4, R12
     OR   R3, R3, R4
     CMPI R3, 0

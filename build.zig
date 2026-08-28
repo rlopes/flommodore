@@ -60,6 +60,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ram", .module = ram_mod },
         },
     });
+    const storage_mod = b.createModule(.{
+        .root_source_file = b.path("src/storage.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ram", .module = ram_mod },
+        },
+    });
     const io_mod = b.createModule(.{
         .root_source_file = b.path("src/io.zig"),
         .target = target,
@@ -68,6 +76,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "util", .module = util_mod },
             .{ .name = "vic256", .module = vic_mod },
             .{ .name = "aur1", .module = aur_mod },
+            .{ .name = "storage", .module = storage_mod },
         },
     });
     const input_mod = b.createModule(.{
@@ -122,6 +131,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "bus", .module = bus_mod },
             .{ .name = "vic256", .module = vic_mod },
             .{ .name = "aur1", .module = aur_mod },
+            .{ .name = "storage", .module = storage_mod },
         },
     });
     const cpu_mod = b.createModule(.{
@@ -330,6 +340,94 @@ pub fn build(b: *std.Build) void {
     lnk_step.dependOn(&b.addInstallArtifact(fll_exe, .{}).step);
 
     // ------------------------------------------------------------------
+    // fldisk — FLFS volume tool (Block 15 follow-up). Nothing else can
+    // format a volume: the BIOS allocates files but never formats, so an
+    // unformatted image reports a total-sector count of zero and every
+    // SAVE fails against it. CI cannot test storage at all without this.
+    // ------------------------------------------------------------------
+    const fldisk_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/fldisk/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fldisk_exe = b.addExecutable(.{
+        .name = "fldisk",
+        .root_module = fldisk_module,
+    });
+    b.installArtifact(fldisk_exe);
+    const disk_step = b.step("disk", "Build the fldisk FLFS volume tool");
+    disk_step.dependOn(&b.addInstallArtifact(fldisk_exe, .{}).step);
+
+    // ------------------------------------------------------------------
+    // flsnd — AUR-1 sound bank tool (Block 16). Also the ONE encoder of
+    // pitch: VFREQ is a phase increment, so `flsnd notes` generates the
+    // note table rather than anyone typing 96 hand-computed constants.
+    // `zig build notes` refreshes the gitignored src/lib/notes.inc that
+    // sndlib.asm includes, the same way `zig build bios` refreshes
+    // rom/flommodore.rom.
+    // ------------------------------------------------------------------
+    // flsnd imports aur1 so `flsnd adsr` can emit the emulator's OWN ADSR
+    // arrays rather than a transcription of them: the envelope generator and
+    // the editor's display of it are then the same numbers by construction.
+    const flsnd_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/flsnd/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "aur1", .module = aur_mod },
+        },
+    });
+    const flsnd_exe = b.addExecutable(.{
+        .name = "flsnd",
+        .root_module = flsnd_module,
+    });
+    b.installArtifact(flsnd_exe);
+    const snd_step = b.step("snd", "Build the flsnd sound bank tool");
+    snd_step.dependOn(&b.addInstallArtifact(flsnd_exe, .{}).step);
+
+    const notes_run = b.addRunArtifact(flsnd_exe);
+    notes_run.addArg("notes");
+    const notes_inc = notes_run.addOutputFileArg("notes.inc");
+    const notes_update = b.addUpdateSourceFiles();
+    notes_update.addCopyFileToSource(notes_inc, "src/lib/notes.inc");
+    const notes_step = b.step("notes", "Generate src/lib/notes.inc (the C0-B7 note table)");
+    notes_step.dependOn(&notes_update.step);
+
+    // The filter's cutoff curve needs c^2, and 4095^2 needs 24 bits against a
+    // 20-bit register, so a guest cannot compute hertz at all — it needs this
+    // table. The ADSR one exists to avoid transcribing aur1.zig.
+    const cutoff_run = b.addRunArtifact(flsnd_exe);
+    cutoff_run.addArg("cutoff");
+    const cutoff_inc = cutoff_run.addOutputFileArg("cutoff.inc");
+    const adsr_run = b.addRunArtifact(flsnd_exe);
+    adsr_run.addArg("adsr");
+    const adsr_inc = adsr_run.addOutputFileArg("adsr.inc");
+    const tables_update = b.addUpdateSourceFiles();
+    tables_update.addCopyFileToSource(cutoff_inc, "src/lib/cutoff.inc");
+    tables_update.addCopyFileToSource(adsr_inc, "src/lib/adsr.inc");
+    const tables_step = b.step("tables", "Generate src/lib/cutoff.inc and src/lib/adsr.inc");
+    tables_step.dependOn(&tables_update.step);
+
+    // ------------------------------------------------------------------
+    // sndlib (Block 16) — the AUR-1 runtime, assembled once and linked
+    // into anything that wants to make a noise. It INCLUDEs the generated
+    // note table, and flas resolves an include relative to the including
+    // file, so src/lib/notes.inc has to exist in the SOURCE tree before
+    // this runs: hence the explicit dependency on notes_update rather
+    // than a cache path, and has_side_effects to stop Zig caching a run
+    // whose real input it cannot see.
+    // ------------------------------------------------------------------
+    const flas_sndlib_run = b.addRunArtifact(flas_exe);
+    flas_sndlib_run.addFileArg(b.path("src/lib/sndlib.asm"));
+    flas_sndlib_run.addArg("-o");
+    const sndlib_flobj = flas_sndlib_run.addOutputFileArg("sndlib.flobj");
+    flas_sndlib_run.step.dependOn(&notes_update.step);
+    flas_sndlib_run.step.dependOn(&tables_update.step); // cutoff.inc, adsr.inc
+    flas_sndlib_run.has_side_effects = true;
+    const sndlib_step = b.step("sndlib", "Assemble src/lib/sndlib.asm");
+    sndlib_step.dependOn(&flas_sndlib_run.step);
+
+    // ------------------------------------------------------------------
     // SDL3 — castholm/SDL, a port of SDL to the Zig build system.
     // Chosen over (a) the official libsdl-org/SDL tarball, which has no
     // build.zig and therefore cannot produce a Zig dependency artifact,
@@ -466,6 +564,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ram", .module = host_ram },
         },
     });
+    const host_storage = b.createModule(.{
+        .root_source_file = b.path("src/storage.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .imports = &.{
+            .{ .name = "ram", .module = host_ram },
+        },
+    });
     const host_io = b.createModule(.{
         .root_source_file = b.path("src/io.zig"),
         .target = b.graph.host,
@@ -474,6 +580,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "util", .module = host_util },
             .{ .name = "vic256", .module = host_vic },
             .{ .name = "aur1", .module = host_aur },
+            .{ .name = "storage", .module = host_storage },
         },
     });
     const host_bus = b.createModule(.{
@@ -521,6 +628,45 @@ pub fn build(b: *std.Build) void {
     genroms_run.has_side_effects = true;
     const genroms_step = b.step("genroms", "Generate test ROMs into tests/roms/");
     genroms_step.dependOn(&genroms_run.step);
+
+    // ------------------------------------------------------------------
+    // Block 14 acceptance (task 14.7): the FDD-1 and AUR-1 readback test
+    // ROMs, run through the harness under the $600D protocol.
+    //
+    // test_storage.rom needs media, so fldisk formats a fresh volume into
+    // the build cache first. Fresh matters: the ROM WRITES to sector 1 to
+    // test the write path, which lands on the FLFS directory and leaves
+    // the volume unparseable — fine for a fixture that exists only to be
+    // written to, but it must never be reused or listed afterwards.
+    // (Both runs mutate or read source-tree artifacts, hence
+    // has_side_effects.)
+    // ------------------------------------------------------------------
+    const fixture_run = b.addRunArtifact(fldisk_exe);
+    fixture_run.addArg("create");
+    const disk_fixture = fixture_run.addOutputFileArg("test.fldisk");
+    fixture_run.addArgs(&.{ "--sectors", "64", "--label", "TESTDISK" });
+
+    const storage_rom_run = b.addRunArtifact(harness_exe);
+    storage_rom_run.addArg("--rom");
+    storage_rom_run.addArg(b.pathFromRoot("tests/roms/test_storage.rom"));
+    storage_rom_run.addArg("--disk");
+    storage_rom_run.addFileArg(disk_fixture);
+    storage_rom_run.addArgs(&.{ "--expect-pass", "--quiet" });
+    storage_rom_run.step.dependOn(&genroms_run.step);
+    storage_rom_run.has_side_effects = true;
+
+    // The readback ROM needs no disk — just enough cycles for a 2 ms
+    // attack (~29k) plus a 300 ms release sampled partway (~40k more).
+    const readback_rom_run = b.addRunArtifact(harness_exe);
+    readback_rom_run.addArg("--rom");
+    readback_rom_run.addArg(b.pathFromRoot("tests/roms/test_aur_readback.rom"));
+    readback_rom_run.addArgs(&.{ "--max-cycles", "400000", "--expect-pass", "--quiet" });
+    readback_rom_run.step.dependOn(&genroms_run.step);
+    readback_rom_run.has_side_effects = true;
+
+    const storage_step = b.step("storagetest", "Block 14 e2e: FDD-1 + AUR-1 readback test ROMs");
+    storage_step.dependOn(&storage_rom_run.step);
+    storage_step.dependOn(&readback_rom_run.step);
 
     // ------------------------------------------------------------------
     // Block 10 e2e acceptance: assemble the .asm rewrite of test_cpu_alu
@@ -655,9 +801,250 @@ pub fn build(b: *std.Build) void {
     fll_bhello_run.addArg("-o");
     const bhello_flapp = fll_bhello_run.addOutputFileArg("bios_hello.flapp");
 
+    // sndlib_demo: the first program in the tree linked from TWO objects,
+    // so it is also the first exercise of fll resolving a symbol across an
+    // object boundary. Everything before it linked one object.
+    const flas_snddemo_run = b.addRunArtifact(flas_exe);
+    flas_snddemo_run.addFileArg(b.path("examples/sndlib_demo.asm"));
+    flas_snddemo_run.addArg("-o");
+    const snddemo_flobj = flas_snddemo_run.addOutputFileArg("sndlib_demo.flobj");
+
+    const fll_snddemo_run = b.addRunArtifact(fll_exe);
+    fll_snddemo_run.addFileArg(snddemo_flobj);
+    fll_snddemo_run.addFileArg(sndlib_flobj);
+    fll_snddemo_run.addArg("-s");
+    fll_snddemo_run.addFileArg(b.path("examples/sndlib_demo.flld"));
+    fll_snddemo_run.addArg("-o");
+    const snddemo_flapp = fll_snddemo_run.addOutputFileArg("sndlib_demo.flapp");
+
+    // No --rom: sndlib drives the chip directly, so the demo needs no BIOS.
+    // No --quiet either, yet — the audio hash it prints is what a golden
+    // gets pinned to once this has run once.
+    const snddemo_run = b.addRunArtifact(harness_exe);
+    snddemo_run.addArg("--flapp");
+    snddemo_run.addFileArg(snddemo_flapp);
+    snddemo_run.addArgs(&.{
+        "--frames",
+        "20",
+        "--expect-pass",
+        "--audio-golden",
+        "6097158f0870eabbb8d16acfcf162a5756e1795d39ed774e1c8713004157a7ce",
+        "--quiet",
+    });
+    const snddemo_step = b.step("sndtest", "Block 16 e2e: sndlib_demo links, runs, and sounds");
+    snddemo_step.dependOn(&snddemo_run.step);
+
+    // ------------------------------------------------------------------
+    // Block 16 task 16.7: the demo bank, on a real disk.
+    //
+    // demobank.asm is absolute and framed by `fll --raw`, so the linker
+    // output IS the .flsnd file. fldisk then formats a volume and adds it
+    // as DEMOBANK, and sndbank_demo reads it back through the BIOS storage
+    // syscalls — the one path where the storage stack and the sound stack
+    // meet.
+    // ------------------------------------------------------------------
+    const flas_bank_run = b.addRunArtifact(flas_exe);
+    flas_bank_run.addFileArg(b.path("examples/demobank.asm"));
+    flas_bank_run.addArg("-o");
+    const bank_flobj = flas_bank_run.addOutputFileArg("demobank.flobj");
+
+    const fll_bank_run = b.addRunArtifact(fll_exe);
+    // --overlay, not --raw. Raw mode is the ROM-REPLACEMENT form and
+    // requires the image to cover the vector slots at $FFFC0 (§8.6); an
+    // overlay is a flat image at an arbitrary base, which is exactly what a
+    // data blob is — the same mode hello83_raw uses.
+    //
+    // --base $01000, not $00000: the emitter reads load_addr 0 as
+    // "relocatable" and refuses. The bank is data, so its assembly address
+    // is arbitrary — see the note in demobank.asm.
+    fll_bank_run.addArgs(&.{ "--overlay", "--base", "$01000", "--size", "656" });
+    fll_bank_run.addFileArg(bank_flobj);
+    fll_bank_run.addArg("-o");
+    const bank_flsnd = fll_bank_run.addOutputFileArg("demobank.flsnd");
+
+    const bankdisk_run = b.addRunArtifact(fldisk_exe);
+    bankdisk_run.addArg("create");
+    const bank_disk = bankdisk_run.addOutputFileArg("demobank.fldisk");
+    bankdisk_run.addArgs(&.{ "--sectors", "64", "--label", "SOUNDS" });
+
+    // -o, so `add` is a pure function of its inputs. Without it the step
+    // would mutate bankdisk_run's cached output, and since `create` does
+    // not re-run while `add` does, every build after the first would try
+    // to add DEMOBANK to a volume that already has it.
+    const bankadd_run = b.addRunArtifact(fldisk_exe);
+    bankadd_run.addArg("add");
+    bankadd_run.addFileArg(bank_disk);
+    bankadd_run.addFileArg(bank_flsnd);
+    bankadd_run.addArgs(&.{ "--name", "DEMOBANK", "--type", "SN", "-o" });
+    const bank_volume = bankadd_run.addOutputFileArg("sounds.fldisk");
+
+    const flas_bankdemo_run = b.addRunArtifact(flas_exe);
+    flas_bankdemo_run.addFileArg(b.path("examples/sndbank_demo.asm"));
+    flas_bankdemo_run.addArg("-o");
+    const bankdemo_flobj = flas_bankdemo_run.addOutputFileArg("sndbank_demo.flobj");
+
+    const fll_bankdemo_run = b.addRunArtifact(fll_exe);
+    fll_bankdemo_run.addFileArg(bankdemo_flobj);
+    fll_bankdemo_run.addFileArg(sndlib_flobj);
+    fll_bankdemo_run.addArg("-s");
+    fll_bankdemo_run.addFileArg(b.path("examples/sndbank_demo.flld"));
+    fll_bankdemo_run.addArg("-o");
+    const bankdemo_flapp = fll_bankdemo_run.addOutputFileArg("sndbank_demo.flapp");
+
+    // Needs the BIOS for the storage syscalls, and runs the cartridge way.
+    const bankdemo_run = b.addRunArtifact(harness_exe);
+    bankdemo_run.addArg("--rom");
+    bankdemo_run.addFileArg(bios_rom);
+    bankdemo_run.addArg("--autoboot");
+    bankdemo_run.addArg("--flapp");
+    bankdemo_run.addFileArg(bankdemo_flapp);
+    bankdemo_run.addArg("--disk");
+    bankdemo_run.addFileArg(bank_volume);
+    bankdemo_run.addArgs(&.{
+        "--frames",
+        "12",
+        "--expect-pass",
+        "--audio-golden",
+        "8450d53e07cbb22da56e5e002e1e2d35abd68962f002d8175d64e81d0c47f404",
+        "--quiet",
+    });
+    const banktest_step = b.step("banktest", "Block 16 e2e: a .flsnd bank loaded off an FLFS volume");
+    banktest_step.dependOn(&bankdemo_run.step);
+
+    // ------------------------------------------------------------------
+    // Block 17: gfxlib and its demo. Assembled like sndlib — a relocatable
+    // library any .flapp can link. The demo runs with the minimal font ROM
+    // rather than the BIOS, since gfxlib wants glyph data at $FE000 and
+    // nothing else.
+    // ------------------------------------------------------------------
+    const flas_gfxlib_run = b.addRunArtifact(flas_exe);
+    flas_gfxlib_run.addFileArg(b.path("src/lib/gfxlib.asm"));
+    flas_gfxlib_run.addArg("-o");
+    const gfxlib_flobj = flas_gfxlib_run.addOutputFileArg("gfxlib.flobj");
+    const gfxlib_step = b.step("gfxlib", "Assemble src/lib/gfxlib.asm");
+    gfxlib_step.dependOn(&flas_gfxlib_run.step);
+
+    const flas_fmtlib_run = b.addRunArtifact(flas_exe);
+    flas_fmtlib_run.addFileArg(b.path("src/lib/fmtlib.asm"));
+    flas_fmtlib_run.addArg("-o");
+    const fmtlib_flobj = flas_fmtlib_run.addOutputFileArg("fmtlib.flobj");
+
+    const flas_gfxdemo_run = b.addRunArtifact(flas_exe);
+    flas_gfxdemo_run.addFileArg(b.path("examples/gfxdemo.asm"));
+    flas_gfxdemo_run.addArg("-o");
+    const gfxdemo_flobj = flas_gfxdemo_run.addOutputFileArg("gfxdemo.flobj");
+
+    const fll_gfxdemo_run = b.addRunArtifact(fll_exe);
+    fll_gfxdemo_run.addFileArg(gfxdemo_flobj);
+    fll_gfxdemo_run.addFileArg(gfxlib_flobj);
+    fll_gfxdemo_run.addFileArg(fmtlib_flobj);
+    fll_gfxdemo_run.addArg("-s");
+    fll_gfxdemo_run.addFileArg(b.path("examples/gfxdemo.flld"));
+    fll_gfxdemo_run.addArg("-o");
+    const gfxdemo_flapp = fll_gfxdemo_run.addOutputFileArg("gfxdemo.flapp");
+
+    // No --golden yet: the demo asserts its own pixels, and a frame hash
+    // pinned before the engine is known-good would only enshrine whatever
+    // it happens to draw.
+    const gfxdemo_run = b.addRunArtifact(harness_exe);
+    gfxdemo_run.addArg("--rom");
+    gfxdemo_run.addArg(b.pathFromRoot("tests/roms/font.rom"));
+    gfxdemo_run.addArg("--flapp");
+    gfxdemo_run.addFileArg(gfxdemo_flapp);
+    gfxdemo_run.addArgs(&.{
+        "--frames",
+        "2",
+        "--expect-pass",
+        "--golden",
+        "9fa05d01581f401280c860038e96a1311437aa6caa26d02eebe39ad0a2100b28",
+        "--quiet",
+    });
+    gfxdemo_run.step.dependOn(&genroms_run.step); // font.rom must exist
+    gfxdemo_run.has_side_effects = true;
+    const gfxtest_step = b.step("gfxtest", "Block 17 e2e: gfxlib draws text into the framebuffer");
+    gfxtest_step.dependOn(&gfxdemo_run.step);
+
+    // ------------------------------------------------------------------
+    // Block 17: AURED. Three objects — the app plus gfxlib and fmtlib — so
+    // this is the first program here to link two libraries at once.
+    //
+    // Runs against the BIOS ROM for its full font (gfxlib reads $FE000 and
+    // the page shows digits, which font.rom has no glyphs for), but does
+    // NOT autoboot: the .flapp loader gives it the D12 environment, and
+    // nothing it calls needs the BIOS to have initialised its RAM.
+    // ------------------------------------------------------------------
+    const flas_aured_run = b.addRunArtifact(flas_exe);
+    flas_aured_run.addFileArg(b.path("examples/aured.asm"));
+    flas_aured_run.addArg("-o");
+    const aured_flobj = flas_aured_run.addOutputFileArg("aured.flobj");
+
+    const fll_aured_run = b.addRunArtifact(fll_exe);
+    fll_aured_run.addFileArg(aured_flobj);
+    fll_aured_run.addFileArg(gfxlib_flobj);
+    fll_aured_run.addFileArg(fmtlib_flobj);
+    fll_aured_run.addFileArg(sndlib_flobj); // for the generated AUR tables
+    fll_aured_run.addArg("-s");
+    fll_aured_run.addFileArg(b.path("examples/aured.flld"));
+    fll_aured_run.addArg("-o");
+    const aured_flapp = fll_aured_run.addOutputFileArg("aured.flapp");
+
+    // No --golden: the app asserts its own repaint cost and outline pixels,
+    // and a frame hash over BIOS-font glyphs would pin bitmaps this project
+    // has never derived expected values for.
+    const aured_run = b.addRunArtifact(harness_exe);
+    // --autoboot, not a bare --flapp: the scope installs an IRQ handler
+    // through SYS_IRQSET, and the DISPATCH table it writes lives in BIOS
+    // RAM that only the boot sequence clears. Started directly, the
+    // dispatcher would read an uninitialised table and call into noise.
+    aured_run.addArg("--rom");
+    aured_run.addFileArg(bios_rom);
+    aured_run.addArg("--autoboot");
+    aured_run.addArg("--flapp");
+    aured_run.addFileArg(aured_flapp);
+    // Two Downs then two Rights, one per frame boundary. Frame-mode
+    // injection lands the event at the start of the next frame, which is
+    // the granularity a UI reads at anyway.
+    // Down, Down, Right, Right — then SPACE, and two frames for the 16 ms
+    // attack to get the envelope off zero before the checks read it.
+    // A volume for AURED to save onto. Created fresh each build, so the
+    // save path exercises SYS_DSKCREAT rather than only overwriting.
+    const aureddisk_run = b.addRunArtifact(fldisk_exe);
+    aureddisk_run.addArg("create");
+    const aured_disk = aureddisk_run.addOutputFileArg("aured.fldisk");
+    aureddisk_run.addArgs(&.{ "--sectors", "32", "--label", "PATCHES" });
+
+    aured_run.addArg("--disk");
+    aured_run.addFileArg(aured_disk);
+    aured_run.addArgs(&.{
+        "--frames",     "20",
+        "--key-at",     "240000:0051", // Down
+        "--key-at",     "480000:0051", // Down
+        "--key-at",     "720000:004F", // Right
+        "--key-at",     "960000:004F", // Right
+        "--key-at",     "1200000:002C", // SPACE — play the patch
+        "--key-at",     "1440000:0016", // S — save to the volume
+        "--key-at",     "1680000:000F", // L — load it back
+        "--expect-pass",
+    });
+    const aured_step = b.step("auredtest", "Block 17 e2e: AURED repaints a page within budget");
+    aured_step.dependOn(&aured_run.step);
+
     const examples_update = b.addUpdateSourceFiles();
     examples_update.addCopyFileToSource(hello_flapp, "examples/hello.flapp");
     examples_update.addCopyFileToSource(bhello_flapp, "examples/bios_hello.flapp");
+    examples_update.addCopyFileToSource(snddemo_flapp, "examples/sndlib_demo.flapp");
+    examples_update.addCopyFileToSource(bankdemo_flapp, "examples/sndbank_demo.flapp");
+    examples_update.addCopyFileToSource(gfxdemo_flapp, "examples/gfxdemo.flapp");
+    examples_update.addCopyFileToSource(aured_flapp, "examples/aured.flapp");
+    // Everything needed to RUN AURED, not just to test it: the .flapp beside
+    // its source, the firmware it autoboots from, the emulator itself, and
+    // fldisk to make a volume for S and L to write to.
+    const aured_build_step = b.step("aured", "Build examples/aured.flapp and the tools to run it");
+    aured_build_step.dependOn(&examples_update.step);
+    aured_build_step.dependOn(&bios_update.step);
+    aured_build_step.dependOn(&b.addInstallArtifact(fldisk_exe, .{}).step);
+    aured_build_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+
     const examples_step = b.step("examples", "Build examples/*.flapp (run bios_hello with --rom + --autoboot)");
     examples_step.dependOn(&examples_update.step);
     examples_step.dependOn(&bios_update.step); // bios_hello needs the firmware too
@@ -751,6 +1138,7 @@ pub fn build(b: *std.Build) void {
         ram_mod,
         rom_mod,
         aur_mod,
+        storage_mod,
         io_mod,
         input_mod,
         bus_mod,
@@ -767,6 +1155,8 @@ pub fn build(b: *std.Build) void {
         asm_codegen_mod,
         asm_objfile_mod,
         asm_listing_mod,
+        fldisk_module,
+        flsnd_module,
         lnk_loader_mod,
         lnk_script_mod,
         lnk_resolver_mod,
@@ -785,4 +1175,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&syscheck_run.step); // Block 12 syscalls/shell/autoboot
     test_step.dependOn(&bootgolden_run.step); // Block 12 golden boot frame
     test_step.dependOn(&bhello_run.step); // examples autoboot demo golden
+    test_step.dependOn(&storage_rom_run.step); // Block 14 FDD-1 test ROM
+    test_step.dependOn(&readback_rom_run.step); // Block 14 AUR-1 readback ROM
+    test_step.dependOn(&snddemo_run.step); // Block 16 sndlib links and sounds
+    test_step.dependOn(&bankdemo_run.step); // Block 16 bank off a real disk
+    test_step.dependOn(&gfxdemo_run.step); // Block 17 gfxlib draws text
+    test_step.dependOn(&aured_run.step); // Block 17 AURED repaint budget
 }

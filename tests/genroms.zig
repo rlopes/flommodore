@@ -1345,6 +1345,233 @@ fn buildAurFm() RomImage {
     return image;
 }
 
+// ---------------------------------------------------------------------------
+// Block 14 test ROMs (task 14.7): AUR-1 output readback and the FDD-1.
+//
+// The storage ROM needs media: run it with `--disk`. Without one the device
+// reports no media and check 1 fails with $0BAD — which is itself the
+// correct answer, not a hang (v1.3 §2.5).
+// ---------------------------------------------------------------------------
+
+const st_base: u32 = 0x80050;
+
+/// Storage registers are full 16-bit values (v1.3 D50), so SW throughout —
+/// unlike the AUR-1's byte registers. R1 holds the device base.
+fn stWrite(k: *Kit, offset: i32, value: i32) void {
+    k.emit(encode.li(12, value));
+    k.emit(encode.sw(1, offset, 12));
+}
+
+/// Spin until STSTAT bit 0 clears. Every accepted command completes in
+/// exactly 2,000 cycles (D52), including the ones that end in an error, so
+/// this can never spin forever on a command the device took.
+fn stWait(k: *Kit) void {
+    const top = k.cur.addr;
+    k.emit(encode.lw(5, 1, 1)); //      STSTAT
+    k.emit(encode.andi(5, 5, 1)); //    busy
+    k.emit(encode.cmpi(5, 0));
+    k.branchTo(.bne, top);
+}
+
+/// Check STERR against an expected code.
+fn stCheckErr(k: *Kit, n: i32, want: i32) void {
+    k.num(n);
+    k.emit(encode.lw(5, 1, 5)); //      STERR
+    k.emit(encode.cmpi(5, want));
+    k.assertTaken(.beq);
+}
+
+/// test_storage.rom: identify, write, read back, and the error paths of the
+/// FDD-1 (v1.3 §2). Requires `--disk` with at least 4 sectors.
+fn buildStorage() RomImage {
+    var image = RomImage.init();
+    var k = Kit.begin(&image);
+    k.emit(encode.li(15, 0x1100));
+    k.loadAddr(1, st_base);
+
+    // 1: media present (STSTAT bit 1), idle, no error.
+    k.num(1);
+    k.emit(encode.lw(5, 1, 1));
+    k.emit(encode.cmpi(5, 0x02));
+    k.assertTaken(.beq);
+
+    // 2-4: identify writes its record to the DMA buffer at $02100.
+    stWrite(&k, 3, 0x02100 / 16); //    STBUF (÷16, D50)
+    stWrite(&k, 0, 3); //               STCMD identify
+    stWait(&k);
+    stCheckErr(&k, 2, 0);
+    k.num(3);
+    k.emit(encode.lb(5, 0, 0x02100)); //  'F'
+    k.emit(encode.cmpi(5, 'F'));
+    k.assertTaken(.beq);
+    k.num(4);
+    k.emit(encode.lb(5, 0, 0x02106)); //  sector size low byte of $0200
+    k.emit(encode.cmpi(5, 0x00));
+    k.assertTaken(.beq);
+    k.emit(encode.lb(5, 0, 0x02107));
+    k.emit(encode.cmpi(5, 0x02));
+    k.assertTaken(.beq);
+
+    // 5: write a recognisable byte pattern from $03000 into sector 1.
+    k.emit(encode.li(6, 0x3000)); //    fill cursor
+    k.emit(encode.li(7, 0)); //         value
+    const fill_top = k.cur.addr;
+    k.emit(encode.sb(6, 0, 7));
+    k.emit(encode.addi(6, 6, 1));
+    k.emit(encode.addi(7, 7, 1));
+    k.emit(encode.andi(7, 7, 0xFF)); // wrap the pattern into a byte
+    k.emit(encode.cmpi(6, 0x3200)); //  512 bytes
+    k.branchTo(.bne, fill_top);
+    stWrite(&k, 2, 1); //               STLBA
+    stWrite(&k, 3, 0x03000 / 16); //    STBUF
+    stWrite(&k, 0, 2); //               STCMD write
+    stWait(&k);
+    stCheckErr(&k, 5, 0);
+
+    // 6: read it back somewhere else and compare byte for byte.
+    stWrite(&k, 3, 0x02100 / 16);
+    stWrite(&k, 0, 1); //               STCMD read
+    stWait(&k);
+    stCheckErr(&k, 6, 0);
+    k.num(7);
+    k.emit(encode.li(6, 0x2100));
+    k.emit(encode.li(7, 0x3000));
+    const cmp_top = k.cur.addr;
+    k.emit(encode.lb(5, 6, 0));
+    k.emit(encode.lb(4, 7, 0));
+    k.emit(encode.cmp(5, 4));
+    k.assertTaken(.beq);
+    k.emit(encode.addi(6, 6, 1));
+    k.emit(encode.addi(7, 7, 1));
+    k.emit(encode.cmpi(6, 0x2300));
+    k.branchTo(.bne, cmp_top);
+
+    // 8: a bad LBA still completes — with STERR 2, not a hang (§2.5).
+    stWrite(&k, 2, 0xFFFF);
+    stWrite(&k, 0, 1);
+    stWait(&k);
+    stCheckErr(&k, 8, 2);
+
+    // 9: a buffer that would leave general RAM is refused the same way.
+    stWrite(&k, 2, 0);
+    stWrite(&k, 3, 0x3FF00 / 16); //    starts inside, ends outside
+    stWrite(&k, 0, 1);
+    stWait(&k);
+    stCheckErr(&k, 9, 4);
+
+    // 10: a command issued while busy is rejected with STERR 5, and the
+    // command in flight is undisturbed.
+    stWrite(&k, 3, 0x02100 / 16);
+    stWrite(&k, 0, 3); //               identify, now busy
+    stWrite(&k, 0, 1); //               …rejected
+    stCheckErr(&k, 10, 5);
+    stWait(&k);
+    stCheckErr(&k, 11, 0); //           the identify completed cleanly
+
+    k.pass();
+    return image;
+}
+
+/// test_aur_readback.rom: AOSCSEL/AOSC/AENV (v1.3 §1.2) read from the guest
+/// side. No disk, no IRQs — just the two latches.
+fn buildAurReadback() RomImage {
+    var image = RomImage.init();
+    var k = Kit.begin(&image);
+    k.emit(encode.li(15, 0x1100));
+    k.loadAddr(1, aur_base);
+
+    // 1: reset state (v1.3 §1.4) — mid-scale oscillator, silent envelope.
+    k.num(1);
+    k.emit(encode.lw(5, 1, 0x4D)); //   AOSC
+    k.emit(encode.cmpi(5, 0x80));
+    k.assertTaken(.beq);
+    k.num(2);
+    k.emit(encode.lw(5, 1, 0x4E)); //   AENV
+    k.emit(encode.cmpi(5, 0x00));
+    k.assertTaken(.beq);
+
+    // Voice 0: a parked full-scale square (freq 0 keeps the phase still).
+    aurWrite(&k, 0x40, 255); //         AMVOL
+    aurWrite(&k, 0x41, 15);
+    aurWrite(&k, 0x42, 15);
+    aurWrite(&k, 0x43, 0x01); //        AMVOICE: voice 0
+    aurWrite(&k, 0x00, 0x00);
+    aurWrite(&k, 0x01, 0x00); //        freq 0
+    aurWrite(&k, 0x02, 1); //           square
+    aurWrite(&k, 0x04, 0x00); //        attack idx 0, decay idx 0
+    aurWrite(&k, 0x05, 0xF8); //        sustain 15, release idx 8 = 300 ms
+    aurWrite(&k, 0x07, 255); //         VVOL
+    aurWrite(&k, 0x0D, 15);
+    aurWrite(&k, 0x0E, 15);
+    aurWrite(&k, 0x03, 0x80); //        gate on
+    // Hold ≈ 80k cycles: attack is 2 ms ≈ 88 samples ≈ 28.7k cycles.
+    k.emit(encode.li(6, 40_000));
+    const hold_top = k.cur.addr;
+    k.emit(encode.subi(6, 6, 1));
+    k.branchTo(.bne, hold_top);
+
+    // 3-4: the square reads full scale, and so does the envelope.
+    k.num(3);
+    k.emit(encode.lw(5, 1, 0x4D));
+    k.emit(encode.cmpi(5, 0xFF));
+    k.assertTaken(.beq);
+    k.num(4);
+    k.emit(encode.lw(5, 1, 0x4E));
+    k.emit(encode.cmpi(5, 0xFF));
+    k.assertTaken(.beq);
+
+    // 5: AOSC and AENV ignore writes (v1.3 §1.2).
+    aurWrite(&k, 0x4D, 0x00);
+    aurWrite(&k, 0x4E, 0x00);
+    k.num(5);
+    k.emit(encode.lw(5, 1, 0x4D));
+    k.emit(encode.cmpi(5, 0xFF));
+    k.assertTaken(.beq);
+
+    // 6-7: select voice 1 — never gated, sine parked at phase 0, so the
+    // oscillator reads mid-scale and the envelope reads silent.
+    aurWrite(&k, 0x4C, 0x01); //        AOSCSEL = voice 1
+    k.emit(encode.li(6, 400)); //       ≈ 3 internal samples
+    const sel_top = k.cur.addr;
+    k.emit(encode.subi(6, 6, 1));
+    k.branchTo(.bne, sel_top);
+    k.num(6);
+    k.emit(encode.lw(5, 1, 0x4D));
+    k.emit(encode.cmpi(5, 0x80));
+    k.assertTaken(.beq);
+    k.num(7);
+    k.emit(encode.lw(5, 1, 0x4E));
+    k.emit(encode.cmpi(5, 0x00));
+    k.assertTaken(.beq);
+
+    // 8: AOSCSEL keeps three bits.
+    aurWrite(&k, 0x4C, 0xFF);
+    k.num(8);
+    k.emit(encode.lw(5, 1, 0x4C));
+    k.emit(encode.cmpi(5, 0x07));
+    k.assertTaken(.beq);
+
+    // 9: back to voice 0 and gate off — the envelope drains while the
+    // oscillator keeps reporting the same parked square.
+    aurWrite(&k, 0x4C, 0x00);
+    aurWrite(&k, 0x03, 0x00); //        gate off → release
+    k.emit(encode.li(6, 20_000));
+    const rel_top = k.cur.addr;
+    k.emit(encode.subi(6, 6, 1));
+    k.branchTo(.bne, rel_top);
+    k.num(9);
+    k.emit(encode.lw(5, 1, 0x4E));
+    k.emit(encode.cmpi(5, 0xFF));
+    k.assertNotTaken(.beq); //          strictly below full scale now
+    k.num(10);
+    k.emit(encode.lw(5, 1, 0x4D));
+    k.emit(encode.cmpi(5, 0xFF)); //    …but the square is untouched
+    k.assertTaken(.beq);
+
+    k.pass();
+    return image;
+}
+
 const Builder = struct {
     name: []const u8,
     build: *const fn () RomImage,
@@ -1364,6 +1591,8 @@ const builders = [_]Builder{
     .{ .name = "test_vic_sprite.rom", .build = buildVicSprite },
     .{ .name = "test_aur_basic.rom", .build = buildAurBasic },
     .{ .name = "test_aur_fm.rom", .build = buildAurFm },
+    .{ .name = "test_aur_readback.rom", .build = buildAurReadback },
+    .{ .name = "test_storage.rom", .build = buildStorage },
     .{ .name = "font.rom", .build = buildFontRom },
 };
 
@@ -1441,4 +1670,19 @@ test "genroms: nop_loop image has vectors and code where the spec says" {
     // Everything before the entry point is zero → would trap to BRK (D35),
     // never execute silently.
     try testing.expectEqual(@as(u8, 0), image.bytes[0]);
+}
+
+test "genroms: Block 14 ROMs stay inside the code region and set RESET" {
+    for ([_]RomImage{ buildStorage(), buildAurReadback() }) |image| {
+        const reset = std.mem.readInt(u32, image.bytes[rom.vectors_offset..][0..4], .little);
+        try testing.expectEqual(@as(u32, entry_addr), reset);
+        // A stray trap must land on the FAIL stub, never on zeroed ROM.
+        const brk = std.mem.readInt(u32, image.bytes[rom.vectors_offset + 12 ..][0..4], .little);
+        try testing.expectEqual(@as(u32, fail_addr), brk);
+        // The last word before the handler region must still be zero: if
+        // main code had grown into it the Kit assert would have fired, but
+        // pin it here too — silent image corruption is the failure mode.
+        const guard = std.mem.readInt(u32, image.bytes[RomImage.offsetOf(fail_addr) - 4 ..][0..4], .little);
+        try testing.expectEqual(@as(u32, 0), guard);
+    }
 }
