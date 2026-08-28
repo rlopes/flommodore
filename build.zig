@@ -992,8 +992,13 @@ pub fn build(b: *std.Build) void {
     // and a frame hash over BIOS-font glyphs would pin bitmaps this project
     // has never derived expected values for.
     const aured_run = b.addRunArtifact(harness_exe);
+    // --autoboot, not a bare --flapp: the scope installs an IRQ handler
+    // through SYS_IRQSET, and the DISPATCH table it writes lives in BIOS
+    // RAM that only the boot sequence clears. Started directly, the
+    // dispatcher would read an uninitialised table and call into noise.
     aured_run.addArg("--rom");
     aured_run.addFileArg(bios_rom);
+    aured_run.addArg("--autoboot");
     aured_run.addArg("--flapp");
     aured_run.addFileArg(aured_flapp);
     // Two Downs then two Rights, one per frame boundary. Frame-mode

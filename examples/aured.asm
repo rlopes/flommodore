@@ -68,6 +68,7 @@
 ;   $0Exx  cutoff[AFCUTHI] == 1714 Hz     the filter display indexes right
 ;   $0Fxx  status == 2                    the load reported success
 ;   $10xx  VWAVE == 3 after the trip      edit -> record -> disk -> chip
+;   $11xx  the scope trace is not flat    the 11.25 kHz sampler really ran
 ;
 ; $06xx and $07xx are the pair that matters most: a cursor that moves but
 ; never writes fails $07xx, and a write that ignores the cursor fails $06xx
@@ -95,6 +96,19 @@
     EQU SYS_DSKWRITE, $FC17C     ; + 4*31
     EQU SYS_DSKFIND,  $FC180     ; + 4*32
     EQU SYS_DSKCREAT, $FC184     ; + 4*33
+    EQU SYS_TSET,     $FC158     ; + 4*22
+    EQU SYS_IRQSET,   $FC168     ; + 4*26
+
+    EQU IRQC,  $80040            ; +1 IRQMASK
+
+    ; The scope samples AOSC on a timer, per v1.3 §1.5: TADIV 1 divides the
+    ; 14.4 MHz clock by 8, and a reload of 160 divides that by 160 again —
+    ; exactly 11.25 kHz, one interrupt every 1,280 cycles. 128 samples then
+    ; span 11.4 ms, or three cycles of a 262 Hz tone, which is what a trace
+    ; wants to show.
+    EQU SCOPE_RELOAD, 160
+    EQU SCOPE_LEN,    128
+    EQU SCOPE_Y,      140        ; sample >> 3 lands 140..171, centred 156
 
     ; The bank is edited in place and written straight to disk, so it must
     ; sit at a 16-byte-aligned address: STBUF counts 16-byte units, and a
@@ -167,6 +181,23 @@ cp_bank:
     CMPI R1, 0
     BNE  fail
 
+    ; A known fill, so "the trace is not flat" means the interrupt wrote
+    ; varying values rather than that bss happened to contain noise.
+    LOAD_ADDR R1, scope_buf
+    LOAD_ADDR R2, scope_prev
+    LI   R3, SCOPE_LEN
+sc_fill:
+    LI   R12, $80
+    SB   [R1], R12
+    LI   R12, 156
+    SB   [R2], R12
+    ADDI R1, R1, 1
+    ADDI R2, R2, 1
+    SUBI R3, R3, 1
+    BNE  sc_fill
+    LOAD_ADDR R4, scope_idx
+    SW   [R4], R0
+
     ; ---- time one repaint -------------------------------------------
     MFSR R9, CYC
     CALLA draw_page
@@ -226,6 +257,24 @@ ck_bottom:
     BEQ  run_loop
     OR   R11, R11, R1
     JMPA fail
+
+    ; ---- start sampling ---------------------------------------------
+    ; Deliberately after the repaint measurement: with the timer running,
+    ; roughly 7% of every frame is spent in the interrupt, and folding that
+    ; into the repaint budget would measure two things at once.
+    LI   R11, 22
+    LI   R1, 0                   ; IRQ source 0, timer A
+    LOAD_ADDR R2, scope_irq
+    CALLA SYS_IRQSET
+    LI   R11, 23
+    LI   R1, 0                   ; timer A
+    LI   R2, SCOPE_RELOAD
+    LI   R3, $07                 ; enable | repeat | IRQ
+    CALLA SYS_TSET
+    LOAD_ADDR R4, IRQC
+    LI   R12, $01                ; unmask timer A
+    SW   [R4 + 1], R12
+    SEI
 
     ; ---- the frame loop ---------------------------------------------
     ; Six frames of the real thing: wait for the vertical blank, drain the
@@ -336,6 +385,26 @@ ck_oscsel:
     BEQ  ck_saveload
     OR   R11, R11, R1
     JMPA fail
+ck_scope:
+    ; The buffer was filled with $80 before the timer started, so any byte
+    ; differing from another means the interrupt ran AND the oscillator was
+    ; moving. A silent chip or a dead timer both leave it uniform.
+    LOAD_ADDR R4, scope_buf
+    LB   R2, [R4]                ; whatever the first sample turned out to be
+    LI   R3, 1
+sc_scan:
+    ADD  R12, R4, R3
+    LB   R1, [R12]
+    CMP  R1, R2
+    BNE  ck_scope_ok
+    ADDI R3, R3, 1
+    CMPI R3, SCOPE_LEN
+    BNE  sc_scan
+    LI   R11, $1100              ; every sample identical — nothing sampled
+    OR   R11, R11, R2
+    JMPA fail
+ck_scope_ok:
+
 ck_saveload:
     ; S then L were injected after the edits, so the chip has been through
     ; record -> disk -> RAM -> record -> chip. VWAVE surviving as 3 is that
@@ -579,6 +648,7 @@ dp_marker:
     CALLA draw_env
     CALLA draw_filter
     CALLA draw_meters
+    CALLA draw_scope
 
     POP  R8
     POP  R7
@@ -868,6 +938,83 @@ draw_filter:
     RET
 
 ; ----------------------------------------------------------------------------
+; scope_irq — the sampler, called by the BIOS dispatcher at 11.25 kHz.
+;
+; AOSC holds one value for a whole internal sample period (326 cycles at
+; ASRATE 0), so a scope cannot be built by reading it in a loop: it has to be
+; sampled on a clock. This is the routine v1.3 §1.5 describes, and the reason
+; the meters elsewhere in this file are honestly labelled meters.
+;
+; It runs 187 times a frame. The dispatcher costs about 80 instructions to
+; deliver these twelve, which is worth knowing: at this rate the DISPATCH
+; mechanism, not the handler, is most of the cost.
+;
+; Ends in RET, not RTI — the dispatcher acknowledges the source before
+; calling and executes the RTI itself (decision br). Clobbers R1-R4, R12,
+; which the dispatcher has already saved.
+; ----------------------------------------------------------------------------
+scope_irq:
+    LOAD_ADDR R4, AURG
+    LB   R1, [R4 + $0D]          ; AOSC, latched at the last internal sample
+    LOAD_ADDR R4, scope_idx
+    LW   R2, [R4]
+    LOAD_ADDR R12, scope_buf
+    ADD  R12, R12, R2
+    SB   [R12], R1
+    ADDI R2, R2, 1
+    ANDI R2, R2, (SCOPE_LEN - 1) ; a power of two, so the wrap is a mask
+    SW   [R4], R2
+    RET
+
+; ----------------------------------------------------------------------------
+; draw_scope — the trace, one pixel per column.
+;
+; Erases by redrawing the PREVIOUS frame's pixel in the background colour
+; rather than wiping a strip: a 256x24 wipe is ~24,000 cycles and 128 erase
+; plots are ~1,000. That is the same reasoning that kept gfx_clear out of the
+; frame loop, one scale down.
+;
+; sample >> 3 maps 0..255 onto 32 scanlines, so $80 — the zero crossing —
+; sits in the middle of the band. Clobbers R1-R4, R12; R6, R7 saved.
+; ----------------------------------------------------------------------------
+draw_scope:
+    PUSH LR
+    PUSH R6
+    PUSH R7
+    LI   R6, 0
+ds_col:
+    LOAD_ADDR R12, scope_prev    ; unpaint the last frame's dot
+    ADD  R12, R12, R6
+    LB   R2, [R12]
+    MOV  R1, R6
+    ADDI R1, R1, 8
+    LI   R3, $00
+    CALLA gfx_plot
+
+    LOAD_ADDR R12, scope_buf     ; and paint this one
+    ADD  R12, R12, R6
+    LB   R7, [R12]
+    LI   R12, 3
+    SHR  R7, R7, R12
+    ADDI R7, R7, SCOPE_Y
+    MOV  R1, R6
+    ADDI R1, R1, 8
+    MOV  R2, R7
+    LI   R3, $E0
+    CALLA gfx_plot
+
+    LOAD_ADDR R12, scope_prev
+    ADD  R12, R12, R6
+    SB   [R12], R7
+    ADDI R6, R6, 1
+    CMPI R6, SCOPE_LEN
+    BNE  ds_col
+    POP  R7
+    POP  R6
+    POP  LR
+    RET
+
+; ----------------------------------------------------------------------------
 ; draw_bar (R1 = y, R2 = level 0-255) — a 128 px trough with the level
 ; filled in. The trough is redrawn every frame because a shrinking bar would
 ; otherwise leave its own tail behind: nothing clears the screen.
@@ -1069,5 +1216,11 @@ aured_cursor:
     DS 2                         ; which register is selected, 0-15
 aured_status:
     DS 2                         ; 0 none, 1 saved, 2 loaded, $FF failed
+scope_idx:
+    DS 2                         ; next slot in the ring
+scope_buf:
+    DS 128                       ; AOSC samples at 11.25 kHz
+scope_prev:
+    DS 128                       ; last frame's y per column, for erasing
 val_buf:
     DS 8                         ; '$' + two hex, or five decimal digits + NUL
